@@ -1,0 +1,8 @@
+WATCHLIST = [
+    "RELIANCE.NS",
+    "INDUSINDBK.NS",
+    "MUTHOOTFIN.NS",
+    "CDSL.NS",
+    "BSE.NS",
+    "SYRMA.NS"
+]
