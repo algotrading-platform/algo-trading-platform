@@ -48,20 +48,6 @@ STOCKS = [
     "CDSL.NS",
     "BSE.NS",
     "SYRMA.NS",
-    "HDFCBANK.NS",
-    "INFY.NS",
-    "TCS.NS",
-    "ICICIBANK.NS",
-    "AXISBANK.NS",
-    "KOTAKBANK.NS",
-    "SBIN.NS",
-    "BAJFINANCE.NS",
-    "MARUTI.NS",
-    "TATAmotors.NS",
-    "ADANIPORTS.NS",
-    "WIPRO.NS",
-    "SUNPHARMA.NS",
-    "TITAN.NS",
 ]
 
 # Display helper for stocks
