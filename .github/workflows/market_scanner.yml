@@ -1,0 +1,75 @@
+# ============================================================
+# .github/workflows/market_scanner.yml
+#
+# GitHub Actions Cloud Scheduler
+# --------------------------------
+# Runs the signal scanner on GitHub's servers during
+# Indian market hours — completely free.
+#
+# This means signals fire even when your laptop is off.
+#
+# Schedule: Every 5 minutes, Mon-Fri, 9:15 AM - 3:35 PM IST
+# IST = UTC+5:30, so:
+#   9:15 IST  = 3:45 UTC
+#   15:35 IST = 10:05 UTC
+#
+# GitHub Actions cron uses UTC.
+# We run every 5 minutes between 3:45 UTC and 10:05 UTC
+# on weekdays. The scanner itself checks market hours
+# so it won't fire on holidays.
+#
+# NOTE: GitHub Actions has ~1 minute delay on cron jobs.
+# This is acceptable for our candle-close-based strategy.
+# ============================================================
+
+name: Market Signal Scanner
+
+on:
+  schedule:
+    # Every 5 minutes, Mon-Fri, 3:45 UTC to 10:05 UTC
+    # (= 9:15 IST to 15:35 IST)
+    - cron: "*/5 3-10 * * 1-5"
+
+  # Allow manual trigger from GitHub Actions UI
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4   # kill if takes longer than 4 min
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run one scan cycle
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python run_single_scan.py
+
+      - name: Upload signal logs as artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: signal-logs-${{ github.run_number }}
+          path: data/
+          retention-days: 7
