@@ -533,7 +533,14 @@ with st.sidebar:
     last_scan = get_last_scan_time()
     fetch_period = PERIOD_MAP.get(selected_tf, "3mo")
 
-    if last_scan == "just now" or (last_scan and last_scan.endswith("m ago") and int(last_scan.split("m")[0]) <= 10):
+    try:
+        _is_recent = (
+            last_scan == "just now" or
+            (last_scan and last_scan.endswith("m ago") and int(last_scan.split("m")[0]) <= 10)
+        )
+    except (ValueError, IndexError):
+        _is_recent = False
+    if _is_recent:
         sched_html = f'<div class="sched-active"><span style="width:6px;height:6px;border-radius:50%;background:var(--green);display:inline-block;"></span> Last scan: {last_scan}</div>'
     elif last_scan:
         sched_html = f'<div class="sched-stale">⚠ Last scan: {last_scan}</div>'
