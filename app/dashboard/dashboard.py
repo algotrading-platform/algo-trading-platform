@@ -23,6 +23,7 @@ from data.providers.yfinance_provider import YFinanceProvider
 from core.indicators.rsi_indicator import RSIIndicator
 from core.logger.signal_logger import SignalLogger
 from core.backtesting.backtest_store import get_results
+from core.database import get_last_scan_time as _db_last_scan
 from configs.instruments import (
     INDEXES, INDEXES_DISPLAY, INDEXES_TV,
     STOCKS, stock_display,
@@ -467,22 +468,11 @@ def get_latest_signals(tf: str) -> pd.DataFrame:
     )
 
 def get_last_scan_time() -> str:
-    """Returns how long ago the scheduler last ran, for sidebar status."""
+    """Returns how long ago the scheduler last ran — reads from Supabase."""
     try:
-        logs = logger.get_logs()
-        if logs.empty: return None
-        latest_ts = pd.to_datetime(logs["Timestamp"], errors="coerce").max()
-        if pd.isna(latest_ts): return None
-        now = datetime.now(IST)
-        if latest_ts.tzinfo is None:
-            latest_ts = IST.localize(latest_ts)
-        diff = now - latest_ts.astimezone(IST)
-        mins = int(diff.total_seconds() / 60)
-        if mins < 2:   return "just now"
-        if mins < 60:  return f"{mins}m ago"
-        hours = mins // 60
-        return f"{hours}h {mins%60}m ago"
-    except: return None
+        return _db_last_scan()
+    except Exception:
+        return None
 
 
 # ============================================================

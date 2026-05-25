@@ -1,75 +1,64 @@
-# ============================================================
-# .github/workflows/market_scanner.yml
-#
-# GitHub Actions Cloud Scheduler
-# --------------------------------
-# Runs the signal scanner on GitHub's servers during
-# Indian market hours — completely free.
-#
-# This means signals fire even when your laptop is off.
-#
-# Schedule: Every 5 minutes, Mon-Fri, 9:15 AM - 3:35 PM IST
-# IST = UTC+5:30, so:
-#   9:15 IST  = 3:45 UTC
-#   15:35 IST = 10:05 UTC
-#
-# GitHub Actions cron uses UTC.
-# We run every 5 minutes between 3:45 UTC and 10:05 UTC
-# on weekdays. The scanner itself checks market hours
-# so it won't fire on holidays.
-#
-# NOTE: GitHub Actions has ~1 minute delay on cron jobs.
-# This is acceptable for our candle-close-based strategy.
-# ============================================================
-
 name: Market Signal Scanner
 
 on:
   schedule:
-    # Every 5 minutes, Mon-Fri, 3:45 UTC to 10:05 UTC
-    # (= 9:15 IST to 15:35 IST)
-    - cron: "*/5 3-10 * * 1-5"
+    # ── EQUITY SCANS ──────────────────────────────────────────
+    # Every 5 min, Mon–Fri, 9:15 AM – 3:35 PM IST
+    # IST = UTC + 5:30, so 9:15 IST = 3:45 UTC, 3:35 PM IST = 10:05 UTC
+    - cron: '1,6,11,16,21,26,31,36,41,46,51,56 3,4,5,6,7,8,9 * * 1-5'
+    - cron: '1,6,11,16,21,26,31,36,41,46,51,56 10 * * 1-5'
 
-  # Allow manual trigger from GitHub Actions UI
+    # ── COMMODITY EVENING SCANS ───────────────────────────────
+    # Every 30 min, Mon–Fri, 3:35 PM – 11:55 PM IST
+    # 3:35 PM IST = 10:05 UTC, 11:55 PM IST = 6:25 UTC next day
+    - cron: '0,30 10,11,12,13,14,15,16,17,18 * * 1-5'
+
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Scan mode'
+        required: false
+        default: 'auto'
+        type: choice
+        options: ['auto', 'equity', 'commodity', 'all']
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 4   # kill if takes longer than 4 min
+    timeout-minutes: 8
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      - name: Run one scan cycle
+      - name: Determine scan mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+             [ "${{ github.event.inputs.mode }}" != "auto" ]; then
+            echo "mode=${{ github.event.inputs.mode }}" >> $GITHUB_OUTPUT
+          else
+            echo "mode=auto" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run scan
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SUPABASE_URL:        ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:        ${{ secrets.SUPABASE_KEY }}
+          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python run_single_scan.py
-
-      - name: Upload signal logs as artifact
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: signal-logs-${{ github.run_number }}
-          path: data/
-          retention-days: 7
+          if [ "${{ steps.mode.outputs.mode }}" = "auto" ]; then
+            python run_single_scan.py
+          else
+            python run_single_scan.py --mode ${{ steps.mode.outputs.mode }}
+          fi
