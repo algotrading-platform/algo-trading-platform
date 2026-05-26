@@ -132,8 +132,9 @@ COMMODITIES_TV = {
     "CL=F": "NYMEX:CL1!",
 }
 
-# Timeframes that DO NOT support commodity intraday data
-COMMODITIES_SKIP_TIMEFRAMES = {"5 Minutes", "15 Minutes"}
+# Commodities scan in the same 9:15–3:30 window as everything else.
+# No timeframes are skipped.
+COMMODITIES_SKIP_TIMEFRAMES = set()
 
 
 def get_all_instruments() -> list[dict]:

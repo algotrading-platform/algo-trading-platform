@@ -603,7 +603,11 @@ def build_rows(symbols, display_map, tv_map, skip_tf=None):
             sig   = str(d["Signal"])
             rsi   = d["RSI"]
             price = d["Price"]
-            ts    = str(d["Timestamp"])[:16]
+            try:
+                _ts = pd.to_datetime(d["Timestamp"], utc=True).tz_convert(IST)
+                ts  = _ts.strftime("%Y-%m-%d %H:%M IST")
+            except Exception:
+                ts  = str(d["Timestamp"])[:16]
         else:
             sig = "HOLD"; rsi = "—"; price = "—"; ts = "—"
 
@@ -899,6 +903,18 @@ try:
         else:
             # Format columns cleanly — no raw floats
             display = logs_tf[["Timestamp","Stock","Signal","RSI","Price"]].copy()
+            # Convert UTC timestamps to IST
+            try:
+                display["Timestamp"] = pd.to_datetime(display["Timestamp"], utc=True).dt.tz_convert(IST).dt.strftime("%Y-%m-%d %H:%M IST")
+            except Exception:
+                pass
+            # Replace commodity/stock codes with friendly display names
+            _name_map = {
+                **COMMODITIES_DISPLAY,
+                **{s: stock_display(s) for s in STOCKS},
+                **INDEXES_DISPLAY,
+            }
+            display["Stock"] = display["Stock"].apply(lambda x: _name_map.get(x, x))
             display["RSI"]   = display["RSI"].apply(lambda x: f"{float(x):.2f}" if str(x).replace('.','').replace('-','').isdigit() else x)
             display["Price"] = display["Price"].apply(lambda x: f"₹{float(x):,.2f}" if str(x).replace('.','').replace('-','').isdigit() else x)
 

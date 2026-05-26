@@ -2,13 +2,12 @@
 # core/scheduler/signal_scheduler.py
 #
 # Market hours:
-#   Equity (NSE/BSE):  9:15 AM – 3:30 PM IST  Mon–Fri
-#   Commodity (MCX):   9:00 AM – 11:55 PM IST  Mon–Fri
+#   Single window: 9:15 AM – 3:30 PM IST  Mon–Fri
+#   ALL instruments scanned together:
+#   Indexes + Stocks + Commodities
 #
-# Scan modes:
-#   equity    → indexes + stocks only
-#   commodity → commodities only
-#   all       → everything (morning overlap 9:00–3:30)
+# No pre-market scan. No evening scan.
+# Everything stops at 3:30 PM IST.
 # ============================================================
 
 import os
@@ -76,8 +75,8 @@ def is_market_day() -> bool:
     return today.weekday() < 5 and today not in NSE_HOLIDAYS
 
 
-def is_equity_hours() -> bool:
-    """NSE/BSE: 9:15 AM – 3:30 PM IST"""
+def is_market_hours() -> bool:
+    """Single window: 9:15 AM – 3:30 PM IST"""
     if not is_market_day():
         return False
     from datetime import time as dtime
@@ -85,13 +84,13 @@ def is_equity_hours() -> bool:
     return dtime(9, 15) <= t <= dtime(15, 30)
 
 
+# Keep for backward compatibility with run_single_scan.py
+def is_equity_hours() -> bool:
+    return is_market_hours()
+
+
 def is_commodity_hours() -> bool:
-    """MCX non-agri (Gold, Silver, Copper, Crude): 9:00 AM – 11:55 PM IST"""
-    if not is_market_day():
-        return False
-    from datetime import time as dtime
-    t = datetime.now(IST).time()
-    return dtime(9, 0) <= t <= dtime(23, 55)
+    return is_market_hours()
 
 
 def is_last_trading_day_of_month() -> bool:
@@ -225,9 +224,9 @@ def scan_instrument(
 
 def run_scan(tf_name: str, mode: str = "all") -> None:
     """
-    mode: "equity"    → only INDEX + STOCK
-          "commodity" → only COMMODITY
-          "all"       → everything
+    Scans ALL instruments — Indexes + Stocks + Commodities.
+    Mode parameter kept for backward compatibility but ignored.
+    Single window: 9:15 AM – 3:30 PM IST only.
     """
     interval = TIMEFRAMES[tf_name]
     period   = PERIOD_MAP[tf_name]
@@ -240,32 +239,19 @@ def run_scan(tf_name: str, mode: str = "all") -> None:
         log.info(f"SKIP  {tf_name}  not last trading day")
         return
 
-    # Filter instruments by mode and market hours
-    scan_list = []
-    for inst in instruments:
-        cat = inst["category"]
+    # Single market hours check — all instruments same window
+    if not is_market_hours():
+        log.info(f"SKIP  {tf_name}  outside market hours (9:15–3:30 IST)")
+        return
 
-        if mode == "equity" and cat == "COMMODITY":
-            continue
-        if mode == "commodity" and cat != "COMMODITY":
-            continue
-
-        # Check appropriate market hours
-        if cat == "COMMODITY":
-            if not is_commodity_hours():
-                continue
-        else:
-            if not is_equity_hours():
-                continue
-
-        scan_list.append(inst)
+    scan_list = instruments
 
     if not scan_list:
-        log.info(f"SKIP  {tf_name}  [{mode}]  no instruments in market hours")
+        log.info(f"SKIP  {tf_name}  no instruments")
         return
 
     log.info(
-        f"SCAN START  {tf_name}  [{mode}]  "
+        f"SCAN START  {tf_name}  [all]  "
         f"{len(scan_list)} instruments  "
         f"interval={interval}  period={period}"
     )
@@ -297,7 +283,7 @@ def run_scan(tf_name: str, mode: str = "all") -> None:
 
     elapsed = round(time.time() - start_time, 1)
     log.info(
-        f"SCAN DONE   {tf_name}  [{mode}]  "
+        f"SCAN DONE   {tf_name}  [all]  "
         f"{len(results)}/{len(scan_list)} processed  "
         f"{signals} signals  {elapsed}s"
     )
@@ -374,33 +360,9 @@ def build_scheduler() -> BlockingScheduler:
         max_instances=1, coalesce=True,
     )
 
-    # ---- COMMODITY EVENING SCANS (3:35 PM – 11:55 PM) ----
-    # Every 30 minutes — commodities move slowly in evening
-    # Covers Gold, Silver, Copper, Crude following US markets
-
-    scheduler.add_job(
-        lambda: run_scan("15 Minutes", "commodity"),
-        CronTrigger(
-            minute="0,30",
-            hour="16,17,18,19,20,21,22,23",
-            day_of_week="mon-fri", timezone=IST,
-        ),
-        id="scan_commodity_evening",
-        name="Commodity Evening Scan",
-        max_instances=1, coalesce=True,
-    )
-
-    scheduler.add_job(
-        lambda: run_scan("1 Hour", "commodity"),
-        CronTrigger(
-            minute="5",
-            hour="16,17,18,19,20,21,22,23",
-            day_of_week="mon-fri", timezone=IST,
-        ),
-        id="scan_commodity_1h",
-        name="Commodity 1H Evening Scan",
-        max_instances=1, coalesce=True,
-    )
+    # ---- COMMODITY EVENING SCANS REMOVED ----
+    # All scanning stops at 3:30 PM IST.
+    # Commodities are included in the equity window above.
 
     return scheduler
 
@@ -410,8 +372,9 @@ def start() -> None:
     log.info("Algo Trading Signal Scheduler")
     log.info(f"Instruments : {len(instruments)}")
     log.info(f"Timeframes  : {list(TIMEFRAMES.keys())}")
-    log.info("Equity hours   : 9:15 AM – 3:30 PM IST")
-    log.info("Commodity hours: 9:00 AM – 11:55 PM IST")
+    log.info("Market hours: 9:15 AM – 3:30 PM IST (all instruments)")
+    log.info("Indexes + Stocks + Commodities scanned together")
+    log.info("No pre-market scan. No evening scan.")
     log.info("=" * 60)
     scheduler = build_scheduler()
     try:

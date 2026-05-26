@@ -3,12 +3,10 @@
 # run_single_scan.py
 #
 # Entry point for GitHub Actions.
-# Runs one scan cycle for the appropriate mode based on time.
+# Runs one scan cycle — all instruments 9:15–3:30 IST only.
 #
 # Usage:
-#   python run_single_scan.py                 # auto-detect mode
-#   python run_single_scan.py --mode equity
-#   python run_single_scan.py --mode commodity
+#   python run_single_scan.py        # auto-detect
 #   python run_single_scan.py --mode all
 # ============================================================
 
@@ -23,8 +21,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from core.scheduler.signal_scheduler import (
     run_scan,
-    is_equity_hours,
-    is_commodity_hours,
+    is_market_hours,
     is_market_day,
     TIMEFRAMES,
 )
@@ -39,29 +36,13 @@ log = logging.getLogger("single_scan")
 IST = pytz.timezone("Asia/Kolkata")
 
 
-def detect_mode() -> str:
-    """
-    Auto-detect which mode to run based on current IST time.
-    equity    → 9:15 AM – 3:30 PM
-    commodity → 3:31 PM – 11:55 PM
-    both      → overlap (shouldn't happen but safe)
-    """
-    eq  = is_equity_hours()
-    com = is_commodity_hours()
-
-    if eq and com:   return "all"
-    if eq:           return "equity"
-    if com:          return "commodity"
-    return None
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode",
-        choices=["equity", "commodity", "all"],
-        default=None,
-        help="Scan mode. Auto-detected from time if not specified."
+        choices=["all"],
+        default="all",
+        help="Scan mode. Always 'all' — all instruments together."
     )
     args = parser.parse_args()
 
@@ -69,20 +50,15 @@ def main():
         log.info("Market closed today (weekend or holiday). Skipping scan.")
         sys.exit(0)
 
-    mode = args.mode or detect_mode()
-
-    if mode is None:
-        log.info("Outside all market hours. Skipping scan.")
+    if not is_market_hours():
+        log.info("Outside market hours (9:15–3:30 IST). Skipping scan.")
         sys.exit(0)
 
     now = datetime.now(IST).strftime("%H:%M IST")
-    log.info(f"Single scan — mode={mode} — time={now}")
+    log.info(f"Single scan — mode=all — time={now}")
 
-    # Run all timeframes for the detected mode
-    # GitHub Actions calls this every 5 min for equity
-    # and every 30 min for commodity (separate workflow jobs)
     for tf in TIMEFRAMES.keys():
-        run_scan(tf, mode)
+        run_scan(tf, "all")
 
     log.info("Single scan complete.")
 
