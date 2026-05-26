@@ -44,7 +44,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st_autorefresh(interval=60000, key="dashboard_refresh")
+st_autorefresh(interval=300000, key="dashboard_refresh")  # 5 min — matches scheduler
 IST = pytz.timezone("Asia/Kolkata")
 
 
