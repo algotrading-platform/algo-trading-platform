@@ -2,12 +2,13 @@
 # core/scheduler/signal_scheduler.py
 #
 # Market hours:
-#   Single window: 9:15 AM – 3:30 PM IST  Mon–Fri
-#   ALL instruments scanned together:
-#   Indexes + Stocks + Commodities
+#   Equity (NSE/BSE):  9:15 AM – 3:30 PM IST  Mon–Fri
+#   Commodity (MCX):   9:00 AM – 11:55 PM IST  Mon–Fri
 #
-# No pre-market scan. No evening scan.
-# Everything stops at 3:30 PM IST.
+# Scan modes:
+#   equity    → indexes + stocks only
+#   commodity → commodities only
+#   all       → everything (morning overlap 9:00–3:30)
 # ============================================================
 
 import os
@@ -56,13 +57,58 @@ log = logging.getLogger("scheduler")
 IST = pytz.timezone("Asia/Kolkata")
 
 NSE_HOLIDAYS = {
-    date(2025, 1, 26), date(2025, 3, 14), date(2025, 4, 14),
-    date(2025, 4, 18), date(2025, 5, 1),  date(2025, 8, 15),
-    date(2025, 10, 2), date(2025, 10, 24),date(2025, 11, 5),
-    date(2025, 12, 25),
-    date(2026, 1, 26), date(2026, 3, 3),  date(2026, 4, 3),
-    date(2026, 4, 14), date(2026, 5, 1),  date(2026, 8, 15),
-    date(2026, 10, 2), date(2026, 11, 13),date(2026, 12, 25),
+    # ── 2025 ──────────────────────────────────────────────────
+    date(2025, 1, 26),   # Republic Day
+    date(2025, 2, 26),   # Mahashivratri
+    date(2025, 3, 14),   # Holi
+    date(2025, 3, 31),   # Id-ul-Fitr (Ramzan)
+    date(2025, 4, 14),   # Dr. Ambedkar Jayanti
+    date(2025, 4, 18),   # Good Friday
+    date(2025, 5, 1),    # Maharashtra Day
+    date(2025, 8, 15),   # Independence Day
+    date(2025, 8, 27),   # Ganesh Chaturthi
+    date(2025, 10, 2),   # Gandhi Jayanti / Dussehra
+    date(2025, 10, 20),  # Diwali Laxmi Pujan
+    date(2025, 10, 21),  # Diwali Balipratipada
+    date(2025, 11, 5),   # Prakash Gurpurab
+    date(2025, 12, 25),  # Christmas
+
+    # ── 2026 ──────────────────────────────────────────────────
+    date(2026, 1, 26),   # Republic Day
+    date(2026, 2, 26),   # Mahashivratri
+    date(2026, 3, 20),   # Id-ul-Fitr (Ramzan)
+    date(2026, 3, 25),   # Holi
+    date(2026, 4, 2),    # Ram Navami
+    date(2026, 4, 3),    # Good Friday
+    date(2026, 4, 14),   # Dr. Ambedkar Jayanti
+    date(2026, 4, 30),   # Buddha Purnima
+    date(2026, 6, 27),   # Id-ul-Adha (Bakri Id)
+    date(2026, 7, 17),   # Muharram
+    date(2026, 8, 15),   # Independence Day
+    date(2026, 8, 27),   # Ganesh Chaturthi
+    date(2026, 9, 25),   # Dussehra
+    date(2026, 10, 2),   # Gandhi Jayanti
+    date(2026, 10, 20),  # Diwali Laxmi Pujan
+    date(2026, 10, 21),  # Diwali Balipratipada
+    date(2026, 11, 25),  # Guru Nanak Jayanti
+    date(2026, 12, 25),  # Christmas
+
+    # ── 2027 ──────────────────────────────────────────────────
+    date(2027, 1, 26),   # Republic Day
+    date(2027, 2, 17),   # Mahashivratri
+    date(2027, 3, 10),   # Holi
+    date(2027, 3, 19),   # Id-ul-Fitr (Ramzan)
+    date(2027, 3, 26),   # Good Friday
+    date(2027, 4, 2),    # Ram Navami
+    date(2027, 4, 14),   # Dr. Ambedkar Jayanti
+    date(2027, 4, 30),   # Buddha Purnima
+    date(2027, 8, 15),   # Independence Day
+    date(2027, 8, 16),   # Janmashtami
+    date(2027, 10, 2),   # Gandhi Jayanti
+    date(2027, 10, 8),   # Dussehra
+    date(2027, 10, 29),  # Diwali Laxmi Pujan
+    date(2027, 11, 16),  # Guru Nanak Jayanti
+    date(2027, 12, 25),  # Christmas
 }
 
 
@@ -75,8 +121,8 @@ def is_market_day() -> bool:
     return today.weekday() < 5 and today not in NSE_HOLIDAYS
 
 
-def is_market_hours() -> bool:
-    """Single window: 9:15 AM – 3:30 PM IST"""
+def is_equity_hours() -> bool:
+    """NSE/BSE: 9:15 AM – 3:30 PM IST"""
     if not is_market_day():
         return False
     from datetime import time as dtime
@@ -84,13 +130,13 @@ def is_market_hours() -> bool:
     return dtime(9, 15) <= t <= dtime(15, 30)
 
 
-# Keep for backward compatibility with run_single_scan.py
-def is_equity_hours() -> bool:
-    return is_market_hours()
-
-
 def is_commodity_hours() -> bool:
-    return is_market_hours()
+    """MCX non-agri (Gold, Silver, Copper, Crude): 9:00 AM – 11:55 PM IST"""
+    if not is_market_day():
+        return False
+    from datetime import time as dtime
+    t = datetime.now(IST).time()
+    return dtime(9, 0) <= t <= dtime(23, 55)
 
 
 def is_last_trading_day_of_month() -> bool:
@@ -224,9 +270,9 @@ def scan_instrument(
 
 def run_scan(tf_name: str, mode: str = "all") -> None:
     """
-    Scans ALL instruments — Indexes + Stocks + Commodities.
-    Mode parameter kept for backward compatibility but ignored.
-    Single window: 9:15 AM – 3:30 PM IST only.
+    mode: "equity"    → only INDEX + STOCK
+          "commodity" → only COMMODITY
+          "all"       → everything
     """
     interval = TIMEFRAMES[tf_name]
     period   = PERIOD_MAP[tf_name]
@@ -239,19 +285,32 @@ def run_scan(tf_name: str, mode: str = "all") -> None:
         log.info(f"SKIP  {tf_name}  not last trading day")
         return
 
-    # Single market hours check — all instruments same window
-    if not is_market_hours():
-        log.info(f"SKIP  {tf_name}  outside market hours (9:15–3:30 IST)")
-        return
+    # Filter instruments by mode and market hours
+    scan_list = []
+    for inst in instruments:
+        cat = inst["category"]
 
-    scan_list = instruments
+        if mode == "equity" and cat == "COMMODITY":
+            continue
+        if mode == "commodity" and cat != "COMMODITY":
+            continue
+
+        # Check appropriate market hours
+        if cat == "COMMODITY":
+            if not is_commodity_hours():
+                continue
+        else:
+            if not is_equity_hours():
+                continue
+
+        scan_list.append(inst)
 
     if not scan_list:
-        log.info(f"SKIP  {tf_name}  no instruments")
+        log.info(f"SKIP  {tf_name}  [{mode}]  no instruments in market hours")
         return
 
     log.info(
-        f"SCAN START  {tf_name}  [all]  "
+        f"SCAN START  {tf_name}  [{mode}]  "
         f"{len(scan_list)} instruments  "
         f"interval={interval}  period={period}"
     )
@@ -283,7 +342,7 @@ def run_scan(tf_name: str, mode: str = "all") -> None:
 
     elapsed = round(time.time() - start_time, 1)
     log.info(
-        f"SCAN DONE   {tf_name}  [all]  "
+        f"SCAN DONE   {tf_name}  [{mode}]  "
         f"{len(results)}/{len(scan_list)} processed  "
         f"{signals} signals  {elapsed}s"
     )
@@ -360,9 +419,33 @@ def build_scheduler() -> BlockingScheduler:
         max_instances=1, coalesce=True,
     )
 
-    # ---- COMMODITY EVENING SCANS REMOVED ----
-    # All scanning stops at 3:30 PM IST.
-    # Commodities are included in the equity window above.
+    # ---- COMMODITY EVENING SCANS (3:35 PM – 11:55 PM) ----
+    # Every 30 minutes — commodities move slowly in evening
+    # Covers Gold, Silver, Copper, Crude following US markets
+
+    scheduler.add_job(
+        lambda: run_scan("15 Minutes", "commodity"),
+        CronTrigger(
+            minute="0,30",
+            hour="16,17,18,19,20,21,22,23",
+            day_of_week="mon-fri", timezone=IST,
+        ),
+        id="scan_commodity_evening",
+        name="Commodity Evening Scan",
+        max_instances=1, coalesce=True,
+    )
+
+    scheduler.add_job(
+        lambda: run_scan("1 Hour", "commodity"),
+        CronTrigger(
+            minute="5",
+            hour="16,17,18,19,20,21,22,23",
+            day_of_week="mon-fri", timezone=IST,
+        ),
+        id="scan_commodity_1h",
+        name="Commodity 1H Evening Scan",
+        max_instances=1, coalesce=True,
+    )
 
     return scheduler
 
@@ -372,9 +455,8 @@ def start() -> None:
     log.info("Algo Trading Signal Scheduler")
     log.info(f"Instruments : {len(instruments)}")
     log.info(f"Timeframes  : {list(TIMEFRAMES.keys())}")
-    log.info("Market hours: 9:15 AM – 3:30 PM IST (all instruments)")
-    log.info("Indexes + Stocks + Commodities scanned together")
-    log.info("No pre-market scan. No evening scan.")
+    log.info("Equity hours   : 9:15 AM – 3:30 PM IST")
+    log.info("Commodity hours: 9:00 AM – 11:55 PM IST")
     log.info("=" * 60)
     scheduler = build_scheduler()
     try:
