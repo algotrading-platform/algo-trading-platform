@@ -295,3 +295,62 @@ def get_backtest_results(
     except Exception as e:
         print(f"[DB] get_backtest_results error: {e}")
         return pd.DataFrame()
+
+
+# ============================================================
+# UPSTOX TOKENS TABLE
+# ============================================================
+
+def save_upstox_token(access_token: str) -> bool:
+    """Save Upstox access token. Expires at 3:30 AM next day IST."""
+    try:
+        import pytz
+        IST = pytz.timezone("Asia/Kolkata")
+        now = datetime.now(IST)
+        expires_at = (now + timedelta(days=1)).replace(
+            hour=3, minute=30, second=0, microsecond=0
+        )
+        client = get_client()
+        client.table("upstox_tokens").insert({
+            "access_token": access_token,
+            "created_at":   now.isoformat(),
+            "expires_at":   expires_at.isoformat(),
+        }).execute()
+        return True
+    except Exception as e:
+        print(f"[DB] save_upstox_token error: {e}")
+        return False
+
+
+def get_upstox_token() -> str | None:
+    """
+    Fetch the latest valid Upstox access token.
+    Returns None if not found or expired.
+    """
+    try:
+        import pytz
+        IST = pytz.timezone("Asia/Kolkata")
+        client = get_client()
+        result = (
+            client.table("upstox_tokens")
+            .select("access_token, expires_at")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not result.data:
+            return None
+
+        row = result.data[0]
+        expires_at = datetime.fromisoformat(row["expires_at"])
+        if expires_at.tzinfo is None:
+            expires_at = IST.localize(expires_at)
+
+        if datetime.now(IST) >= expires_at:
+            return None
+
+        return row["access_token"]
+
+    except Exception as e:
+        print(f"[DB] get_upstox_token error: {e}")
+        return None

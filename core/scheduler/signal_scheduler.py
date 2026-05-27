@@ -32,7 +32,7 @@ sys.path.append(
     )
 )
 
-from data.providers.yfinance_provider import YFinanceProvider
+from data.providers.upstox_provider import UpstoxProvider
 from core.indicators.rsi_indicator import RSIIndicator
 from core.signals.reversal_rsi_signal import ReversalRSISignal
 from core.backtesting.rsi_backtest import RSIBacktest
@@ -153,7 +153,7 @@ def is_last_trading_day_of_month() -> bool:
 # ENGINES
 # ============================================================
 
-provider      = YFinanceProvider()
+provider      = UpstoxProvider()   # Uses Upstox for intraday, yfinance fallback for daily/weekly
 rsi_indicator = RSIIndicator()
 signal_engine = ReversalRSISignal()
 backtest_eng  = RSIBacktest()
@@ -455,7 +455,7 @@ def start() -> None:
     log.info("Algo Trading Signal Scheduler")
     log.info(f"Instruments : {len(instruments)}")
     log.info(f"Timeframes  : {list(TIMEFRAMES.keys())}")
-    log.info("Equity hours   : 9:15 AM – 3:30 PM IST")
+    log.info("Data source    : Upstox API (intraday) + yfinance (daily/weekly)")
     log.info("Commodity hours: 9:00 AM – 11:55 PM IST")
     log.info("=" * 60)
     scheduler = build_scheduler()
