@@ -419,33 +419,7 @@ def build_scheduler() -> BlockingScheduler:
         max_instances=1, coalesce=True,
     )
 
-    # ---- COMMODITY EVENING SCANS (3:35 PM – 11:55 PM) ----
-    # Every 30 minutes — commodities move slowly in evening
-    # Covers Gold, Silver, Copper, Crude following US markets
-
-    scheduler.add_job(
-        lambda: run_scan("15 Minutes", "commodity"),
-        CronTrigger(
-            minute="0,30",
-            hour="16,17,18,19,20,21,22,23",
-            day_of_week="mon-fri", timezone=IST,
-        ),
-        id="scan_commodity_evening",
-        name="Commodity Evening Scan",
-        max_instances=1, coalesce=True,
-    )
-
-    scheduler.add_job(
-        lambda: run_scan("1 Hour", "commodity"),
-        CronTrigger(
-            minute="5",
-            hour="16,17,18,19,20,21,22,23",
-            day_of_week="mon-fri", timezone=IST,
-        ),
-        id="scan_commodity_1h",
-        name="Commodity 1H Evening Scan",
-        max_instances=1, coalesce=True,
-    )
+    # No evening scans — everything stops at 3:30 PM IST
 
     return scheduler
 
@@ -455,8 +429,9 @@ def start() -> None:
     log.info("Algo Trading Signal Scheduler")
     log.info(f"Instruments : {len(instruments)}")
     log.info(f"Timeframes  : {list(TIMEFRAMES.keys())}")
-    log.info("Data source    : Upstox API (intraday) + yfinance (daily/weekly)")
-    log.info("Commodity hours: 9:00 AM – 11:55 PM IST")
+    log.info("Data source : Upstox API (intraday) + yfinance (daily/weekly)")
+    log.info("Market hours: 9:15 AM – 3:30 PM IST (all instruments)")
+    log.info("No pre-market scan. No evening scan.")
     log.info("=" * 60)
     scheduler = build_scheduler()
     try:
