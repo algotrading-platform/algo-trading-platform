@@ -1,26 +1,26 @@
 # ============================================================
 # data/providers/upstox_provider.py
 #
-# Upstox API data provider — replaces YFinanceProvider
-# for intraday timeframes (5m, 15m, 1h).
+# Upstox API data provider — PRIMARY data source for ALL
+# instruments and ALL timeframes.
 #
 # Uses historical candle API — accurate IST timestamps,
 # no data gaps, real-time prices during market hours.
+#
+# Data source priority:
+#   1. Upstox API (all instruments, all timeframes)
+#   2. yfinance (fallback ONLY when Upstox is down/token missing)
 #
 # Token management:
 #   - Access token stored in Supabase (table: upstox_tokens)
 #   - Token generated daily via scripts/upstox_login.py
 #   - Falls back to YFinanceProvider if token missing/expired
 #
-# Upstox symbol format:
-#   NSE stocks : NSE_EQ|INE002A01018  (requires ISIN)
-#   Indexes    : NSE_INDEX|Nifty 50
-#   Commodities: MCX_FO|...
-#
-# Since ISIN mapping is complex, we use a hybrid approach:
-#   - Upstox for indexes (Nifty 50, Bank Nifty, Sensex)
-#   - Upstox for top liquid stocks via symbol mapping
-#   - YFinance fallback for anything not in mapping
+# Commodity support:
+#   - MCX contracts fetched dynamically from Upstox instruments API
+#   - Auto-detects active contract for Gold, Silver, Copper, Crude
+#   - Contract keys cached in memory to avoid repeated API calls
+#   - Falls back to yfinance if MCX contract lookup fails
 # ============================================================
 
 import os
@@ -131,12 +131,19 @@ UPSTOX_SYMBOL_MAP = {
     "SYRMA.NS": "NSE_EQ|SYRMA",
 }
 
-# Commodities not supported via Upstox historical API in this tier
-# Fall back to yfinance for GC=F, SI=F, HG=F, CL=F
-UPSTOX_UNSUPPORTED = {"GC=F", "SI=F", "HG=F", "CL=F"}
+# Commodities — yfinance symbols mapped to MCX search names
+# Active contract fetched dynamically from Upstox instruments API
+MCX_COMMODITY_SEARCH = {
+    "GC=F": "GOLD",
+    "SI=F": "SILVER",
+    "HG=F": "COPPER",
+    "CL=F": "CRUDEOIL",
+}
 
-# Timeframes that use yfinance (daily/weekly — no accuracy issue)
-YFINANCE_TIMEFRAMES = {"1d", "1wk", "1mo"}
+# In-memory cache for active MCX contract keys
+# Refreshed once per day at scheduler startup
+_mcx_contract_cache: dict[str, str] = {}
+_mcx_cache_date: str = ""
 
 
 # ============================================================
@@ -204,12 +211,11 @@ def save_token(access_token: str) -> bool:
 
 class UpstoxProvider(BaseDataProvider):
     """
-    Fetches OHLCV data from Upstox historical candle API.
-    Falls back to YFinanceProvider when:
-      - No valid token
-      - Symbol not in mapping (commodities)
-      - Daily/Weekly/Monthly timeframes
-      - Any API error
+    Fetches OHLCV data from Upstox API for ALL instruments
+    and ALL timeframes. yfinance used ONLY as fallback when:
+      - No valid token in Supabase
+      - Upstox API returns error
+      - MCX contract lookup fails
     """
 
     def __init__(self):
@@ -223,31 +229,24 @@ class UpstoxProvider(BaseDataProvider):
         period: str   = "1mo",
     ) -> pd.DataFrame:
 
-        # Use yfinance for daily/weekly/monthly — no accuracy issue
-        if interval in YFINANCE_TIMEFRAMES:
-            return self._yf.fetch_data(symbol, interval, period)
-
-        # Use yfinance for unsupported symbols (commodities)
-        if symbol in UPSTOX_UNSUPPORTED:
-            return self._yf.fetch_data(symbol, interval, period)
-
-        # Check symbol mapping
-        upstox_sym = UPSTOX_SYMBOL_MAP.get(symbol)
-        if not upstox_sym:
-            return self._yf.fetch_data(symbol, interval, period)
-
-        # Get token
+        # Get token — if missing fall back to yfinance immediately
         token = get_token()
         if not token:
             print(f"[Upstox] No valid token — falling back to yfinance for {symbol}")
             return self._yf.fetch_data(symbol, interval, period)
 
-        # Map interval
+        # Map interval to Upstox format
         upstox_interval = UPSTOX_INTERVALS.get(interval)
         if not upstox_interval:
             return self._yf.fetch_data(symbol, interval, period)
 
-        # Calculate date range from period
+        # Resolve instrument key
+        upstox_sym = self._resolve_symbol(symbol, token)
+        if not upstox_sym:
+            print(f"[Upstox] No mapping for {symbol} — falling back to yfinance")
+            return self._yf.fetch_data(symbol, interval, period)
+
+        # Calculate date range
         to_date, from_date = self._period_to_dates(period)
 
         try:
@@ -260,6 +259,7 @@ class UpstoxProvider(BaseDataProvider):
             )
 
             if df is None or df.empty:
+                print(f"[Upstox] Empty data for {symbol} — falling back to yfinance")
                 return self._yf.fetch_data(symbol, interval, period)
 
             return df
@@ -267,6 +267,104 @@ class UpstoxProvider(BaseDataProvider):
         except Exception as e:
             print(f"[Upstox] fetch error {symbol}: {e} — falling back to yfinance")
             return self._yf.fetch_data(symbol, interval, period)
+
+    def _resolve_symbol(self, symbol: str, token: str) -> str | None:
+        """
+        Resolve yfinance symbol to Upstox instrument key.
+        For MCX commodities, fetches active contract dynamically.
+        """
+        # Check static mapping first (indexes + stocks)
+        if symbol in UPSTOX_SYMBOL_MAP:
+            return UPSTOX_SYMBOL_MAP[symbol]
+
+        # MCX commodity — fetch active contract
+        if symbol in MCX_COMMODITY_SEARCH:
+            return self._get_mcx_contract(
+                symbol=symbol,
+                token=token,
+                search_name=MCX_COMMODITY_SEARCH[symbol],
+            )
+
+        return None
+
+    def _get_mcx_contract(
+        self,
+        symbol: str,
+        token: str,
+        search_name: str,
+    ) -> str | None:
+        """
+        Fetch the active MCX futures contract key from Upstox.
+        Uses in-memory cache — refreshed once per day.
+
+        Upstox instruments search API returns active contracts.
+        We pick the nearest expiry (front month contract).
+        """
+        global _mcx_contract_cache, _mcx_cache_date
+
+        today = datetime.now(IST).strftime("%Y-%m-%d")
+
+        # Return cached value if still valid today
+        if _mcx_cache_date == today and symbol in _mcx_contract_cache:
+            return _mcx_contract_cache[symbol]
+
+        try:
+            url = f"{self._base_url}/instruments/search"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+            }
+            params = {
+                "q": search_name,
+                "asset_type": "FO",
+            }
+
+            response = requests.get(
+                url, headers=headers, params=params, timeout=10
+            )
+
+            if response.status_code != 200:
+                print(f"[Upstox] MCX search failed for {search_name}: {response.status_code}")
+                return None
+
+            data = response.json()
+            instruments = data.get("data", [])
+
+            if not instruments:
+                print(f"[Upstox] No MCX contracts found for {search_name}")
+                return None
+
+            # Filter MCX futures only
+            mcx_futures = [
+                inst for inst in instruments
+                if inst.get("exchange", "").upper() == "MCX"
+                and inst.get("instrument_type", "").upper() in ("FUT", "FO")
+            ]
+
+            if not mcx_futures:
+                print(f"[Upstox] No MCX futures found for {search_name}")
+                return None
+
+            # Sort by expiry — pick nearest (front month)
+            mcx_futures.sort(key=lambda x: x.get("expiry", "9999-99-99"))
+            active = mcx_futures[0]
+            instrument_key = active.get("instrument_key", "")
+
+            if not instrument_key:
+                return None
+
+            # Cache it
+            _mcx_contract_cache[symbol] = instrument_key
+            _mcx_cache_date = today
+
+            print(f"[Upstox] MCX contract for {search_name}: {instrument_key} "
+                  f"(expiry: {active.get('expiry', 'unknown')})")
+
+            return instrument_key
+
+        except Exception as e:
+            print(f"[Upstox] MCX contract lookup error for {search_name}: {e}")
+            return None
 
     def _fetch_candles(
         self,
