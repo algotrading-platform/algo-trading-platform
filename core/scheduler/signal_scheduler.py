@@ -1,14 +1,26 @@
 # ============================================================
 # core/scheduler/signal_scheduler.py
 #
-# Market hours:
-#   Equity (NSE/BSE):  9:15 AM – 3:30 PM IST  Mon–Fri
-#   Commodity (MCX):   9:00 AM – 11:55 PM IST  Mon–Fri
+# Market hours: 9:15 AM – 3:30 PM IST  Mon–Fri
+# All instruments scanned together: Indexes + Stocks + Commodities
 #
-# Scan modes:
-#   equity    → indexes + stocks only
-#   commodity → commodities only
-#   all       → everything (morning overlap 9:00–3:30)
+# Strategy selection:
+#   Set SIGNAL_STRATEGY env variable to choose strategy.
+#   Default: "RSI Reversal"
+#
+#   Available strategies:
+#     RSI Reversal
+#     RSI + Pivot Confluence
+#     Bollinger Bands
+#     EMA Crossover
+#     MACD
+#     Volume Breakout
+#     Cash-Futures Arbitrage
+#
+# Instrument universe:
+#   ~180 NSE F&O stocks (fetched dynamically from NSE API)
+#   + 3 Indexes
+#   + 4 Commodities
 # ============================================================
 
 import os
@@ -17,7 +29,6 @@ import time
 import logging
 import calendar
 from datetime import datetime, date
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytz
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -27,25 +38,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 sys.path.append(
-    os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "../..")
-    )
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 )
 
 from data.providers.upstox_provider import UpstoxProvider
-from core.indicators.rsi_indicator import RSIIndicator
-from core.signals.reversal_rsi_signal import ReversalRSISignal
-from core.backtesting.rsi_backtest import RSIBacktest
-from core.backtesting.backtest_store import write_result
-from core.logger.signal_logger import SignalLogger
-from core.alerts.alert_manager import AlertManager
-from configs.instruments import (
-    get_all_instruments,
-    COMMODITIES,
-    COMMODITIES_SKIP_TIMEFRAMES,
-)
+from core.engine.strategy_engine import StrategyEngine
+from core.strategies.strategies import STRATEGY_NAMES
+from configs.universe import get_all_instruments_extended
 from configs.timeframes import TIMEFRAMES, PERIOD_MAP
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,61 +56,46 @@ log = logging.getLogger("scheduler")
 
 IST = pytz.timezone("Asia/Kolkata")
 
+# ============================================================
+# STRATEGY SELECTION
+# ============================================================
+
+_DEFAULT_STRATEGY = "RSI Reversal"
+_ACTIVE_STRATEGY  = os.getenv("SIGNAL_STRATEGY", _DEFAULT_STRATEGY)
+
+ALL_STRATEGY_NAMES = STRATEGY_NAMES + ["Cash-Futures Arbitrage"]
+
+if _ACTIVE_STRATEGY not in ALL_STRATEGY_NAMES:
+    log.warning(
+        f"Unknown strategy '{_ACTIVE_STRATEGY}'. "
+        f"Falling back to '{_DEFAULT_STRATEGY}'."
+    )
+    _ACTIVE_STRATEGY = _DEFAULT_STRATEGY
+
+# ============================================================
+# NSE HOLIDAYS 2025–2027
+# ============================================================
+
 NSE_HOLIDAYS = {
-    # ── 2025 ──────────────────────────────────────────────────
-    date(2025, 1, 26),   # Republic Day
-    date(2025, 2, 26),   # Mahashivratri
-    date(2025, 3, 14),   # Holi
-    date(2025, 3, 31),   # Id-ul-Fitr (Ramzan)
-    date(2025, 4, 14),   # Dr. Ambedkar Jayanti
-    date(2025, 4, 18),   # Good Friday
-    date(2025, 5, 1),    # Maharashtra Day
-    date(2025, 8, 15),   # Independence Day
-    date(2025, 8, 27),   # Ganesh Chaturthi
-    date(2025, 10, 2),   # Gandhi Jayanti / Dussehra
-    date(2025, 10, 20),  # Diwali Laxmi Pujan
-    date(2025, 10, 21),  # Diwali Balipratipada
-    date(2025, 11, 5),   # Prakash Gurpurab
-    date(2025, 12, 25),  # Christmas
+    date(2025, 1, 26), date(2025, 2, 26), date(2025, 3, 14),
+    date(2025, 3, 31), date(2025, 4, 14), date(2025, 4, 18),
+    date(2025, 5, 1),  date(2025, 8, 15), date(2025, 8, 27),
+    date(2025, 10, 2), date(2025, 10, 20),date(2025, 10, 21),
+    date(2025, 11, 5), date(2025, 12, 25),
 
-    # ── 2026 ──────────────────────────────────────────────────
-    date(2026, 1, 26),   # Republic Day
-    date(2026, 2, 26),   # Mahashivratri
-    date(2026, 3, 20),   # Id-ul-Fitr (Ramzan)
-    date(2026, 3, 25),   # Holi
-    date(2026, 4, 2),    # Ram Navami
-    date(2026, 4, 3),    # Good Friday
-    date(2026, 4, 14),   # Dr. Ambedkar Jayanti
-    date(2026, 4, 30),   # Buddha Purnima
-    date(2026, 6, 27),   # Id-ul-Adha (Bakri Id)
-    date(2026, 7, 17),   # Muharram
-    date(2026, 8, 15),   # Independence Day
-    date(2026, 8, 27),   # Ganesh Chaturthi
-    date(2026, 9, 25),   # Dussehra
-    date(2026, 10, 2),   # Gandhi Jayanti
-    date(2026, 10, 20),  # Diwali Laxmi Pujan
-    date(2026, 10, 21),  # Diwali Balipratipada
-    date(2026, 11, 25),  # Guru Nanak Jayanti
-    date(2026, 12, 25),  # Christmas
+    date(2026, 1, 26), date(2026, 2, 26), date(2026, 3, 20),
+    date(2026, 3, 25), date(2026, 4, 2),  date(2026, 4, 3),
+    date(2026, 4, 14), date(2026, 4, 30), date(2026, 6, 27),
+    date(2026, 7, 17), date(2026, 8, 15), date(2026, 8, 27),
+    date(2026, 9, 25), date(2026, 10, 2), date(2026, 10, 20),
+    date(2026, 10, 21),date(2026, 11, 25),date(2026, 12, 25),
 
-    # ── 2027 ──────────────────────────────────────────────────
-    date(2027, 1, 26),   # Republic Day
-    date(2027, 2, 17),   # Mahashivratri
-    date(2027, 3, 10),   # Holi
-    date(2027, 3, 19),   # Id-ul-Fitr (Ramzan)
-    date(2027, 3, 26),   # Good Friday
-    date(2027, 4, 2),    # Ram Navami
-    date(2027, 4, 14),   # Dr. Ambedkar Jayanti
-    date(2027, 4, 30),   # Buddha Purnima
-    date(2027, 8, 15),   # Independence Day
-    date(2027, 8, 16),   # Janmashtami
-    date(2027, 10, 2),   # Gandhi Jayanti
-    date(2027, 10, 8),   # Dussehra
-    date(2027, 10, 29),  # Diwali Laxmi Pujan
-    date(2027, 11, 16),  # Guru Nanak Jayanti
-    date(2027, 12, 25),  # Christmas
+    date(2027, 1, 26), date(2027, 2, 17), date(2027, 3, 10),
+    date(2027, 3, 19), date(2027, 3, 26), date(2027, 4, 2),
+    date(2027, 4, 14), date(2027, 4, 30), date(2027, 8, 15),
+    date(2027, 8, 16), date(2027, 10, 2), date(2027, 10, 8),
+    date(2027, 10, 29),date(2027, 11, 16),date(2027, 12, 25),
 }
-
 
 # ============================================================
 # MARKET HOURS CHECKS
@@ -121,8 +106,8 @@ def is_market_day() -> bool:
     return today.weekday() < 5 and today not in NSE_HOLIDAYS
 
 
-def is_equity_hours() -> bool:
-    """NSE/BSE: 9:15 AM – 3:30 PM IST"""
+def is_market_hours() -> bool:
+    """Single window: 9:15 AM – 3:30 PM IST"""
     if not is_market_day():
         return False
     from datetime import time as dtime
@@ -130,13 +115,13 @@ def is_equity_hours() -> bool:
     return dtime(9, 15) <= t <= dtime(15, 30)
 
 
+# Keep for backward compatibility
+def is_equity_hours() -> bool:
+    return is_market_hours()
+
+
 def is_commodity_hours() -> bool:
-    """MCX non-agri (Gold, Silver, Copper, Crude): 9:00 AM – 11:55 PM IST"""
-    if not is_market_day():
-        return False
-    from datetime import time as dtime
-    t = datetime.now(IST).time()
-    return dtime(9, 0) <= t <= dtime(23, 55)
+    return is_market_hours()
 
 
 def is_last_trading_day_of_month() -> bool:
@@ -150,134 +135,29 @@ def is_last_trading_day_of_month() -> bool:
 
 
 # ============================================================
-# ENGINES
+# ENGINES & INSTRUMENTS
 # ============================================================
 
-provider      = UpstoxProvider()   # Uses Upstox for intraday, yfinance fallback for daily/weekly
-rsi_indicator = RSIIndicator()
-signal_engine = ReversalRSISignal()
-backtest_eng  = RSIBacktest()
-logger        = SignalLogger()
-alerts        = AlertManager()
-instruments   = get_all_instruments()
+provider    = UpstoxProvider()
+instruments = get_all_instruments_extended()
+
+# Build strategy engine with selected strategy
+_engine = StrategyEngine(_ACTIVE_STRATEGY)
 
 
 # ============================================================
-# SINGLE INSTRUMENT SCAN
-# ============================================================
-
-def scan_instrument(
-    symbol:   str,
-    name:     str,
-    category: str,
-    tf_name:  str,
-    interval: str,
-    period:   str,
-    strategy: str = "RSI Reversal",
-    retries:  int = 3,
-) -> dict | None:
-
-    # Skip commodities on intraday timeframes
-    if symbol in COMMODITIES and tf_name in COMMODITIES_SKIP_TIMEFRAMES:
-        return None
-
-    for attempt in range(1, retries + 1):
-        try:
-            df = provider.fetch_data(
-                symbol=symbol,
-                interval=interval,
-                period=period,
-            )
-
-            if df is None or df.empty or len(df) < 20:
-                return None
-
-            df["RSI"] = rsi_indicator.calculate(df["Close"])
-            df.dropna(subset=["RSI"], inplace=True)
-
-            if len(df) < 3:
-                return None
-
-            latest    = df.iloc[-1]
-            signal    = signal_engine.generate_signal(df["RSI"])
-            rsi_val   = round(float(latest["RSI"]), 2)
-            price_val = round(float(latest["Close"]), 2)
-
-            # Log signal
-            logger.log_signal(
-                stock=symbol,
-                timeframe=tf_name,
-                signal=signal,
-                rsi=rsi_val,
-                price=price_val,
-                strategy=strategy,
-            )
-
-            # Alert on state change
-            alert = alerts.check_alert(
-                timeframe=tf_name,
-                stock=symbol,
-                current_signal=signal,
-                rsi=rsi_val,
-                price=price_val,
-                strategy=strategy,
-            )
-
-            if alert:
-                log.info(
-                    f"ALERT  {symbol:20s}  {tf_name:12s}  "
-                    f"{alert['previous']:5s} -> {alert['signal']:5s}  "
-                    f"RSI={rsi_val}  Price={price_val}"
-                )
-
-            # Backtest
-            trades  = backtest_eng.run(df)
-            summary = backtest_eng.summarise(trades)
-
-            write_result(
-                symbol=symbol,
-                name=name,
-                timeframe=tf_name,
-                category=category,
-                summary=summary,
-                period=period,
-                strategy=strategy,
-            )
-
-            return {
-                "symbol":   symbol,
-                "signal":   signal,
-                "rsi":      rsi_val,
-                "price":    price_val,
-                "trades":   summary["trades"],
-                "pnl":      summary["pnl"],
-                "win_rate": summary["win_rate"],
-                "alerted":  alert is not None,
-            }
-
-        except Exception as e:
-            if attempt < retries:
-                log.warning(f"Retry {attempt}/{retries}  {symbol}  {tf_name}  {e}")
-                time.sleep(2 * attempt)
-            else:
-                log.error(f"FAILED {symbol}  {tf_name}  after {retries} attempts: {e}")
-                return None
-
-
-# ============================================================
-# FULL SCAN — one timeframe, filtered by mode
+# FULL SCAN
 # ============================================================
 
 def run_scan(tf_name: str, mode: str = "all") -> None:
     """
-    mode: "equity"    → only INDEX + STOCK
-          "commodity" → only COMMODITY
-          "all"       → everything
+    Run selected strategy scan on all instruments.
+    mode parameter kept for backward compatibility.
     """
     interval = TIMEFRAMES[tf_name]
     period   = PERIOD_MAP[tf_name]
 
-    # Weekly/Monthly special gates
+    # Weekly/Monthly gates
     if tf_name == "1 Week" and datetime.now(IST).weekday() != 4:
         log.info(f"SKIP  {tf_name}  not Friday")
         return
@@ -285,77 +165,30 @@ def run_scan(tf_name: str, mode: str = "all") -> None:
         log.info(f"SKIP  {tf_name}  not last trading day")
         return
 
-    # Filter instruments by mode and market hours
-    scan_list = []
-    for inst in instruments:
-        cat = inst["category"]
-
-        if mode == "equity" and cat == "COMMODITY":
-            continue
-        if mode == "commodity" and cat != "COMMODITY":
-            continue
-
-        # Check appropriate market hours
-        if cat == "COMMODITY":
-            if not is_commodity_hours():
-                continue
-        else:
-            if not is_equity_hours():
-                continue
-
-        scan_list.append(inst)
-
-    if not scan_list:
-        log.info(f"SKIP  {tf_name}  [{mode}]  no instruments in market hours")
+    if not is_market_hours():
+        log.info(f"SKIP  {tf_name}  outside market hours (9:15–3:30 IST)")
         return
 
-    log.info(
-        f"SCAN START  {tf_name}  [{mode}]  "
-        f"{len(scan_list)} instruments  "
-        f"interval={interval}  period={period}"
-    )
+    # Arbitrage only on 5min timeframe (needs live prices)
+    if _ACTIVE_STRATEGY == "Cash-Futures Arbitrage" and tf_name not in ("5 Minutes", "15 Minutes"):
+        log.info(f"SKIP  {tf_name}  Arbitrage runs on 5min/15min only")
+        return
 
-    start_time = time.time()
-    results    = []
-    signals    = 0
-
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {
-            executor.submit(
-                scan_instrument,
-                inst["symbol"],
-                inst["name"],
-                inst["category"],
-                tf_name,
-                interval,
-                period,
-            ): inst
-            for inst in scan_list
-        }
-
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                results.append(result)
-                if result["signal"] != "HOLD":
-                    signals += 1
-
-    elapsed = round(time.time() - start_time, 1)
-    log.info(
-        f"SCAN DONE   {tf_name}  [{mode}]  "
-        f"{len(results)}/{len(scan_list)} processed  "
-        f"{signals} signals  {elapsed}s"
+    _engine.run_scan(
+        provider=provider,
+        tf_name=tf_name,
+        interval=interval,
+        period=period,
+        instruments=instruments,
     )
 
 
 # ============================================================
-# SCHEDULER — local laptop use
+# SCHEDULER
 # ============================================================
 
 def build_scheduler() -> BlockingScheduler:
     scheduler = BlockingScheduler(timezone=IST)
-
-    # ---- EQUITY SCANS (9:15 AM – 3:30 PM) ----
 
     scheduler.add_job(
         lambda: run_scan("5 Minutes", "all"),
@@ -419,18 +252,18 @@ def build_scheduler() -> BlockingScheduler:
         max_instances=1, coalesce=True,
     )
 
-    # No evening scans — everything stops at 3:30 PM IST
-
     return scheduler
 
 
 def start() -> None:
+    total = len(instruments)
     log.info("=" * 60)
     log.info("Algo Trading Signal Scheduler")
-    log.info(f"Instruments : {len(instruments)}")
+    log.info(f"Strategy    : {_ACTIVE_STRATEGY}")
+    log.info(f"Instruments : {total} (Indexes + ~180 F&O Stocks + Commodities)")
     log.info(f"Timeframes  : {list(TIMEFRAMES.keys())}")
-    log.info("Data source : Upstox API (intraday) + yfinance (daily/weekly)")
-    log.info("Market hours: 9:15 AM – 3:30 PM IST (all instruments)")
+    log.info("Data source : Upstox API (primary) + yfinance (fallback)")
+    log.info("Market hours: 9:15 AM – 3:30 PM IST")
     log.info("No pre-market scan. No evening scan.")
     log.info("=" * 60)
     scheduler = build_scheduler()
