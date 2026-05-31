@@ -232,3 +232,117 @@ def is_volume_confirmed(df: pd.DataFrame) -> bool:
         return ratio >= 1.2  # at least 20% above average
     except Exception:
         return True
+
+
+# ============================================================
+# TREND DETECTION — Jwala's logic
+# ============================================================
+
+def get_daily_trend(df_daily: pd.DataFrame) -> str:
+    """
+    Determine if a stock/index is in uptrend or downtrend
+    based on its daily chart.
+
+    Logic:
+      RISING  → price > EMA20 AND 5-day momentum positive
+      FALLING → price < EMA20 AND 5-day momentum negative
+      NEUTRAL → mixed signals
+
+    Returns: "RISING" | "FALLING" | "NEUTRAL"
+    """
+    if df_daily is None or df_daily.empty or len(df_daily) < 21:
+        return "NEUTRAL"
+
+    try:
+        df = add_ema(df_daily.copy(), periods=[20])
+        df.dropna(subset=["EMA_20"], inplace=True)
+
+        if df.empty:
+            return "NEUTRAL"
+
+        latest  = df.iloc[-1]
+        price   = float(latest["Close"])
+        ema20   = float(latest["EMA_20"])
+
+        # 5-day momentum
+        if len(df) >= 5:
+            price_5d = float(df.iloc[-5]["Close"])
+            momentum = (price - price_5d) / price_5d * 100
+        else:
+            momentum = 0.0
+
+        if price > ema20 and momentum >= 0:
+            return "RISING"
+        elif price < ema20 and momentum <= 0:
+            return "FALLING"
+        elif price > ema20:
+            return "RISING"
+        elif price < ema20:
+            return "FALLING"
+
+    except Exception:
+        pass
+
+    return "NEUTRAL"
+
+
+def calculate_signal_strength(
+    signal:       str,
+    nifty_trend:  str,
+    stock_trend:  str,
+) -> str:
+    """
+    Determine signal strength based on Nifty + stock daily trends.
+
+    BUY strength:
+      Nifty RISING + Stock RISING  → STRONG
+      Stock RISING only             → MODERATE
+      Nifty RISING only             → MODERATE
+      Both FALLING                  → WEAK (will be suppressed)
+
+    SELL strength:
+      Nifty FALLING + Stock FALLING → STRONG
+      Stock FALLING only            → MODERATE
+      Nifty FALLING only            → MODERATE
+      Both RISING                   → WEAK (will be suppressed)
+    """
+    if signal == "BUY":
+        if nifty_trend == "RISING" and stock_trend == "RISING":
+            return "STRONG"
+        elif stock_trend == "RISING":
+            return "MODERATE"
+        elif nifty_trend == "RISING":
+            return "MODERATE"
+        else:
+            return "WEAK"
+
+    elif signal == "SELL":
+        if nifty_trend == "FALLING" and stock_trend == "FALLING":
+            return "STRONG"
+        elif stock_trend == "FALLING":
+            return "MODERATE"
+        elif nifty_trend == "FALLING":
+            return "MODERATE"
+        else:
+            return "WEAK"
+
+    return "WEAK"
+
+
+def should_suppress_signal(
+    signal:      str,
+    nifty_trend: str,
+    stock_trend: str,
+) -> bool:
+    """
+    Suppress signal when both index and stock trend oppose it.
+    Reduces noise and improves signal quality.
+
+    Suppress BUY when: Nifty FALLING + Stock FALLING
+    Suppress SELL when: Nifty RISING + Stock RISING
+    """
+    if signal == "BUY":
+        return nifty_trend == "FALLING" and stock_trend == "FALLING"
+    if signal == "SELL":
+        return nifty_trend == "RISING" and stock_trend == "RISING"
+    return False

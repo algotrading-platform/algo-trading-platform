@@ -2,11 +2,11 @@
 # core/engine/strategy_engine.py
 #
 # Runs the selected strategy on all instruments.
-# Handles both regular strategies and Cash-Futures Arbitrage.
-#
-# Usage:
-#   engine = StrategyEngine("RSI Reversal")
-#   results = engine.run_scan(tf_name, instruments)
+# Applies Jwala's trend-based signal strength logic:
+#   - Fetches Nifty daily trend once per scan cycle
+#   - Fetches each stock's daily trend per instrument
+#   - Calculates STRONG / MODERATE / WEAK from trends
+#   - Suppresses signals when both trends oppose the signal
 # ============================================================
 
 import time
@@ -18,7 +18,12 @@ import pytz
 
 from core.strategies.strategies import get_strategy, STRATEGY_NAMES
 from core.strategies.arbitrage_strategy import ArbitrageStrategy, arbitrage_strategy
-from core.indicators.indicators import add_rsi
+from core.indicators.indicators import (
+    add_rsi,
+    get_daily_trend,
+    calculate_signal_strength,
+    should_suppress_signal,
+)
 from core.logger.signal_logger import SignalLogger
 from core.alerts.alert_manager import AlertManager
 from core.backtesting.rsi_backtest import RSIBacktest
@@ -28,12 +33,49 @@ log = logging.getLogger("strategy_engine")
 IST = pytz.timezone("Asia/Kolkata")
 
 ARBITRAGE_STRATEGY_NAME = "Cash-Futures Arbitrage"
+NIFTY_SYMBOL = "^NSEI"
+
+
+# ============================================================
+# NIFTY TREND — fetched once per scan cycle
+# ============================================================
+
+_nifty_trend_cache: dict = {"trend": "NEUTRAL", "date": None}
+
+
+def get_nifty_daily_trend(provider) -> str:
+    """
+    Fetch Nifty daily trend. Cached per calendar day.
+    Returns RISING | FALLING | NEUTRAL.
+    """
+    global _nifty_trend_cache
+
+    from datetime import date
+    today = date.today().isoformat()
+
+    if _nifty_trend_cache["date"] == today:
+        return _nifty_trend_cache["trend"]
+
+    try:
+        df = provider.fetch_data(
+            symbol=NIFTY_SYMBOL,
+            interval="1d",
+            period="3mo",
+        )
+        trend = get_daily_trend(df)
+        _nifty_trend_cache = {"trend": trend, "date": today}
+        log.info(f"Nifty daily trend: {trend}")
+        return trend
+    except Exception as e:
+        log.warning(f"Could not fetch Nifty trend: {e}")
+        return "NEUTRAL"
 
 
 class StrategyEngine:
     """
     Runs a selected strategy on a list of instruments.
-    Handles data fetching, signal generation, logging, alerting.
+    Enriches every signal with Nifty + stock trend context.
+    Suppresses low-quality signals automatically.
     """
 
     def __init__(self, strategy_name: str):
@@ -55,38 +97,49 @@ class StrategyEngine:
     def scan_instrument(
         self,
         provider,
-        symbol:   str,
-        name:     str,
-        category: str,
-        tf_name:  str,
-        interval: str,
-        period:   str,
-        retries:  int = 3,
+        symbol:       str,
+        name:         str,
+        category:     str,
+        tf_name:      str,
+        interval:     str,
+        period:       str,
+        nifty_trend:  str = "NEUTRAL",
+        retries:      int = 3,
     ) -> dict | None:
-        """
-        Scan a single instrument with the selected strategy.
-        Returns result dict or None on failure.
-        """
         if self.is_arbitrage:
             return self._scan_arbitrage(
-                provider, symbol, name, category, tf_name, interval, period, retries
+                provider, symbol, name, category,
+                tf_name, interval, period, nifty_trend, retries
             )
         return self._scan_standard(
-            provider, symbol, name, category, tf_name, interval, period, retries
+            provider, symbol, name, category,
+            tf_name, interval, period, nifty_trend, retries
         )
+
+    def _get_stock_daily_trend(self, provider, symbol: str) -> str:
+        """Fetch stock's own daily trend for strength calculation."""
+        try:
+            df_daily = provider.fetch_data(
+                symbol=symbol,
+                interval="1d",
+                period="3mo",
+            )
+            return get_daily_trend(df_daily)
+        except Exception:
+            return "NEUTRAL"
 
     def _scan_standard(
         self,
         provider,
-        symbol:   str,
-        name:     str,
-        category: str,
-        tf_name:  str,
-        interval: str,
-        period:   str,
-        retries:  int = 3,
+        symbol:      str,
+        name:        str,
+        category:    str,
+        tf_name:     str,
+        interval:    str,
+        period:      str,
+        nifty_trend: str = "NEUTRAL",
+        retries:     int = 3,
     ) -> dict | None:
-        """Run a standard (non-arbitrage) strategy on one instrument."""
 
         for attempt in range(1, retries + 1):
             try:
@@ -99,7 +152,6 @@ class StrategyEngine:
                 if df is None or df.empty or len(df) < 20:
                     return None
 
-                # Ensure RSI is available for backtest + price/rsi logging
                 df_with_rsi = add_rsi(df.copy())
                 df_with_rsi.dropna(subset=["RSI"], inplace=True)
 
@@ -110,9 +162,36 @@ class StrategyEngine:
                 rsi_val   = round(float(latest["RSI"]), 2)
                 price_val = round(float(latest["Close"]), 2)
 
-                # Run selected strategy
+                # Run strategy
                 result = self.strategy.generate_signal(df.copy())
                 signal = result.signal
+
+                # ── Trend-based strength (Jwala's logic) ──
+                if signal in ("BUY", "SELL"):
+                    # For indexes and commodities use NEUTRAL stock trend
+                    if category in ("INDEX", "COMMODITY"):
+                        stock_trend = "NEUTRAL"
+                    else:
+                        stock_trend = self._get_stock_daily_trend(provider, symbol)
+
+                    # Check suppression
+                    if should_suppress_signal(signal, nifty_trend, stock_trend):
+                        log.debug(
+                            f"SUPPRESSED {symbol} {signal} — "
+                            f"Nifty:{nifty_trend} Stock:{stock_trend}"
+                        )
+                        signal = "HOLD"
+
+                    else:
+                        # Recalculate strength based on trends
+                        trend_strength = calculate_signal_strength(
+                            signal, nifty_trend, stock_trend
+                        )
+                        result.strength    = trend_strength
+                        result.nifty_trend = nifty_trend
+                        result.stock_trend = stock_trend
+                else:
+                    stock_trend = "NEUTRAL"
 
                 # Log signal
                 self.logger.log_signal(
@@ -124,7 +203,7 @@ class StrategyEngine:
                     strategy=self.strategy_name,
                 )
 
-                # Alert on state change — pass full result for rich message
+                # Alert on state change
                 alert = self.alerts.check_alert(
                     timeframe=tf_name,
                     stock=symbol,
@@ -139,7 +218,8 @@ class StrategyEngine:
                     log.info(
                         f"ALERT  {symbol:20s}  {tf_name:12s}  "
                         f"{alert['previous']:5s} → {signal:5s}  "
-                        f"RSI={rsi_val}  [{result.strength}]"
+                        f"[{result.strength}]  "
+                        f"Nifty:{nifty_trend}  Stock:{stock_trend}"
                     )
 
                 # Backtest
@@ -157,16 +237,18 @@ class StrategyEngine:
                 )
 
                 return {
-                    "symbol":    symbol,
-                    "signal":    signal,
-                    "strength":  result.strength,
-                    "reason":    result.reason,
-                    "rsi":       rsi_val,
-                    "price":     price_val,
-                    "trades":    summary["trades"],
-                    "pnl":       summary["pnl"],
-                    "win_rate":  summary["win_rate"],
-                    "alerted":   alert is not None,
+                    "symbol":      symbol,
+                    "signal":      signal,
+                    "strength":    result.strength,
+                    "reason":      result.reason,
+                    "nifty_trend": nifty_trend,
+                    "stock_trend": stock_trend,
+                    "rsi":         rsi_val,
+                    "price":       price_val,
+                    "trades":      summary["trades"],
+                    "pnl":         summary["pnl"],
+                    "win_rate":    summary["win_rate"],
+                    "alerted":     alert is not None,
                 }
 
             except Exception as e:
@@ -180,23 +262,19 @@ class StrategyEngine:
     def _scan_arbitrage(
         self,
         provider,
-        symbol:   str,
-        name:     str,
-        category: str,
-        tf_name:  str,
-        interval: str,
-        period:   str,
-        retries:  int = 3,
+        symbol:      str,
+        name:        str,
+        category:    str,
+        tf_name:     str,
+        interval:    str,
+        period:      str,
+        nifty_trend: str = "NEUTRAL",
+        retries:     int = 3,
     ) -> dict | None:
-        """
-        Run Cash-Futures Arbitrage scan on one instrument.
-        Only applicable to STOCK category (not indexes or commodities).
-        """
-        # Arbitrage only applies to NSE stocks with F&O contracts
+
         if category != "STOCK":
             return None
 
-        # Get Upstox token
         try:
             from data.providers.upstox_provider import get_token
             token = get_token()
@@ -204,12 +282,10 @@ class StrategyEngine:
             token = None
 
         if not token:
-            log.warning(f"[Arbitrage] No Upstox token — skipping {symbol}")
             return None
 
         for attempt in range(1, retries + 1):
             try:
-                # Fetch spot price
                 df = provider.fetch_data(
                     symbol=symbol,
                     interval=interval,
@@ -221,29 +297,24 @@ class StrategyEngine:
 
                 spot_price = round(float(df["Close"].iloc[-1]), 2)
 
-                # Generate arbitrage signal
                 result = arbitrage_strategy.generate_arbitrage_signal(
                     symbol=symbol,
                     spot_price=spot_price,
                     token=token,
                 )
 
-                signal = result.signal
-
-                # Use spread_pct as RSI equivalent for logging
+                signal     = result.signal
                 spread_pct = result.indicators.get("Spread_Pct", 0.0)
 
-                # Log signal
                 self.logger.log_signal(
                     stock=symbol,
                     timeframe=tf_name,
                     signal=signal,
-                    rsi=spread_pct,  # store spread % in RSI field
+                    rsi=spread_pct,
                     price=spot_price,
                     strategy=self.strategy_name,
                 )
 
-                # Alert
                 alert = self.alerts.check_alert(
                     timeframe=tf_name,
                     stock=symbol,
@@ -254,18 +325,13 @@ class StrategyEngine:
                     signal_result=result,
                 )
 
-                if alert:
-                    log.info(
-                        f"ARBITRAGE  {symbol:20s}  "
-                        f"Spread={spread_pct}%  "
-                        f"[{result.strength}]"
-                    )
-
                 return {
                     "symbol":      symbol,
                     "signal":      signal,
                     "strength":    result.strength,
                     "reason":      result.reason,
+                    "nifty_trend": "NEUTRAL",
+                    "stock_trend": "NEUTRAL",
                     "rsi":         spread_pct,
                     "price":       spot_price,
                     "indicators":  result.indicators,
@@ -277,7 +343,7 @@ class StrategyEngine:
                     log.warning(f"[Arbitrage] Retry {attempt}/{retries}  {symbol}: {e}")
                     time.sleep(2 * attempt)
                 else:
-                    log.error(f"[Arbitrage] FAILED {symbol} after {retries} attempts: {e}")
+                    log.error(f"[Arbitrage] FAILED {symbol}: {e}")
                     return None
 
     def run_scan(
@@ -289,16 +355,16 @@ class StrategyEngine:
         instruments: list[dict],
         max_workers: int = 10,
     ) -> list[dict]:
-        """
-        Run strategy on all instruments in parallel.
-        Returns list of result dicts.
-        """
+
         if not instruments:
             return []
 
+        # Fetch Nifty trend ONCE per scan cycle
+        nifty_trend = get_nifty_daily_trend(provider)
+
         log.info(
             f"SCAN START  [{self.strategy_name}]  {tf_name}  "
-            f"{len(instruments)} instruments"
+            f"{len(instruments)} instruments  Nifty:{nifty_trend}"
         )
 
         start_time = time.time()
@@ -316,6 +382,7 @@ class StrategyEngine:
                     tf_name,
                     interval,
                     period,
+                    nifty_trend,
                 ): inst
                 for inst in instruments
             }

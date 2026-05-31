@@ -1,11 +1,5 @@
 # ============================================================
 # core/strategies/base_strategy.py
-#
-# Base class for all trading strategies.
-# Every strategy must implement:
-#   - name: str
-#   - description: str
-#   - generate_signal(df) -> SignalResult
 # ============================================================
 
 from dataclasses import dataclass, field
@@ -14,14 +8,14 @@ from typing import Optional
 
 @dataclass
 class SignalResult:
-    """
-    Standardised signal output from any strategy.
-    """
+    """Standardised signal output from any strategy."""
     signal:      str              # BUY | SELL | HOLD
     strength:    str              # STRONG | MODERATE | WEAK
     reason:      str              # Human-readable explanation
-    indicators:  dict = field(default_factory=dict)  # Key indicator values
-    strategy:    str  = ""        # Strategy name (set by engine)
+    indicators:  dict = field(default_factory=dict)
+    strategy:    str  = ""
+    nifty_trend: str  = "NEUTRAL"  # RISING | FALLING | NEUTRAL
+    stock_trend: str  = "NEUTRAL"  # RISING | FALLING | NEUTRAL
 
     def is_actionable(self) -> bool:
         return self.signal in ("BUY", "SELL")
@@ -31,16 +25,19 @@ class SignalResult:
         if self.signal == "SELL": return "🔴"
         return "⚪"
 
-    def strength_emoji(self) -> str:
-        if self.strength == "STRONG":   return "💪"
-        if self.strength == "MODERATE": return "👍"
-        return "👌"
+    def trend_line(self) -> str:
+        """One-line trend summary for Telegram."""
+        def _arrow(t):
+            if t == "RISING":  return "↑"
+            if t == "FALLING": return "↓"
+            return "→"
+        return (
+            f"Nifty {_arrow(self.nifty_trend)} {self.nifty_trend.capitalize()}  |  "
+            f"Stock {_arrow(self.stock_trend)} {self.stock_trend.capitalize()}"
+        )
 
 
 class BaseStrategy:
-    """
-    Abstract base class for all strategies.
-    """
     name:        str = "Base Strategy"
     description: str = "Base strategy — override in subclass"
 

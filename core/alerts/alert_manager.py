@@ -1,12 +1,12 @@
 # ============================================================
 # core/alerts/alert_manager.py
 #
-# Enhanced with:
-#   - Signal strength (STRONG / MODERATE / WEAK)
-#   - Strategy explanation (why this is a signal)
-#   - Key indicator values
-#   - Arbitrage breakdown (spread %, profit estimate)
-#   - Clean formatted Telegram message
+# Compact Telegram message format — Jwala's requested layout:
+#
+#   🟢 HDFCBANK — BUY — 1H
+#   ₹786.85  (10:16 IST)
+#   💪 STRONG  |  RSI Reversal
+#   📊 Nifty ↑ Rising  |  Stock ↑ Uptrend
 # ============================================================
 
 import os
@@ -38,6 +38,18 @@ def _display_name(symbol: str) -> str:
     return symbol.replace(".NS", "")
 
 
+def _trend_arrow(trend: str) -> str:
+    if trend == "RISING":  return "↑"
+    if trend == "FALLING": return "↓"
+    return "→"
+
+
+def _strength_emoji(strength: str) -> str:
+    if strength == "STRONG":   return "💪"
+    if strength == "MODERATE": return "👍"
+    return "👌"
+
+
 class AlertManager:
 
     def __init__(self):
@@ -46,18 +58,15 @@ class AlertManager:
 
     def check_alert(
         self,
-        timeframe:     str,
-        stock:         str,
+        timeframe:      str,
+        stock:          str,
         current_signal: str,
-        rsi:           float,
-        price:         float,
-        strategy:      str  = "RSI Reversal",
-        signal_result  = None,  # SignalResult object if available
+        rsi:            float,
+        price:          float,
+        strategy:       str  = "RSI Reversal",
+        signal_result   = None,
     ) -> dict | None:
-        """
-        Returns alert dict if signal changed, else None.
-        Fires Telegram message on state transition.
-        """
+
         previous_signal = db.get_alert_state(stock, timeframe)
 
         if previous_signal is None:
@@ -73,13 +82,13 @@ class AlertManager:
         db.upsert_alert_state(stock, timeframe, current_signal)
 
         alert = {
-            "stock":     stock,
-            "timeframe": timeframe,
-            "signal":    current_signal,
-            "previous":  previous_signal,
-            "rsi":       round(float(rsi), 2),
-            "price":     round(float(price), 2),
-            "strategy":  strategy,
+            "stock":         stock,
+            "timeframe":     timeframe,
+            "signal":        current_signal,
+            "previous":      previous_signal,
+            "rsi":           round(float(rsi), 2),
+            "price":         round(float(price), 2),
+            "strategy":      strategy,
             "signal_result": signal_result,
         }
 
@@ -91,27 +100,26 @@ class AlertManager:
     def _send_telegram(self, alert: dict) -> None:
         signal   = alert["signal"]
         name     = _display_name(alert["stock"])
-        ist_now  = datetime.now(IST).strftime("%d %b %Y  %H:%M IST")
-        strategy = alert["strategy"]
         tf       = alert["timeframe"]
-        rsi      = alert["rsi"]
         price    = alert["price"]
-        previous = alert["previous"]
+        strategy = alert["strategy"]
         result   = alert.get("signal_result")
 
-        # Signal emoji and header
-        if signal == "BUY":
-            header_emoji = "🟢"
-            action_line  = "📈 *LONG OPPORTUNITY*"
-        else:
-            header_emoji = "🔴"
-            action_line  = "📉 *SHORT OPPORTUNITY*"
+        # Time
+        ist_now = datetime.now(IST).strftime("%H:%M IST")
 
-        # Strength emoji
-        strength = "MODERATE"
+        # Trends from signal result
+        nifty_trend = "NEUTRAL"
+        stock_trend = "NEUTRAL"
+        strength    = "MODERATE"
+
         if result:
-            strength = result.strength
-        strength_emoji = {"STRONG": "💪", "MODERATE": "👍", "WEAK": "👌"}.get(strength, "👍")
+            nifty_trend = getattr(result, "nifty_trend", "NEUTRAL")
+            stock_trend = getattr(result, "stock_trend", "NEUTRAL")
+            strength    = getattr(result, "strength",    "MODERATE")
+
+        # Signal emoji
+        sig_emoji = "🟢" if signal == "BUY" else "🔴"
 
         # Price format
         try:
@@ -119,115 +127,33 @@ class AlertManager:
         except Exception:
             price_str = str(price)
 
-        # Build message
-        lines = [
-            f"{header_emoji} *ALGO SIGNAL — {signal}*",
-            f"━━━━━━━━━━━━━━━━━━━━━",
-            f"📌 *{name}*",
-            f"{action_line}",
-            f"",
-            f"📊 *Signal Details*",
-            f"Strength  : {strength_emoji} `{strength}`",
-            f"Strategy  : `{strategy}`",
-            f"Timeframe : `{tf}`",
-            f"Price     : `{price_str}`",
-        ]
-
-        # RSI or Spread depending on strategy
+        # Arbitrage gets different format
         if strategy == "Cash-Futures Arbitrage":
-            lines.append(f"Spread    : `{rsi}%`")
+            spread = alert["rsi"]  # stored spread % in rsi field
+            indicators = result.indicators if result else {}
+            gross   = indicators.get("Gross_Profit", 0)
+            net     = indicators.get("Net_Profit_Est", 0)
+            expiry  = indicators.get("Expiry", "")
+            fut_sym = indicators.get("Futures_Symbol", "")
+
+            message = (
+                f"{sig_emoji} *{name} — ARBITRAGE*\n"
+                f"Spot: `{price_str}`  Spread: `{spread}%`  ({ist_now})\n"
+                f"Futures: `{fut_sym}`  Expiry: `{expiry}`\n"
+                f"Est. profit: `₹{gross:,.0f}` gross  /  `₹{net:,.0f}` net\n"
+                f"_Buy spot + Sell futures simultaneously_"
+            )
         else:
-            lines.append(f"RSI       : `{rsi}`")
+            # Compact format — Jwala's design
+            nifty_line = f"Nifty {_trend_arrow(nifty_trend)} {nifty_trend.capitalize()}"
+            stock_line = f"Stock {_trend_arrow(stock_trend)} {stock_trend.capitalize()}"
 
-        lines.append(f"Changed   : `{previous} → {signal}`")
-        lines.append(f"")
-
-        # Strategy explanation — why this is a signal
-        if result and result.reason:
-            lines.append(f"🧠 *Why this signal?*")
-            # For arbitrage, reason is multi-line — format nicely
-            if strategy == "Cash-Futures Arbitrage":
-                reason_lines = result.reason.split("\n")
-                for rl in reason_lines[:6]:  # max 6 lines
-                    if rl.strip():
-                        lines.append(f"  {rl.strip()}")
-            else:
-                # Truncate long reasons
-                reason = result.reason
-                if len(reason) > 200:
-                    reason = reason[:197] + "..."
-                lines.append(f"  _{reason}_")
-            lines.append(f"")
-
-        # Key indicators
-        if result and result.indicators:
-            lines.append(f"📈 *Key Indicators*")
-            indicators = result.indicators
-
-            if strategy == "Cash-Futures Arbitrage":
-                spot    = indicators.get("Spot_Price", 0)
-                futures = indicators.get("Futures_Price", 0)
-                spread  = indicators.get("Spread_Abs", 0)
-                lot     = indicators.get("Lot_Size", 0)
-                gross   = indicators.get("Gross_Profit", 0)
-                net     = indicators.get("Net_Profit_Est", 0)
-                expiry  = indicators.get("Expiry", "")
-                fut_sym = indicators.get("Futures_Symbol", "")
-                lines += [
-                    f"  Spot     : `₹{spot:,.2f}`",
-                    f"  Futures  : `₹{futures:,.2f}` ({fut_sym})",
-                    f"  Spread   : `₹{spread:.2f}/share`",
-                    f"  Lot size : `{lot} shares`",
-                    f"  Gross P&L: `₹{gross:,.0f}`",
-                    f"  Est. Net : `₹{net:,.0f}`",
-                    f"  Expiry   : `{expiry}`",
-                ]
-            elif strategy == "RSI + Pivot Confluence":
-                lines += [
-                    f"  RSI : `{indicators.get('RSI', '')}` (prev: {indicators.get('RSI_prev', '')})",
-                    f"  PP  : `₹{indicators.get('PP', '')}`",
-                    f"  S1  : `₹{indicators.get('S1', '')}`",
-                    f"  R1  : `₹{indicators.get('R1', '')}`",
-                ]
-            elif strategy == "Bollinger Bands":
-                lines += [
-                    f"  BB%B  : `{indicators.get('BB_PCT', '')}`",
-                    f"  Upper : `₹{indicators.get('BB_UPPER', '')}`",
-                    f"  Lower : `₹{indicators.get('BB_LOWER', '')}`",
-                    f"  Mid   : `₹{indicators.get('BB_MID', '')}`",
-                ]
-            elif strategy == "EMA Crossover":
-                lines += [
-                    f"  EMA9  : `₹{indicators.get('EMA_9', '')}`",
-                    f"  EMA20 : `₹{indicators.get('EMA_20', '')}`",
-                    f"  EMA50 : `₹{indicators.get('EMA_50', '')}`",
-                    f"  Trend : `{indicators.get('Trend', '')}`",
-                ]
-            elif strategy == "MACD":
-                lines += [
-                    f"  MACD   : `{indicators.get('MACD', '')}`",
-                    f"  Signal : `{indicators.get('MACD_Signal', '')}`",
-                    f"  Hist   : `{indicators.get('MACD_Hist', '')}`",
-                ]
-            elif strategy == "Volume Breakout":
-                lines += [
-                    f"  Vol Ratio  : `{indicators.get('Vol_Ratio', '')}x avg`",
-                    f"  Period High: `₹{indicators.get('Period_High', '')}`",
-                    f"  Period Low : `₹{indicators.get('Period_Low', '')}`",
-                ]
-            else:
-                # Generic RSI
-                lines.append(f"  RSI : `{rsi}`")
-            lines.append(f"")
-
-        # Footer
-        lines += [
-            f"🕐 `{ist_now}`",
-            f"━━━━━━━━━━━━━━━━━━━━━",
-            f"_For research purposes only. Not financial advice._",
-        ]
-
-        message = "\n".join(lines)
+            message = (
+                f"{sig_emoji} *{name} — {signal} — {tf}*\n"
+                f"`{price_str}`  ({ist_now})\n"
+                f"{_strength_emoji(strength)} {strength}  |  {strategy}\n"
+                f"📊 {nifty_line}  |  {stock_line}"
+            )
 
         url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
         try:
