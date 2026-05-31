@@ -1,6 +1,11 @@
 # ============================================================
 # core/backtesting/rsi_backtest.py
+#
+# RSI levels match reversal_rsi_signal.py: 25/75
 # ============================================================
+
+RSI_OVERSOLD   = 25   # matches reversal_rsi_signal.py
+RSI_OVERBOUGHT = 75   # matches reversal_rsi_signal.py
 
 
 class RSIBacktest:
@@ -9,14 +14,14 @@ class RSIBacktest:
         """
         Simulate RSI reversal strategy on historical data.
         Uses same reversal logic as ReversalRSISignal:
-          BUY  when RSI bounces back above 30 after being below
-          SELL when RSI drops back below 70 after being above
+          BUY  when RSI bounces back above 25 after being below
+          SELL when RSI drops back below 75 after being above
 
         Returns list of trade dicts.
         Completed trades (BUY + SELL pair) contain PnL and PnL%.
         """
-        trades   = []
-        position = None
+        trades    = []
+        position  = None
         buy_price = 0.0
 
         for i in range(2, len(df)):
@@ -27,9 +32,9 @@ class RSIBacktest:
             except (TypeError, ValueError):
                 continue
 
-            # ---- BUY: RSI bouncing from below 30 ----
+            # ---- BUY: RSI bouncing from below 25 ----
             if (
-                previous_rsi < 30
+                previous_rsi < RSI_OVERSOLD
                 and current_rsi > previous_rsi
                 and position is None
             ):
@@ -40,9 +45,9 @@ class RSIBacktest:
                     "Price": round(close, 2),
                 })
 
-            # ---- SELL: RSI reversing from above 70 ----
+            # ---- SELL: RSI reversing from above 75 ----
             elif (
-                previous_rsi > 70
+                previous_rsi > RSI_OVERBOUGHT
                 and current_rsi < previous_rsi
                 and position == "BUY"
             ):

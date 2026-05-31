@@ -3,20 +3,26 @@
 #
 # Reversal confirmation logic (Jwala-approved):
 #
-#   BUY  : RSI was below 30 (trigger), then bounced up for
-#          2 consecutive candles AND crossed back above 30.
-#          This avoids buying into a continuing downtrend.
+#   BUY  : RSI was below 25 (trigger), then bounced up for
+#          2 consecutive candles AND crossed back above 25.
+#          Deeper oversold threshold = fewer, higher quality signals.
 #
-#   SELL : RSI was above 70 (trigger), then turned down for
-#          2 consecutive candles AND crossed back below 70.
-#          This avoids selling into a continuing uptrend.
+#   SELL : RSI was above 75 (trigger), then turned down for
+#          2 consecutive candles AND crossed back below 75.
+#          Deeper overbought threshold = fewer, higher quality signals.
 #
 #   HOLD : Everything else.
+#
+# Changed from 30/70 to 25/75 to reduce signal noise and
+# generate only high-conviction reversal opportunities.
 #
 # Deduplication (previous_signal) is handled by SignalLogger,
 # NOT here. This method always returns the market state so the
 # logger can decide whether to record it.
 # ============================================================
+
+RSI_OVERSOLD  = 25   # BUY trigger level
+RSI_OVERBOUGHT = 75  # SELL trigger level
 
 
 class ReversalRSISignal:
@@ -42,32 +48,32 @@ class ReversalRSISignal:
         prev2    = rsi_series.iloc[-3]
 
         # --------------------------------------------------
-        # BUY: RSI dipped below 30, now recovering
-        #   prev2 < 30  → was in oversold zone
+        # BUY: RSI dipped below 25, now recovering
+        #   prev2 < 25  → was in deep oversold zone
         #   prev  > prev2  → first bounce candle
         #   current > prev → second bounce candle (confirmation)
-        #   current > 30   → crossed back out of oversold zone
+        #   current > 25   → crossed back out of oversold zone
         # --------------------------------------------------
         if (
-            prev2 < 30
+            prev2 < RSI_OVERSOLD
             and prev > prev2
             and current > prev
-            and current > 30
+            and current > RSI_OVERSOLD
         ):
             return "BUY"
 
         # --------------------------------------------------
-        # SELL: RSI pushed above 70, now reversing
-        #   prev2 > 70  → was in overbought zone
+        # SELL: RSI pushed above 75, now reversing
+        #   prev2 > 75  → was in deep overbought zone
         #   prev  < prev2  → first drop candle
         #   current < prev → second drop candle (confirmation)
-        #   current < 70   → crossed back out of overbought zone
+        #   current < 75   → crossed back out of overbought zone
         # --------------------------------------------------
         if (
-            prev2 > 70
+            prev2 > RSI_OVERBOUGHT
             and prev < prev2
             and current < prev
-            and current < 70
+            and current < RSI_OVERBOUGHT
         ):
             return "SELL"
 
