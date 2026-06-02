@@ -31,7 +31,7 @@ from configs.instruments import (
 from configs.universe import get_fno_universe, FALLBACK_FNO_SYMBOLS
 from configs.timeframes import TIMEFRAMES, TV_INTERVALS, PERIOD_MAP
 
-ALL_STRATEGY_NAMES = STRATEGY_NAMES + ["Cash-Futures Arbitrage"]
+ALL_STRATEGY_NAMES = ["All Strategies"] + STRATEGY_NAMES + ["Cash-Futures Arbitrage"]
 
 # ============================================================
 # PAGE CONFIG
@@ -224,6 +224,21 @@ div[data-testid="metric-container"] [data-testid="stMetricValue"] { color: var(-
 ::-webkit-scrollbar { width:4px; height:4px; }
 ::-webkit-scrollbar-track { background:var(--bg); }
 ::-webkit-scrollbar-thumb { background:var(--border2); border-radius:2px; }
+
+/* Responsive — MacBook Air 13" and smaller screens */
+@media (max-width: 1400px) {
+    .stock-name { font-size:12px !important; }
+    .col-hdr { font-size:10px !important; letter-spacing:0.8px !important; }
+    div[data-testid="metric-container"] [data-testid="stMetricValue"] { font-size:20px !important; }
+}
+@media (max-width: 1280px) {
+    .stock-name { font-size:11px !important; }
+    .stock-sym  { font-size:9px !important; }
+    .badge-buy, .badge-sell { font-size:10px !important; padding:3px 8px !important; }
+    .col-hdr { font-size:9px !important; letter-spacing:0.5px !important; }
+    div[data-testid="metric-container"] [data-testid="stMetricValue"] { font-size:18px !important; }
+    div[data-testid="metric-container"] { padding:10px 12px !important; }
+}
 """
 
 theme = DARK if st.session_state.dark_mode else LIGHT
@@ -279,7 +294,9 @@ def fmt_price(val) -> str:
     except: return "—"
 
 def get_latest_signals(tf: str, strategy: str) -> pd.DataFrame:
-    logs = logger.get_logs(strategy=strategy)
+    # "All Strategies" shows latest signal regardless of strategy
+    strat_filter = None if strategy == "All Strategies" else strategy
+    logs = logger.get_logs(strategy=strat_filter)
     if logs.empty: return pd.DataFrame()
     tf_logs = logs[logs["Timeframe"] == tf].copy()
     if tf_logs.empty: return pd.DataFrame()
@@ -708,7 +725,7 @@ st.markdown("<div style='border-top:1px solid var(--border);margin:16px 0 24px;'
 # LOAD DATA
 # ============================================================
 
-all_logs       = logger.get_logs(strategy=selected_strategy)
+all_logs       = logger.get_logs(strategy=None if selected_strategy == "All Strategies" else selected_strategy)
 latest_signals = get_latest_signals(selected_tf, selected_strategy)
 backtest_data  = get_results(selected_tf)
 total_buy = total_sell = total_hold = 0
@@ -887,13 +904,13 @@ def render_section(rows, title, dot_color="#4a90e2"):
     action = sorted(action, key=lambda r: str(r.get("ts", "—")), reverse=True)
 
     # Column headers
-    h = st.columns([2.0, 0.8, 0.7, 0.8, 1.0, 1.1, 1.0, 0.9, 1.5, 0.8])
-    for col, lbl in zip(h, ["Instrument", "Signal", "Strength", "Sig RSI",
-                             "Sig Price", "Cur Price", "PnL", "Win Rate", "Signal Time", "Chart"]):
+    h = st.columns([2.2, 0.7, 0.9, 0.8, 1.2, 1.0, 0.9, 1.2, 0.7])
+    for col, lbl in zip(h, ["Instrument", "Signal", "Strength", "RSI",
+                             "Price → Now", "PnL", "Win%", "Signal Time", "📈"]):
         col.markdown(f'<div class="col-hdr">{lbl}</div>', unsafe_allow_html=True)
 
     for row in action:
-        c = st.columns([2.0, 0.8, 0.7, 0.8, 1.0, 1.1, 1.0, 0.9, 1.5, 0.8])
+        c = st.columns([2.2, 0.7, 0.9, 0.8, 1.2, 1.0, 0.9, 1.2, 0.7])
 
         # Live price fetch
         cur_price = row["sig_price"]
@@ -925,9 +942,17 @@ def render_section(rows, title, dot_color="#4a90e2"):
             badge = '<span class="badge-buy">BUY</span>' if row["signal"] == "BUY" else '<span class="badge-sell">SELL</span>'
             st.markdown(f"<div style='padding:12px 0;'>{badge}</div>", unsafe_allow_html=True)
 
-        # Strength - from signal data if available
+        # Strength
         with c[2]:
-            st.markdown(f"<div style='padding:12px 0;'><span class='badge-moderate'>–</span></div>", unsafe_allow_html=True)
+            _str = row.get("strength", "")
+            if _str == "STRONG":
+                _sc = "badge-strong"
+            elif _str == "MODERATE":
+                _sc = "badge-moderate"
+            else:
+                _sc = "badge-pending"
+            _sl = _str[:3] if _str else "–"
+            st.markdown(f"<div style='padding:12px 0;'><span class='{_sc}'>{_sl}</span></div>", unsafe_allow_html=True)
 
         # Sig RSI
         with c[3]:
@@ -935,44 +960,44 @@ def render_section(rows, title, dot_color="#4a90e2"):
             _ss = rsi_style(row["sig_rsi"])
             st.markdown(f"<div style='padding:12px 0;font-family:JetBrains Mono,monospace;font-size:13px;{_ss}'>{_sv}</div>", unsafe_allow_html=True)
 
-        # Sig Price
+        # Price → Now (merged column)
         with c[4]:
-            st.markdown(f"<div style='padding:12px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t3);'>{fmt_price(row['sig_price'])}</div>", unsafe_allow_html=True)
-
-        # Cur Price
-        with c[5]:
-            cp = fmt_price(cur_price)
             try:
                 diff  = float(cur_price) - float(row["sig_price"])
                 cp_c  = "var(--green)" if diff >= 0 else "var(--red)"
                 arrow = "▲" if diff >= 0 else "▼"
-                tag   = f"<span style='font-size:10px;color:{cp_c};margin-left:3px;'>{arrow}{'+' if diff>=0 else ''}{diff:,.2f}</span>" if cur_live else ""
+                sig_p = fmt_price(row["sig_price"])
+                cur_p = fmt_price(cur_price)
+                diff_str = f"{arrow}{'+' if diff>=0 else ''}{diff:,.1f}" if cur_live else ""
+                st.markdown(f"<div style='padding:8px 0;font-family:JetBrains Mono,monospace;'>"
+                            f"<div style='font-size:11px;color:var(--t3);'>{sig_p}</div>"
+                            f"<div style='font-size:12px;color:{cp_c if cur_live else 'var(--t2)'};font-weight:600;'>{cur_p} <span style='font-size:10px;'>{diff_str}</span></div>"
+                            f"</div>", unsafe_allow_html=True)
             except:
-                cp_c = "var(--t1)"; tag = ""
-            st.markdown(f"<div style='padding:12px 0;font-family:JetBrains Mono,monospace;font-size:13px;color:{cp_c if cur_live else 'var(--t2)'};'>{cp}{tag}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='padding:12px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>{fmt_price(row['sig_price'])}</div>", unsafe_allow_html=True)
 
         # PnL
-        with c[6]:
+        with c[5]:
             pnl_v = row["bt"].get("pnl") if row.get("bt") else None
             content = f"<span style='color:{('var(--green)' if pnl_class(pnl_v)=='pos' else 'var(--red)') if pnl_v is not None else 'var(--t3)'};'>{fmt_pnl(pnl_v) or '—'}</span>" if pnl_v is not None else '<span class="badge-pending">pending</span>'
             st.markdown(f"<div style='padding:12px 0;font-family:JetBrains Mono,monospace;font-size:12px;'>{content}</div>", unsafe_allow_html=True)
 
         # Win Rate
-        with c[7]:
+        with c[6]:
             wr_v = row["bt"].get("win_rate") if row.get("bt") else None
             if wr_v is not None:
                 wr_c = "var(--green)" if float(wr_v) >= 50 else "var(--red)"
-                content = f"<span style='color:{wr_c};'>{float(wr_v):.1f}%</span>"
+                _wrc = f"<span style='color:{wr_c};'>{float(wr_v):.1f}%</span>"
             else:
-                content = '<span class="badge-pending">–</span>'
-            st.markdown(f"<div style='padding:12px 0;font-family:JetBrains Mono,monospace;font-size:12px;'>{content}</div>", unsafe_allow_html=True)
+                _wrc = '<span class="badge-pending">–</span>'
+            st.markdown(f"<div style='padding:12px 0;font-family:JetBrains Mono,monospace;font-size:12px;'>{_wrc}</div>", unsafe_allow_html=True)
 
         # Signal Time
-        with c[8]:
-            st.markdown(f"<div style='padding:12px 0;font-family:JetBrains Mono,monospace;font-size:11px;color:var(--t3);'>{row['ts']}</div>", unsafe_allow_html=True)
+        with c[7]:
+            st.markdown(f"<div style='padding:12px 0;font-family:JetBrains Mono,monospace;font-size:10px;color:var(--t3);'>{row['ts']}</div>", unsafe_allow_html=True)
 
         # Chart button — opens inline chart
-        with c[9]:
+        with c[8]:
             if st.button("📈", key=f"chart_{row['sym']}", help=f"View chart for {row['name']}"):
                 if st.session_state.chart_symbol == row["sym"]:
                     st.session_state.chart_symbol = None
@@ -1011,7 +1036,7 @@ try:
     if all_logs.empty:
         st.markdown('<div class="no-sig">No signals yet. Scheduler runs at 9:15 AM IST.</div>', unsafe_allow_html=True)
     else:
-        logs_tf = all_logs[all_logs["Timeframe"] == selected_tf].copy()
+        logs_tf = all_logs[all_logs["Timeframe"] == selected_tf].copy() if not all_logs.empty else pd.DataFrame()
         if logs_tf.empty:
             st.markdown(f'<div class="no-sig">No signals for <strong>{selected_tf}</strong> timeframe yet.</div>', unsafe_allow_html=True)
         else:

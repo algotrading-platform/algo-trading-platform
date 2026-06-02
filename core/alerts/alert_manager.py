@@ -1,12 +1,9 @@
 # ============================================================
 # core/alerts/alert_manager.py
 #
-# Compact Telegram message format — Jwala's requested layout:
-#
-#   🟢 HDFCBANK — BUY — 1H
-#   ₹786.85  (10:16 IST)
-#   💪 STRONG  |  RSI Reversal
-#   📊 Nifty ↑ Rising  |  Stock ↑ Uptrend
+# Telegram format — Jwala's exact spec:
+# Line 1: emoji + Stock + signal letter + price + time
+# Line 2: strength + strategy + Nifty trend + Stock trend
 # ============================================================
 
 import os
@@ -105,10 +102,8 @@ class AlertManager:
         strategy = alert["strategy"]
         result   = alert.get("signal_result")
 
-        # Time
-        ist_now = datetime.now(IST).strftime("%H:%M IST")
+        ist_now  = datetime.now(IST).strftime("%H:%M IST")
 
-        # Trends from signal result
         nifty_trend = "NEUTRAL"
         stock_trend = "NEUTRAL"
         strength    = "MODERATE"
@@ -118,41 +113,42 @@ class AlertManager:
             stock_trend = getattr(result, "stock_trend", "NEUTRAL")
             strength    = getattr(result, "strength",    "MODERATE")
 
-        # Signal emoji
-        sig_emoji = "🟢" if signal == "BUY" else "🔴"
+        # Signal letter: B for buy, S for sell
+        sig_letter = "B" if signal == "BUY" else "S"
+        sig_emoji  = "🟢" if signal == "BUY" else "🔴"
 
-        # Price format
         try:
             price_str = f"₹{float(price):,.2f}"
         except Exception:
             price_str = str(price)
 
-        # Arbitrage gets different format
+        # ── Arbitrage format ──
         if strategy == "Cash-Futures Arbitrage":
-            spread = alert["rsi"]  # stored spread % in rsi field
+            spread     = alert["rsi"]
             indicators = result.indicators if result else {}
-            gross   = indicators.get("Gross_Profit", 0)
-            net     = indicators.get("Net_Profit_Est", 0)
-            expiry  = indicators.get("Expiry", "")
-            fut_sym = indicators.get("Futures_Symbol", "")
+            gross      = indicators.get("Gross_Profit", 0)
+            net        = indicators.get("Net_Profit_Est", 0)
+            expiry     = indicators.get("Expiry", "")
+            fut_sym    = indicators.get("Futures_Symbol", "")
 
             message = (
-                f"{sig_emoji} *{name} — ARBITRAGE*\n"
-                f"Spot: `{price_str}`  Spread: `{spread}%`  ({ist_now})\n"
-                f"Futures: `{fut_sym}`  Expiry: `{expiry}`\n"
-                f"Est. profit: `₹{gross:,.0f}` gross  /  `₹{net:,.0f}` net\n"
+                f"🔵 *{name}  ARB  {price_str}  {ist_now}*\n"
+                f"Spread `{spread}%`  Futures: `{fut_sym}`  Exp: `{expiry}`\n"
+                f"Gross `₹{gross:,.0f}`  Net `₹{net:,.0f}`\n"
                 f"_Buy spot + Sell futures simultaneously_"
             )
-        else:
-            # Compact format — Jwala's design
-            nifty_line = f"Nifty {_trend_arrow(nifty_trend)} {nifty_trend.capitalize()}"
-            stock_line = f"Stock {_trend_arrow(stock_trend)} {stock_trend.capitalize()}"
 
+        # ── RSI / other strategy format — Jwala's spec ──
+        else:
+            nifty_line = f"N{_trend_arrow(nifty_trend)}"
+            stock_line = f"S{_trend_arrow(stock_trend)}"
+            str_emoji  = _strength_emoji(strength)
+
+            # Line 1: emoji  NAME  B/S  price  time
+            # Line 2: strength emoji + label  |  strategy  |  Nifty↑ Stock↑
             message = (
-                f"{sig_emoji} *{name} — {signal} — {tf}*\n"
-                f"`{price_str}`  ({ist_now})\n"
-                f"{_strength_emoji(strength)} {strength}  |  {strategy}\n"
-                f"📊 {nifty_line}  |  {stock_line}"
+                f"{sig_emoji} *{name}  {sig_letter}  {price_str}  {ist_now}*\n"
+                f"{str_emoji} {strength}  |  {strategy}  |  {nifty_line} {stock_line}  |  {tf}"
             )
 
         url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
