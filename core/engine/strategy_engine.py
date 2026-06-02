@@ -353,7 +353,7 @@ class StrategyEngine:
         interval:    str,
         period:      str,
         instruments: list[dict],
-        max_workers: int = 10,
+        max_workers: int = 5,   # reduced to stay within 1GB RAM
     ) -> list[dict]:
 
         if not instruments:

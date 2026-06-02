@@ -171,14 +171,13 @@ def run_arbitrage_scan(tf_name: str) -> None:
 
 def run_scan(tf_name: str, mode: str = "all") -> None:
     """
-    Runs BOTH RSI and Arbitrage scans in parallel.
+    Runs RSI then Arbitrage sequentially.
+    Sequential to stay within Railway 1GB RAM limit.
     Both always active — dashboard filters by strategy.
+    Total scan time ~60-70s, well within 5-min cycle.
     """
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        rsi_future = ex.submit(run_rsi_scan, tf_name)
-        arb_future = ex.submit(run_arbitrage_scan, tf_name)
-        rsi_future.result()
-        arb_future.result()
+    run_rsi_scan(tf_name)        # RSI first — frees memory before arbitrage
+    run_arbitrage_scan(tf_name)  # Arbitrage after RSI completes
 
 
 # ============================================================
