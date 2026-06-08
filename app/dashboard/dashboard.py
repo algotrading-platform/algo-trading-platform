@@ -1173,15 +1173,45 @@ try:
                 if v == "SELL": return f"background:{sell_bg};color:{sell_fg};font-weight:700;font-family:JetBrains Mono,monospace;font-size:12px;"
                 return "font-family:JetBrains Mono,monospace;font-size:12px;"
 
-            row_count  = len(display)
-            tbl_height = min(max(row_count * 42 + 48, 100), 450)
+            # Build custom HTML table — respects dark mode CSS variables
+            rows_html = ""
+            for _, row in display.iterrows():
+                sig = row["Signal"]
+                if sig == "BUY":
+                    sig_html = f"<span style='color:{buy_fg};font-weight:700;font-family:JetBrains Mono,monospace;'>{sig}</span>"
+                elif sig == "SELL":
+                    sig_html = f"<span style='color:{sell_fg};font-weight:700;font-family:JetBrains Mono,monospace;'>{sig}</span>"
+                else:
+                    sig_html = f"<span style='color:var(--t3);font-family:JetBrains Mono,monospace;'>{sig}</span>"
 
-            st.dataframe(
-                display.style.map(_col, subset=["Signal"]),
-                use_container_width=True,
-                hide_index=True,
-                height=tbl_height,
-            )
+                rows_html += f"""
+                <tr style='border-bottom:1px solid var(--border);'>
+                    <td style='padding:8px 12px;font-size:12px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{row['Timestamp']}</td>
+                    <td style='padding:8px 12px;font-size:13px;color:var(--t1);font-weight:500;'>{row['Stock']}</td>
+                    <td style='padding:8px 12px;'>{sig_html}</td>
+                    <td style='padding:8px 12px;font-size:12px;color:var(--t2);font-family:JetBrains Mono,monospace;'>{row['RSI']}</td>
+                    <td style='padding:8px 12px;font-size:12px;color:var(--t2);font-family:JetBrains Mono,monospace;'>{row['Price']}</td>
+                    <td style='padding:8px 12px;font-size:11px;color:var(--t3);'>{row['Strategy']}</td>
+                </tr>"""
+
+            max_h = min(len(display) * 41 + 50, 450)
+            st.markdown(f"""
+<div style='overflow-y:auto;max-height:{max_h}px;border:1px solid var(--border);border-radius:8px;background:var(--card);'>
+<table style='width:100%;border-collapse:collapse;'>
+    <thead>
+        <tr style='border-bottom:2px solid var(--border2);background:var(--card2);position:sticky;top:0;'>
+            <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:1px;white-space:nowrap;'>Timestamp</th>
+            <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:1px;'>Stock</th>
+            <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:1px;'>Signal</th>
+            <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:1px;'>RSI</th>
+            <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:1px;'>Price</th>
+            <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:1px;'>Strategy</th>
+        </tr>
+    </thead>
+    <tbody>{rows_html}</tbody>
+</table>
+</div>
+""", unsafe_allow_html=True)
 except Exception as e:
     st.warning(f"Signal history unavailable: {e}")
 
