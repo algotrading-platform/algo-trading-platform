@@ -191,6 +191,36 @@ div[data-testid="metric-container"] [data-testid="stMetricValue"] { color: var(-
 /* Market status */
 .mkt-open { display:inline-flex; align-items:center; gap:6px; background:rgba(30,201,160,0.12); border:1px solid rgba(30,201,160,0.35); color:#1ec9a0; padding:7px 18px; border-radius:20px; font-size:12px; font-weight:700; font-family:'JetBrains Mono',monospace; letter-spacing:1px; }
 .mkt-closed { display:inline-flex; align-items:center; gap:6px; background:rgba(240,85,85,0.12); border:1px solid rgba(240,85,85,0.35); color:#f05555; padding:7px 18px; border-radius:20px; font-size:12px; font-weight:700; font-family:'JetBrains Mono',monospace; letter-spacing:1px; }
+
+/* Dark mode tooltip / popover / dropdown fixes */
+div[data-baseweb="tooltip"] { background:var(--card2) !important; color:var(--t1) !important; border:1px solid var(--border2) !important; border-radius:6px !important; }
+div[data-baseweb="popover"] > div { background:var(--card2) !important; border:1px solid var(--border2) !important; }
+div[data-baseweb="menu"] { background:var(--card2) !important; color:var(--t1) !important; }
+div[data-baseweb="menu"] li:hover { background:var(--blue) !important; color:#fff !important; }
+div[data-testid="stSelectbox"] li { color:var(--t1) !important; background:var(--card2) !important; }
+div[data-testid="stTextInput"] input { background:var(--card) !important; color:var(--t1) !important; border-color:var(--border2) !important; }
+div[data-testid="stTextInput"] input::placeholder { color:var(--t3) !important; }
+
+/* ── Dark mode tooltip / popover / dropdown fixes ── */
+div[data-baseweb="tooltip"] { background:var(--card2) !important; color:var(--t1) !important; border:1px solid var(--border2) !important; border-radius:6px !important; font-size:12px !important; }
+div[data-baseweb="popover"] { background:var(--card2) !important; border:1px solid var(--border2) !important; }
+div[data-baseweb="menu"] { background:var(--card2) !important; color:var(--t1) !important; border:1px solid var(--border2) !important; }
+div[data-baseweb="menu"] li { color:var(--t1) !important; }
+div[data-baseweb="menu"] li:hover { background:var(--card) !important; color:var(--blue) !important; }
+div[data-baseweb="select"] div { color:var(--t1) !important; }
+
+/* Streamlit selectbox dropdown options */
+div[data-testid="stSelectbox"] ul { background:var(--card2) !important; border:1px solid var(--border2) !important; }
+div[data-testid="stSelectbox"] li { color:var(--t1) !important; background:var(--card2) !important; }
+div[data-testid="stSelectbox"] li:hover { background:var(--card) !important; color:var(--blue) !important; }
+
+/* Streamlit text input */
+div[data-testid="stTextInput"] input { background:var(--card) !important; color:var(--t1) !important; border-color:var(--border2) !important; }
+div[data-testid="stTextInput"] input::placeholder { color:var(--t3) !important; }
+
+/* Dataframe dark mode */
+div[data-testid="stDataFrame"] { background:var(--card) !important; }
+.dvn-scroller { background:var(--card) !important; }
 .pulse { width:8px; height:8px; border-radius:50%; background:currentColor; animation:pa 2s infinite; }
 @keyframes pa { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.3;transform:scale(0.7)} }
 
