@@ -1,3 +1,5 @@
+import logging
+log = logging.getLogger("upstox_provider")
 # ============================================================
 # data/providers/upstox_provider.py
 #
@@ -39,33 +41,123 @@ IST = pytz.timezone("Asia/Kolkata")
 # yfinance interval → Upstox interval
 # ============================================================
 
-# V2 API intervals (fallback)
+# Upstox V2 fetch strategy:
+#
+#   5m  → fetch "1minute"  for 5d  → resample to  5-min OHLCV
+#   15m → fetch "1minute"  for 5d  → resample to 15-min OHLCV
+#   1h  → fetch "30minute" for 15d → resample to  1-hr  OHLCV
+#   1d  → fetch "day"      directly ✅
+#   1wk → fetch "week"     directly ✅
+#   1mo → fetch "month"    directly ✅
+#
+# This gives 100% Upstox NSE data — same candle boundaries as TradingView.
+
+UPSTOX_FETCH_MAP = {
+    #  interval  fetch_interval  resample_rule  fetch_period
+    "5m":  ("1minute",   "5min",   "5d"),
+    "15m": ("1minute",   "15min",  "5d"),
+    "1h":  ("30minute",  "1h",     "15d"),
+    "1d":  ("day",       None,     None),
+    "1wk": ("week",      None,     None),
+    "1mo": ("month",     None,     None),
+}
+
+# Keep for backward compat
 UPSTOX_INTERVALS = {
-    "5m":  "1minute",
-    "15m": "30minute",
-    "1h":  "day",
     "1d":  "day",
     "1wk": "week",
     "1mo": "month",
 }
 
-# V3 API intervals — supports 5min, 15min, 1hour properly
-# Format: (unit, interval_number)
-# URL: /v3/historical-candle/{instrument_key}/{unit}/{interval}/{to}/{from}
-UPSTOX_INTERVALS_V3 = {
-    "5m":  ("minutes", "5"),
-    "15m": ("minutes", "15"),
-    "1h":  ("hours",   "1"),
-    "1d":  ("days",    "1"),
-    "1wk": ("weeks",   "1"),
-    "1mo": ("months",  "1"),
-}
+# ============================================================
+# UPSTOX INSTRUMENT KEY RESOLUTION
+#
+# Upstox uses ISIN-based instrument keys (since 2024):
+#   NSE_EQ|INE040A01034  (not NSE_EQ|HDFCBANK)
+#
+# We download Upstox's instruments file once at startup
+# and build a symbol → instrument_key map dynamically.
+# ============================================================
 
-# ============================================================
-# UPSTOX SYMBOL MAPPING
-# yfinance symbol → Upstox instrument key
-# Format: EXCHANGE|TRADING_SYMBOL
-# ============================================================
+import gzip
+from io import BytesIO
+import json
+
+_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+_MCX_URL         = "https://assets.upstox.com/market-quote/instruments/exchange/MCX.json.gz"
+
+# Runtime cache: yfinance_symbol → upstox instrument_key
+_symbol_key_cache: dict = {}
+_instruments_loaded  = False
+
+
+def _load_instruments() -> None:
+    """
+    Download Upstox instruments file and build symbol→key map.
+    Called once at startup. Cached in memory.
+    """
+    global _symbol_key_cache, _instruments_loaded
+
+    if _instruments_loaded:
+        return
+
+    print("[Upstox] Downloading instruments file...", flush=True)
+    try:
+        r = requests.get(_INSTRUMENTS_URL, timeout=30)
+        print(f"[Upstox] Instruments file status: {r.status_code}", flush=True)
+
+        if r.status_code != 200:
+            print(f"[Upstox] Instruments file failed: {r.status_code}", flush=True)
+            _instruments_loaded = True
+            return
+
+        print(f"[Upstox] Parsing {len(r.content)} bytes...", flush=True)
+        with gzip.GzipFile(fileobj=BytesIO(r.content)) as gz:
+            instruments = json.load(gz)
+
+        print(f"[Upstox] Total instruments: {len(instruments)}", flush=True)
+
+        count = 0
+        for inst in instruments:
+            # Handle both possible field name formats in Upstox JSON
+            sym   = inst.get("tradingsymbol") or inst.get("trading_symbol") or ""
+            key   = inst.get("instrument_key") or inst.get("key") or ""
+            seg   = inst.get("segment") or inst.get("exchange_segment") or ""
+            itype = inst.get("instrument_type") or inst.get("type") or ""
+
+            if not sym or not key:
+                continue
+
+            # NSE equity stocks
+            if seg == "NSE_EQ" and itype == "EQ":
+                yf_sym = f"{sym}.NS"
+                _symbol_key_cache[yf_sym] = key
+                count += 1
+
+            # NSE indices — match from instrument_key since tradingsymbol is empty
+            if seg == "NSE_INDEX":
+                if key == "NSE_INDEX|Nifty 50":
+                    _symbol_key_cache["^NSEI"]    = key
+                elif key == "NSE_INDEX|Nifty Bank":
+                    _symbol_key_cache["^NSEBANK"] = key
+                elif key == "NSE_INDEX|Nifty 100":
+                    _symbol_key_cache["^NSEI100"] = key
+
+        print(f"[Upstox] ✅ Loaded {count} NSE instruments into cache", flush=True)
+        print(f"[Upstox] Sample: HDFCBANK.NS → {_symbol_key_cache.get('HDFCBANK.NS', 'NOT FOUND')}", flush=True)
+        _instruments_loaded = True
+
+    except Exception as e:
+        print(f"[Upstox] ❌ Load instruments error: {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        _instruments_loaded = True
+
+
+def get_instrument_key(yf_symbol: str) -> str | None:
+    """Get Upstox instrument key for a yfinance symbol."""
+    _load_instruments()
+    return _symbol_key_cache.get(yf_symbol)
 
 UPSTOX_SYMBOL_MAP = {
     # Indexes
@@ -248,10 +340,13 @@ class UpstoxProvider(BaseDataProvider):
             print(f"[Upstox] No valid token — falling back to yfinance for {symbol}")
             return self._yf.fetch_data(symbol, interval, period)
 
-        # Map interval to Upstox format
-        upstox_interval = UPSTOX_INTERVALS.get(interval)
-        if not upstox_interval:
+        # Get fetch strategy for this interval
+        fetch_config = UPSTOX_FETCH_MAP.get(interval)
+        if not fetch_config:
             return self._yf.fetch_data(symbol, interval, period)
+
+        fetch_interval, resample_rule, fetch_period_override = fetch_config
+        effective_period = fetch_period_override if fetch_period_override else period
 
         # Resolve instrument key
         upstox_sym = self._resolve_symbol(symbol, token)
@@ -260,13 +355,13 @@ class UpstoxProvider(BaseDataProvider):
             return self._yf.fetch_data(symbol, interval, period)
 
         # Calculate date range
-        to_date, from_date = self._period_to_dates(period)
+        to_date, from_date = self._period_to_dates(effective_period)
 
         try:
             df = self._fetch_candles(
                 token=token,
                 instrument_key=upstox_sym,
-                interval=upstox_interval,
+                interval=fetch_interval,
                 from_date=from_date,
                 to_date=to_date,
             )
@@ -275,36 +370,124 @@ class UpstoxProvider(BaseDataProvider):
                 print(f"[Upstox] Empty data for {symbol} — falling back to yfinance")
                 return self._yf.fetch_data(symbol, interval, period)
 
+            # Resample if needed (5m, 15m, 1h)
+            if resample_rule:
+                df = self._resample_candles(df, resample_rule)
+
+            if df.empty:
+                return self._yf.fetch_data(symbol, interval, period)
+
             return df
 
         except Exception as e:
             print(f"[Upstox] fetch error {symbol}: {e} — falling back to yfinance")
             return self._yf.fetch_data(symbol, interval, period)
 
+    def _resample_candles(self, df: pd.DataFrame, rule: str) -> pd.DataFrame:
+        """
+        Resample 1-minute or 30-minute candles into larger timeframes.
+        rule: "5min", "15min", "1h"
+
+        This gives us true 5m, 15m, 1h candles from Upstox data —
+        same candle boundaries as TradingView and Zerodha.
+        """
+        try:
+            if "Datetime" not in df.columns:
+                return df
+
+            df = df.copy()
+            df["Datetime"] = pd.to_datetime(df["Datetime"])
+            df = df.set_index("Datetime")
+
+            # Resample OHLCV
+            resampled = df.resample(rule, label="left", closed="left").agg({
+                "Open":   "first",
+                "High":   "max",
+                "Low":    "min",
+                "Close":  "last",
+                "Volume": "sum",
+            }).dropna(subset=["Close"])
+
+            # Keep only market hours candles (9:15 AM to 3:30 PM IST)
+            resampled = resampled.between_time("09:15", "15:30")
+            resampled = resampled.reset_index()
+            resampled = resampled.sort_values("Datetime").reset_index(drop=True)
+
+            return resampled
+
+        except Exception as e:
+            print(f"[Upstox] Resample error: {e}")
+            return df.reset_index() if df.index.name == "Datetime" else df
+
     def _resolve_symbol(self, symbol: str, token: str) -> str | None:
         """
         Resolve yfinance symbol to Upstox instrument key.
-        For MCX commodities, fetches active contract dynamically.
+        Uses the instruments file downloaded at startup.
+        Key format: NSE_EQ|{ISIN} (e.g. NSE_EQ|INE040A01034)
         """
-        # Check static mapping first (indexes + stocks)
-        if symbol in UPSTOX_SYMBOL_MAP:
-            return UPSTOX_SYMBOL_MAP[symbol]
+        # Use dynamic instruments file (ISIN-based keys)
+        key = get_instrument_key(symbol)
+        if key:
+            return key
 
-        # MCX commodity — fetch active contract
-        if symbol in MCX_COMMODITY_SEARCH:
-            return self._get_mcx_contract(
-                symbol=symbol,
-                token=token,
-                search_name=MCX_COMMODITY_SEARCH[symbol],
-            )
-
-        # Auto-resolve: try NSE_EQ|SYMBOL format for unknown .NS stocks
-        if symbol.endswith(".NS"):
-            base = symbol.replace(".NS", "")
-            auto_key = f"NSE_EQ|{base}"
-            return auto_key
+        # MCX commodities
+        if symbol in ("GC=F", "SI=F", "HG=F", "CL=F"):
+            return None  # Fall back to yfinance for MCX
 
         return None
+
+    
+    def _search_instrument(self, symbol: str, token: str) -> str | None:
+        """
+        Search Upstox instruments API to find correct instrument key.
+        Caches results to avoid repeated API calls.
+        """
+        base = symbol.replace(".NS", "")
+
+        # Check cache
+        cache_key = f"NSE_{base}"
+        if cache_key in _mcx_contract_cache:
+            return _mcx_contract_cache[cache_key]
+
+        try:
+            url = "https://api.upstox.com/v2/instruments/search"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+            }
+            params = {"q": base, "asset_type": "EQUITY"}
+
+            response = requests.get(url, headers=headers, params=params, timeout=8)
+            if response.status_code != 200:
+                # Fallback: try direct NSE_EQ format
+                _mcx_contract_cache[cache_key] = f"NSE_EQ|{base}"
+                return f"NSE_EQ|{base}"
+
+            data = response.json()
+            instruments = data.get("data", [])
+
+            # Find best match — NSE equity with exact symbol match
+            for inst in instruments:
+                if (inst.get("exchange", "").upper() == "NSE"
+                    and inst.get("instrument_type", "").upper() in ("EQ", "EQUITY")
+                    and inst.get("tradingsymbol", "").upper() == base.upper()):
+                    key = inst.get("instrument_key", f"NSE_EQ|{base}")
+                    _mcx_contract_cache[cache_key] = key
+                    return key
+
+            # No exact match — try first NSE result
+            for inst in instruments:
+                if inst.get("exchange", "").upper() == "NSE":
+                    key = inst.get("instrument_key", f"NSE_EQ|{base}")
+                    _mcx_contract_cache[cache_key] = key
+                    return key
+
+            # Final fallback
+            _mcx_contract_cache[cache_key] = f"NSE_EQ|{base}"
+            return f"NSE_EQ|{base}"
+
+        except Exception as e:
+            return f"NSE_EQ|{base}"
 
     def _get_mcx_contract(
         self,
@@ -394,26 +577,16 @@ class UpstoxProvider(BaseDataProvider):
         to_date:        str,
     ) -> pd.DataFrame:
         """
-        Call Upstox V3 historical candle API.
-        V3 supports: 5minute, 15minute, 1hour, day, week, month
-        API: /v3/historical-candle/{key}/{unit}/{interval}/{to}/{from}
+        Call Upstox V2 historical candle API.
+        V2 supports: 1minute, 30minute, day, week, month
+        Intraday (5m, 15m, 1h) falls back to yfinance automatically.
         """
         encoded_key = requests.utils.quote(instrument_key, safe="")
 
-        # Use V3 API with proper unit/interval format
-        v3_mapping = UPSTOX_INTERVALS_V3.get(interval)
-        if v3_mapping:
-            unit, interval_num = v3_mapping
-            url = (
-                f"https://api.upstox.com/v3/historical-candle"
-                f"/{encoded_key}/{unit}/{interval_num}/{to_date}/{from_date}"
-            )
-        else:
-            # Fallback to V2 for unmapped intervals
-            url = (
-                f"{self._base_url}/historical-candle"
-                f"/{encoded_key}/{interval}/{to_date}/{from_date}"
-            )
+        url = (
+            f"{self._base_url}/historical-candle"
+            f"/{encoded_key}/{interval}/{to_date}/{from_date}"
+        )
 
         headers = {
             "Authorization": f"Bearer {token}",

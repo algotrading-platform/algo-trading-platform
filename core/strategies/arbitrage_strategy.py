@@ -36,8 +36,8 @@ log = logging.getLogger("arbitrage")
 IST = pytz.timezone("Asia/Kolkata")
 
 # ── Threshold constants ──────────────────────────────────────
-NORMAL_BASIS_PCT  = 1.0   # Normal days — basis must exceed 2% # Flat 1% threshold entire month (Jwala 03-Jun-2026)
-EXPIRY_BASIS_PCT  = 1.0   # Expiry week — basis must exceed 1%
+NORMAL_BASIS_PCT  = 0.5   # Reduced to 0.5% for signal testing (Jwala 06-Jun-2026)
+EXPIRY_BASIS_PCT  = 0.5   # Expiry week — same 0.5% for testing
 EXPIRY_WEEK_DAYS  = 7     # Last 7 calendar days of month = expiry week
 MAX_BASIS_PCT     = 10.0  # Sanity check — above this = data error
 

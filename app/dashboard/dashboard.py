@@ -663,7 +663,7 @@ with st.sidebar:
 
     st.markdown("<div style='margin:14px 0;border-top:1px solid var(--border);'></div>", unsafe_allow_html=True)
 
-    # ── Search ──
+    # ── Search & Filters ──
     st.markdown('<div style="font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:2px;margin-bottom:8px;">Search</div>', unsafe_allow_html=True)
     search_query = st.text_input(
         "Search",
@@ -671,6 +671,22 @@ with st.sidebar:
         label_visibility="collapsed",
         key="search_input",
     ).strip().upper()
+
+    st.markdown('<div style="font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:2px;margin-bottom:8px;margin-top:12px;">Signal Filter</div>', unsafe_allow_html=True)
+    signal_filter = st.selectbox(
+        "Signal",
+        ["All", "BUY only", "SELL only", "BUY + SELL"],
+        label_visibility="collapsed",
+        key="signal_filter",
+    )
+
+    st.markdown('<div style="font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:2px;margin-bottom:8px;margin-top:12px;">Strength Filter</div>', unsafe_allow_html=True)
+    strength_filter = st.selectbox(
+        "Strength",
+        ["All", "STRONG only", "MODERATE+"],
+        label_visibility="collapsed",
+        key="strength_filter",
+    )
 
     st.markdown("<div style='margin:14px 0;border-top:1px solid var(--border);'></div>", unsafe_allow_html=True)
 
@@ -827,6 +843,30 @@ if search_query:
     idx_rows = [r for r in idx_rows if search_query in r["name"].upper() or search_query in r["sym"].upper()]
     stk_rows = [r for r in stk_rows if search_query in r["name"].upper() or search_query in r["sym"].upper()]
     com_rows = [r for r in com_rows if search_query in r["name"].upper() or search_query in r["sym"].upper()]
+
+# Apply signal filter
+def _sig_match(row, flt):
+    s = row.get("signal", "HOLD")
+    if flt == "BUY only":   return s == "BUY"
+    if flt == "SELL only":  return s == "SELL"
+    if flt == "BUY + SELL": return s in ("BUY", "SELL")
+    return True  # All
+
+def _str_match(row, flt):
+    s = row.get("strength", "")
+    if flt == "STRONG only":  return s == "STRONG"
+    if flt == "MODERATE+":    return s in ("STRONG", "MODERATE")
+    return True  # All
+
+if signal_filter != "All":
+    idx_rows = [r for r in idx_rows if _sig_match(r, signal_filter)]
+    stk_rows = [r for r in stk_rows if _sig_match(r, signal_filter)]
+    com_rows = [r for r in com_rows if _sig_match(r, signal_filter)]
+
+if strength_filter != "All":
+    idx_rows = [r for r in idx_rows if _str_match(r, strength_filter)]
+    stk_rows = [r for r in stk_rows if _str_match(r, strength_filter)]
+    com_rows = [r for r in com_rows if _str_match(r, strength_filter)]
 
 
 # ============================================================

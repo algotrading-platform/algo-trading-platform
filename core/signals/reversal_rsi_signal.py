@@ -3,11 +3,11 @@
 #
 # Reversal confirmation logic (Jwala-approved):
 #
-#   BUY  : RSI was below 25 (trigger), then bounced up for
+#   BUY  : RSI was below 35 (trigger), then bounced up for
 #          2 consecutive candles AND crossed back above 25.
 #          Deeper oversold threshold = fewer, higher quality signals.
 #
-#   SELL : RSI was above 75 (trigger), then turned down for
+#   SELL : RSI was above 65 (trigger), then turned down for
 #          2 consecutive candles AND crossed back below 75.
 #          Deeper overbought threshold = fewer, higher quality signals.
 #
@@ -21,8 +21,8 @@
 # logger can decide whether to record it.
 # ============================================================
 
-RSI_OVERSOLD  = 25   # BUY trigger level
-RSI_OVERBOUGHT = 75  # SELL trigger level
+RSI_OVERSOLD  = 35   # BUY trigger level (Jwala 06-Jun-2026: broaden to 35)
+RSI_OVERBOUGHT = 65  # SELL trigger level (Jwala 06-Jun-2026: broaden to 65)
 
 
 class ReversalRSISignal:
@@ -49,10 +49,10 @@ class ReversalRSISignal:
 
         # --------------------------------------------------
         # BUY: RSI dipped below 25, now recovering
-        #   prev2 < 25  → was in deep oversold zone
+        #   prev2 < 35  → was in oversold zone
         #   prev  > prev2  → first bounce candle
         #   current > prev → second bounce candle (confirmation)
-        #   current > 25   → crossed back out of oversold zone
+        #   current > 35   → crossed back out of oversold zone
         # --------------------------------------------------
         if (
             prev2 < RSI_OVERSOLD
@@ -64,10 +64,10 @@ class ReversalRSISignal:
 
         # --------------------------------------------------
         # SELL: RSI pushed above 75, now reversing
-        #   prev2 > 75  → was in deep overbought zone
+        #   prev2 > 65  → was in overbought zone
         #   prev  < prev2  → first drop candle
         #   current < prev → second drop candle (confirmation)
-        #   current < 75   → crossed back out of overbought zone
+        #   current < 65   → crossed back out of overbought zone
         # --------------------------------------------------
         if (
             prev2 > RSI_OVERBOUGHT

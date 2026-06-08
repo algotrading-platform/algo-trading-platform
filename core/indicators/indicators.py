@@ -385,3 +385,81 @@ def should_suppress_signal(
     if signal == "SELL":
         return nifty_trend == "RISING" and stock_trend == "RISING"
     return False
+
+# ============================================================
+# MULTI-TIMEFRAME TREND — Jwala's 3-arrow system
+# ============================================================
+
+def get_trend_arrow(trend: str) -> str:
+    """Convert trend string to arrow."""
+    if trend == "RISING":  return "↑"
+    if trend == "FALLING": return "↓"
+    return "→"
+
+
+def get_multi_timeframe_trend(
+    provider,
+    symbol: str,
+) -> dict:
+    """
+    Get 3-timeframe trend for a symbol.
+    Returns dict with daily, hourly, 5min trends.
+
+    Jwala's spec:
+      Daily  → is stock/nifty trending up over past month?
+      Hourly → is it rising in last few hours?
+      5min   → is it rising right now?
+
+    Returns:
+      {
+        "daily":  "RISING" | "FALLING" | "NEUTRAL",
+        "hourly": "RISING" | "FALLING" | "NEUTRAL",
+        "5min":   "RISING" | "FALLING" | "NEUTRAL",
+        "label":  "D↑ H↓ 5m↑"
+      }
+    """
+    result = {"daily": "NEUTRAL", "hourly": "NEUTRAL", "5min": "NEUTRAL", "label": "D→ H→ 5m→"}
+
+    try:
+        # Daily trend — stock daily chart (1 month)
+        df_daily = provider.fetch_data(symbol=symbol, interval="1d", period="3mo")
+        result["daily"] = get_stock_daily_trend(df_daily)
+    except Exception:
+        pass
+
+    try:
+        # Hourly trend — last 5 hourly candles
+        df_1h = provider.fetch_data(symbol=symbol, interval="1h", period="5d")
+        if df_1h is not None and len(df_1h) >= 3:
+            # Simple: current hourly close vs 3 hours ago
+            cur   = float(df_1h["Close"].iloc[-1])
+            prev3 = float(df_1h["Close"].iloc[-3])
+            result["hourly"] = "RISING" if cur > prev3 else ("FALLING" if cur < prev3 else "NEUTRAL")
+    except Exception:
+        pass
+
+    try:
+        # 5min trend — last 6 x 5min candles (30 mins)
+        df_5m = provider.fetch_data(symbol=symbol, interval="5m", period="1d")
+        if df_5m is not None and len(df_5m) >= 6:
+            cur   = float(df_5m["Close"].iloc[-1])
+            prev6 = float(df_5m["Close"].iloc[-6])
+            result["5min"] = "RISING" if cur > prev6 else ("FALLING" if cur < prev6 else "NEUTRAL")
+    except Exception:
+        pass
+
+    # Build label: "D↑ H↓ 5m↑"
+    d = get_trend_arrow(result["daily"])
+    h = get_trend_arrow(result["hourly"])
+    m = get_trend_arrow(result["5min"])
+    result["label"] = f"D{d} H{h} 5m{m}"
+
+    return result
+
+
+def get_nifty_multi_trend(provider) -> dict:
+    """
+    Get 3-timeframe trend for Nifty 50.
+    Uses ^NSEI symbol.
+    """
+    return get_multi_timeframe_trend(provider, "^NSEI")

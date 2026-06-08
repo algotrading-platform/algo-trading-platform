@@ -4,8 +4,8 @@
 # RSI levels match reversal_rsi_signal.py: 25/75
 # ============================================================
 
-RSI_OVERSOLD   = 25   # matches reversal_rsi_signal.py
-RSI_OVERBOUGHT = 75   # matches reversal_rsi_signal.py
+RSI_OVERSOLD   = 35   # matches reversal_rsi_signal.py
+RSI_OVERBOUGHT = 65   # matches reversal_rsi_signal.py
 
 
 class RSIBacktest:

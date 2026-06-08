@@ -67,8 +67,8 @@ class RSIReversalStrategy(BaseStrategy):
         }
 
         # BUY: RSI bounced from oversold
-        if prev2 < 25 and prev > prev2 and current > prev and current > 25:
-            strength = "STRONG" if prev2 < 20 else "MODERATE"
+        if prev2 < 35 and prev > prev2 and current > prev and current > 35:
+            strength = "STRONG" if prev2 < 28 else "MODERATE"
             reason = (
                 f"RSI recovered from oversold zone. "
                 f"RSI was {round(prev2,1)} (below 30), now rising to {round(current,1)}. "
@@ -77,8 +77,8 @@ class RSIReversalStrategy(BaseStrategy):
             return SignalResult("BUY", strength, reason, indicators, self.name)
 
         # SELL: RSI reversed from overbought
-        if prev2 > 75 and prev < prev2 and current < prev and current < 75:
-            strength = "STRONG" if prev2 > 80 else "MODERATE"
+        if prev2 > 65 and prev < prev2 and current < prev and current < 65:
+            strength = "STRONG" if prev2 > 72 else "MODERATE"
             reason = (
                 f"RSI reversed from overbought zone. "
                 f"RSI was {round(prev2,1)} (above 70), now falling to {round(current,1)}. "
@@ -141,8 +141,8 @@ class RSIPivotStrategy(BaseStrategy):
         }
 
         # Check RSI reversal
-        rsi_buy  = prev2 < 25 and prev > prev2 and current > prev and current > 25
-        rsi_sell = prev2 > 75 and prev < prev2 and current < prev and current < 75
+        rsi_buy  = prev2 < 35 and prev > prev2 and current > prev and current > 35
+        rsi_sell = prev2 > 65 and prev < prev2 and current < prev and current < 65
 
         def near_level(level_price: float) -> bool:
             if level_price <= 0:
@@ -561,3 +561,93 @@ def get_strategy(name: str) -> BaseStrategy:
     if name not in STRATEGIES:
         raise ValueError(f"Unknown strategy: {name}. Available: {STRATEGY_NAMES}")
     return STRATEGIES[name]
+
+class VolumeSpikeStrategy(BaseStrategy):
+    """
+    Volume Spike Strategy — Jwala's exact spec (06-Jun-2026):
+
+    Condition: Current candle volume > 2000% of 2-week average volume
+    Signal   : BUY — institutional buying detected
+    Strength : STRONG if volume > 3000%, MODERATE if > 2000%
+
+    Jwala's insight from Business Standard research:
+    "From past 20 days tracking — 8 out of 10 stocks rise on that day.
+     Some rising by 20% on same day, 4-5% next day."
+    "Someone who is having some kind of info is buying that stock heavily."
+
+    This is an INDEPENDENT strategy — does not require RSI.
+    Also works as RSI confirmation — RSI reversal + volume spike = STRONG BUY.
+    """
+
+    name = "Volume Spike"
+    description = (
+        "Detects institutional buying via abnormal volume surge. "
+        "Signals when volume exceeds 2000% of 2-week average. "
+        "Based on Jwala's Business Standard research."
+    )
+
+    # 14 candles = 2 weeks of daily candles
+    LOOKBACK_CANDLES   = 14
+    SPIKE_THRESHOLD    = 20.0   # 2000% = 20x average
+    STRONG_THRESHOLD   = 30.0   # 3000% = STRONG signal
+
+    def generate_signal(self, df) -> "SignalResult":
+        if df is None or df.empty or len(df) < self.LOOKBACK_CANDLES + 1:
+            return SignalResult(
+                "HOLD", "WEAK",
+                f"Insufficient data (need {self.LOOKBACK_CANDLES + 1}+ candles)",
+                strategy=self.name,
+            )
+
+        if "Volume" not in df.columns:
+            return SignalResult(
+                "HOLD", "WEAK",
+                "Volume data not available",
+                strategy=self.name,
+            )
+
+        try:
+            df = df.copy()
+            df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce")
+            df.dropna(subset=["Volume"], inplace=True)
+
+            if len(df) < self.LOOKBACK_CANDLES + 1:
+                return SignalResult("HOLD", "WEAK", "Insufficient volume data", strategy=self.name)
+
+            # 2-week average (excluding current candle)
+            avg_volume   = float(df["Volume"].iloc[-self.LOOKBACK_CANDLES-1:-1].mean())
+            curr_volume  = float(df["Volume"].iloc[-1])
+            curr_close   = float(df["Close"].iloc[-1])
+
+            if avg_volume <= 0:
+                return SignalResult("HOLD", "WEAK", "Zero average volume", strategy=self.name)
+
+            volume_ratio = curr_volume / avg_volume  # e.g. 20.0 = 2000%
+            volume_pct   = round(volume_ratio * 100, 0)  # e.g. 2000%
+
+            indicators = {
+                "Volume":       int(curr_volume),
+                "Avg_Volume":   int(avg_volume),
+                "Volume_Ratio": round(volume_ratio, 2),
+                "Volume_Pct":   volume_pct,
+                "Close":        round(curr_close, 2),
+            }
+
+            if volume_ratio >= self.SPIKE_THRESHOLD:
+                strength = "STRONG" if volume_ratio >= self.STRONG_THRESHOLD else "MODERATE"
+                reason = (
+                    f"VOLUME SPIKE: {volume_pct:.0f}% of 2-week average "
+                    f"({int(curr_volume):,} vs avg {int(avg_volume):,}). "
+                    f"Institutional buying detected."
+                )
+                return SignalResult("BUY", strength, reason, indicators, self.name)
+
+            return SignalResult(
+                "HOLD", "WEAK",
+                f"Volume {volume_pct:.0f}% of average (need 2000%+). "
+                f"Current: {int(curr_volume):,} | Avg: {int(avg_volume):,}",
+                indicators, self.name,
+            )
+
+        except Exception as e:
+            return SignalResult("HOLD", "WEAK", f"Volume calculation error: {e}", strategy=self.name)
