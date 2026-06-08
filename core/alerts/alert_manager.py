@@ -146,16 +146,19 @@ class AlertManager:
             data_source = alert.get("data_source", "yfinance")
             src_tag     = "✅" if data_source == "upstox" else "⚠"
 
-            # 3-arrow trend labels
-            nifty_label = result.indicators.get("nifty_trend_label", f"N{_trend_arrow(nifty_trend)}") if result and hasattr(result, "indicators") else f"N{_trend_arrow(nifty_trend)}"
-            stock_label = result.indicators.get("stock_trend_label", f"S{_trend_arrow(stock_trend)}") if result and hasattr(result, "indicators") else f"S{_trend_arrow(stock_trend)}"
+            # 3-arrow trend labels — D/H/5m for both Nifty and Stock
+            indicators   = result.indicators if (result and hasattr(result, "indicators")) else {}
+            nifty_label  = indicators.get("nifty_trend_label") or f"N{_trend_arrow(nifty_trend)}"
+            stock_label  = indicators.get("stock_trend_label") or f"S{_trend_arrow(stock_trend)}"
 
-            # Line 1: emoji  NAME  B/S  price  time
-            # Line 2: strength | strategy | Nifty trends | Stock trends | tf | src
+            # Format:
+            # 🔴 GODREJCP  S  ₹995.10  14:11 IST
+            # 💪 STRONG  |  RSI Reversal
+            # Nifty: D↓ H↓ 5m↓  Stock: D↑ H↑ 5m↑  |  5 Minutes  ⚠
             message = (
                 f"{sig_emoji} *{name}  {sig_letter}  {price_str}  {ist_now}*\n"
                 f"{str_emoji} {strength}  |  {strategy}\n"
-                f"Nifty: `{nifty_label}`  Stock: `{stock_label}`  |  {tf}  {src_tag}"
+                f"Nifty: {nifty_label}  |  Stock: {stock_label}  |  {tf}  {src_tag}"
             )
 
         url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"

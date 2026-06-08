@@ -25,6 +25,7 @@ from core.indicators.indicators import (
     get_daily_trend,
     calculate_signal_strength,
     should_suppress_signal,
+    get_multi_timeframe_trend,
 )
 from core.logger.signal_logger import SignalLogger
 from core.alerts.alert_manager import AlertManager
@@ -43,6 +44,29 @@ NIFTY_SYMBOL = "^NSEI"
 # ============================================================
 
 _nifty_trend_cache: dict = {"trend": "NEUTRAL", "date": None}
+_nifty_multi_cache: dict = {"label": "D→ H→ 5m→", "date": None}
+
+
+def _get_nifty_multi_label(provider) -> str:
+    """
+    Get Nifty 3-arrow trend label. Cached per calendar day.
+    Returns: "D↓ H↓ 5m↑" format
+    """
+    global _nifty_multi_cache
+    from datetime import date
+    today = date.today().isoformat()
+
+    if _nifty_multi_cache["date"] == today:
+        return _nifty_multi_cache["label"]
+
+    try:
+        from core.indicators.indicators import get_multi_timeframe_trend
+        multi = get_multi_timeframe_trend(provider, "^NSEI")
+        label = multi["label"].replace("D", "D").replace("H", "H")  # keep as-is
+        _nifty_multi_cache = {"label": label, "date": today}
+        return label
+    except Exception:
+        return "D→ H→ 5m→"
 
 
 def get_nifty_daily_trend(provider) -> str:
@@ -192,6 +216,16 @@ class StrategyEngine:
                         result.strength    = trend_strength
                         result.nifty_trend = nifty_trend
                         result.stock_trend = stock_trend
+
+                        # ── 3-arrow multi-timeframe trend (Jwala's spec) ──
+                        # Only fetch when signal fires — avoids extra API calls for HOLD
+                        try:
+                            multi = get_multi_timeframe_trend(provider, symbol)
+                            result.indicators["nifty_trend_label"]  = _get_nifty_multi_label(provider)
+                            result.indicators["stock_trend_label"]  = multi["label"]
+                        except Exception:
+                            result.indicators["nifty_trend_label"]  = f"N{nifty_trend[0]}"
+                            result.indicators["stock_trend_label"]  = f"S{stock_trend[0]}"
                 else:
                     stock_trend = "NEUTRAL"
 
