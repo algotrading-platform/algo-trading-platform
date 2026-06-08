@@ -235,17 +235,47 @@ def is_volume_confirmed(df: pd.DataFrame) -> bool:
 
 
 # ============================================================
-# TREND DETECTION — Jwala's logic
+# TREND DETECTION — Jwala's exact logic
 # ============================================================
 
-def get_daily_trend(df_daily: pd.DataFrame) -> str:
+def get_nifty_trend(df_daily: pd.DataFrame) -> str:
     """
-    Determine if a stock/index is in uptrend or downtrend
-    based on its daily chart.
+    Nifty trend — Jwala's exact specification:
+    "Is Nifty at this time higher than yesterday's close or not?"
 
-    Logic:
-      RISING  → price > EMA20 AND 5-day momentum positive
-      FALLING → price < EMA20 AND 5-day momentum negative
+    Simple intraday comparison:
+      Today's close > Yesterday's close → RISING
+      Today's close < Yesterday's close → FALLING
+
+    Returns: "RISING" | "FALLING" | "NEUTRAL"
+    """
+    if df_daily is None or df_daily.empty or len(df_daily) < 2:
+        return "NEUTRAL"
+
+    try:
+        today_close     = float(df_daily["Close"].iloc[-1])
+        yesterday_close = float(df_daily["Close"].iloc[-2])
+
+        if today_close > yesterday_close:
+            return "RISING"
+        elif today_close < yesterday_close:
+            return "FALLING"
+
+    except Exception:
+        pass
+
+    return "NEUTRAL"
+
+
+def get_stock_daily_trend(df_daily: pd.DataFrame) -> str:
+    """
+    Stock 1-month trend — Jwala's exact specification:
+    "If daily is bullish — stock rising from April to May — that is strong."
+    "For Emami — falling from 470 to 399 for over a month — I wouldn't buy."
+
+    Logic (20D EMA + higher highs):
+      RISING  → price > 20D EMA AND second half of month higher than first half
+      FALLING → price < 20D EMA AND second half lower than first half
       NEUTRAL → mixed signals
 
     Returns: "RISING" | "FALLING" | "NEUTRAL"
@@ -257,33 +287,42 @@ def get_daily_trend(df_daily: pd.DataFrame) -> str:
         df = add_ema(df_daily.copy(), periods=[20])
         df.dropna(subset=["EMA_20"], inplace=True)
 
-        if df.empty:
+        if len(df) < 20:
             return "NEUTRAL"
 
-        latest  = df.iloc[-1]
-        price   = float(latest["Close"])
-        ema20   = float(latest["EMA_20"])
+        latest = df.iloc[-1]
+        price  = float(latest["Close"])
+        ema20  = float(latest["EMA_20"])
 
-        # 5-day momentum
-        if len(df) >= 5:
-            price_5d = float(df.iloc[-5]["Close"])
-            momentum = (price - price_5d) / price_5d * 100
-        else:
-            momentum = 0.0
+        # Higher highs check — split last 20 days into two halves
+        recent   = df.iloc[-20:]
+        first10  = float(recent.iloc[:10]["Close"].mean())
+        second10 = float(recent.iloc[10:]["Close"].mean())
+        higher_highs = second10 > first10
 
-        if price > ema20 and momentum >= 0:
+        above_ema = price > ema20
+
+        if above_ema and higher_highs:
             return "RISING"
-        elif price < ema20 and momentum <= 0:
+        elif not above_ema and not higher_highs:
             return "FALLING"
-        elif price > ema20:
-            return "RISING"
-        elif price < ema20:
+        elif above_ema:
+            return "RISING"   # EMA is primary indicator
+        else:
             return "FALLING"
 
     except Exception:
         pass
 
     return "NEUTRAL"
+
+
+def get_daily_trend(df_daily: pd.DataFrame) -> str:
+    """
+    Generic trend — used for stocks (calls get_stock_daily_trend).
+    Kept for backward compatibility.
+    """
+    return get_stock_daily_trend(df_daily)
 
 
 def calculate_signal_strength(

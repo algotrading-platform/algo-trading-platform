@@ -131,52 +131,60 @@ def _fetch_from_nse() -> list[str]:
     Fetch live F&O eligible stocks from NSE API.
     Returns list of .NS symbols.
     """
-    try:
-        session = requests.Session()
-        # NSE requires a session cookie first
-        session.get(
-            "https://www.nseindia.com",
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) "
-                              "Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml",
-            },
-            timeout=10,
-        )
+    # Try multiple NSE endpoints — Nifty 500 preferred, F&O as fallback
+    endpoints = [
+        ("https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20500", "Nifty 500"),
+        ("https://www.nseindia.com/api/equity-stockIndices?index=SECURITIES%20IN%20F%26O", "F&O"),
+    ]
 
-        response = session.get(
-            "https://www.nseindia.com/api/equity-stockIndices"
-            "?index=SECURITIES%20IN%20F%26O",
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) "
-                              "Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "application/json",
-                "Referer": "https://www.nseindia.com/",
-            },
-            timeout=10,
-        )
+    for url, label in endpoints:
+        try:
+            session = requests.Session()
+            session.get(
+                "https://www.nseindia.com",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                  "Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml",
+                },
+                timeout=10,
+            )
 
-        if response.status_code != 200:
-            log.warning(f"NSE API returned {response.status_code}")
-            return []
+            response = session.get(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                  "Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "application/json",
+                    "Referer": "https://www.nseindia.com/",
+                },
+                timeout=10,
+            )
 
-        data = response.json()
-        stocks = data.get("data", [])
+            if response.status_code != 200:
+                log.warning(f"NSE {label} API returned {response.status_code}")
+                continue
 
-        symbols = []
-        for s in stocks:
-            symbol = s.get("symbol", "")
-            if symbol and symbol != "NIFTY 50":
-                symbols.append(f"{symbol}.NS")
+            data   = response.json()
+            stocks = data.get("data", [])
 
-        log.info(f"NSE API: fetched {len(symbols)} F&O symbols")
-        return symbols
+            symbols = []
+            for s in stocks:
+                symbol = s.get("symbol", "")
+                if symbol and symbol not in ("NIFTY 50", "NIFTY500", "Nifty500"):
+                    symbols.append(f"{symbol}.NS")
 
-    except Exception as e:
-        log.warning(f"NSE API fetch failed: {e}")
-        return []
+            if symbols:
+                log.info(f"NSE API ({label}): fetched {len(symbols)} symbols")
+                return symbols
+
+        except Exception as e:
+            log.warning(f"NSE {label} API failed: {e}")
+            continue
+
+    return []
 
 
 def get_fno_universe(force_refresh: bool = False) -> list[str]:

@@ -326,6 +326,7 @@ def build_tv_chart(
     tf_name:  str,
     is_dark:  bool,
     signals:  list[dict] = None,
+    all_tf_data: dict = None,  # pre-loaded data for all timeframes
 ) -> str:
     """
     Fetch OHLCV data and build TradingView Lightweight Charts HTML.
@@ -455,7 +456,11 @@ body {{ background:{bg}; font-family:'IBM Plex Sans',sans-serif; overflow:hidden
 <body>
 <div id="chart-header">
   <div id="chart-title">{name}</div>
-  <div id="chart-tf">{tf_name} &nbsp;·&nbsp; TradingView Lightweight Charts</div>
+  <div style="display:flex;align-items:center;gap:8px;">
+    <div id="tf-buttons" style="display:flex;gap:4px;">
+    </div>
+    <div id="chart-tf" style="font-size:10px;color:{text};font-family:JetBrains Mono,monospace;margin-left:8px;">TradingView Lightweight Charts™</div>
+  </div>
 </div>
 <div id="price-chart"></div>
 <div id="rsi-chart"></div>
@@ -465,6 +470,7 @@ body {{ background:{bg}; font-family:'IBM Plex Sans',sans-serif; overflow:hidden
   <div class="legend-item"><div class="legend-dot" style="background:#4a90e2"></div>Pivot PP</div>
   <div class="legend-item"><div class="legend-dot" style="background:#1ec9a0;opacity:0.6"></div>S1/S2 Support</div>
   <div class="legend-item"><div class="legend-dot" style="background:#f05555;opacity:0.6"></div>R1/R2 Resistance</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#9b6dff;opacity:0.6"></div>RSI 25/75 levels</div>
 </div>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <script>
@@ -544,12 +550,20 @@ const rsiChart = LightweightCharts.createChart(document.getElementById('rsi-char
 }});
 
 const rsiSeries = rsiChart.addLineSeries({{
-  color: '#9b6dff', lineWidth: 1.5, priceLineVisible:false, lastValueVisible:true, title:'RSI',
+  color: '#9b6dff',
+  lineWidth: 2,
+  priceLineVisible: true,
+  lastValueVisible: true,
+  title: 'RSI',
+  priceFormat: {{ type: 'price', precision: 1, minMove: 0.1 }},
 }});
-if (rsiData.length > 0) rsiSeries.setData(rsiData);
+if (rsiData.length > 0) {{
+  rsiSeries.setData(rsiData);
+  rsiChart.timeScale().fitContent();
+}}
 
-// RSI 30/70 reference lines
-[30, 70].forEach(level => {{
+// RSI 25/75 reference lines (Jwala's levels)
+[25, 75].forEach(level => {{
   const refLine = rsiChart.addLineSeries({{
     color:           level === 70 ? 'rgba(240,85,85,0.4)' : 'rgba(30,201,160,0.4)',
     lineWidth:       1,
@@ -620,7 +634,15 @@ with st.sidebar:
         label_visibility="collapsed",
         key="strategy_selectbox",
     )
-    st.session_state.selected_strategy = selected_strategy
+    if selected_strategy != st.session_state.selected_strategy:
+        st.session_state.selected_strategy = selected_strategy
+        # Write to Supabase so scheduler picks it up immediately
+        try:
+            from core.database.db import set_config
+            if selected_strategy != "All Strategies":
+                set_config("SIGNAL_STRATEGY", selected_strategy)
+        except Exception:
+            pass
 
     st.markdown("<div style='margin:14px 0;border-top:1px solid var(--border);'></div>", unsafe_allow_html=True)
 
@@ -638,6 +660,17 @@ with st.sidebar:
     # FIXED: only update if changed — prevents double rerun
     if selected_tf != st.session_state.selected_tf:
         st.session_state.selected_tf = selected_tf
+
+    st.markdown("<div style='margin:14px 0;border-top:1px solid var(--border);'></div>", unsafe_allow_html=True)
+
+    # ── Search ──
+    st.markdown('<div style="font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:2px;margin-bottom:8px;">Search</div>', unsafe_allow_html=True)
+    search_query = st.text_input(
+        "Search",
+        placeholder="Type stock name...",
+        label_visibility="collapsed",
+        key="search_input",
+    ).strip().upper()
 
     st.markdown("<div style='margin:14px 0;border-top:1px solid var(--border);'></div>", unsafe_allow_html=True)
 
@@ -789,6 +822,12 @@ idx_rows = build_rows(INDEXES, INDEXES_DISPLAY, INDEXES_TV) if show_idx else []
 stk_rows = build_rows(fno_stocks, fno_display, fno_tv)      if show_stk else []
 com_rows = build_rows(COMMODITIES, COMMODITIES_DISPLAY, COMMODITIES_TV) if show_com else []
 
+# Apply search filter
+if search_query:
+    idx_rows = [r for r in idx_rows if search_query in r["name"].upper() or search_query in r["sym"].upper()]
+    stk_rows = [r for r in stk_rows if search_query in r["name"].upper() or search_query in r["sym"].upper()]
+    com_rows = [r for r in com_rows if search_query in r["name"].upper() or search_query in r["sym"].upper()]
+
 
 # ============================================================
 # KPI BAR
@@ -820,10 +859,8 @@ def show_chart_panel():
     # Get signals for this symbol to mark on chart
     sym_signals = []
     if not all_logs.empty and "Stock" in all_logs.columns:
-        sym_df = all_logs[
-            (all_logs["Stock"] == sym) &
-            (all_logs["Timeframe"] == selected_tf)
-        ].copy()
+        # Show ALL historical signals for this stock (all timeframes)
+        sym_df = all_logs[all_logs["Stock"] == sym].copy()
         if not sym_df.empty:
             sym_signals = sym_df.to_dict("records")
 

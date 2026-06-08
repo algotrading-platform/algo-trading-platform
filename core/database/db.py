@@ -354,3 +354,42 @@ def get_upstox_token() -> str | None:
     except Exception as e:
         print(f"[DB] get_upstox_token error: {e}")
         return None
+
+# ============================================================
+# APP CONFIG TABLE
+# Dynamic runtime configuration — active strategy etc.
+# ============================================================
+
+def get_config(key: str) -> str | None:
+    """Get a config value by key from app_config table."""
+    try:
+        client = get_client()
+        result = (
+            client.table("app_config")
+            .select("value")
+            .eq("key", key)
+            .limit(1)
+            .execute()
+        )
+        if result.data:
+            return result.data[0]["value"]
+        return None
+    except Exception as e:
+        print(f"[DB] get_config error: {e}")
+        return None
+
+
+def set_config(key: str, value: str) -> bool:
+    """Set a config value — upserts into app_config table."""
+    try:
+        from datetime import datetime
+        client = get_client()
+        client.table("app_config").upsert({
+            "key":        key,
+            "value":      value,
+            "updated_at": datetime.now().isoformat(),
+        }, on_conflict="key").execute()
+        return True
+    except Exception as e:
+        print(f"[DB] set_config error: {e}")
+        return False

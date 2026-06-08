@@ -39,13 +39,26 @@ IST = pytz.timezone("Asia/Kolkata")
 # yfinance interval → Upstox interval
 # ============================================================
 
+# V2 API intervals (fallback)
 UPSTOX_INTERVALS = {
-    "5m":  "5minute",
-    "15m": "30minute",   # Upstox uses 30minute for 15m equivalent
-    "1h":  "1hour",
-    "1d":  "1day",
-    "1wk": "1week",
-    "1mo": "1month",
+    "5m":  "1minute",
+    "15m": "30minute",
+    "1h":  "day",
+    "1d":  "day",
+    "1wk": "week",
+    "1mo": "month",
+}
+
+# V3 API intervals — supports 5min, 15min, 1hour properly
+# Format: (unit, interval_number)
+# URL: /v3/historical-candle/{instrument_key}/{unit}/{interval}/{to}/{from}
+UPSTOX_INTERVALS_V3 = {
+    "5m":  ("minutes", "5"),
+    "15m": ("minutes", "15"),
+    "1h":  ("hours",   "1"),
+    "1d":  ("days",    "1"),
+    "1wk": ("weeks",   "1"),
+    "1mo": ("months",  "1"),
 }
 
 # ============================================================
@@ -285,6 +298,12 @@ class UpstoxProvider(BaseDataProvider):
                 search_name=MCX_COMMODITY_SEARCH[symbol],
             )
 
+        # Auto-resolve: try NSE_EQ|SYMBOL format for unknown .NS stocks
+        if symbol.endswith(".NS"):
+            base = symbol.replace(".NS", "")
+            auto_key = f"NSE_EQ|{base}"
+            return auto_key
+
         return None
 
     def _get_mcx_contract(
@@ -375,16 +394,26 @@ class UpstoxProvider(BaseDataProvider):
         to_date:        str,
     ) -> pd.DataFrame:
         """
-        Call Upstox historical candle API and return clean DataFrame.
-        API docs: https://upstox.com/developer/api-documentation/historical-candle-data
+        Call Upstox V3 historical candle API.
+        V3 supports: 5minute, 15minute, 1hour, day, week, month
+        API: /v3/historical-candle/{key}/{unit}/{interval}/{to}/{from}
         """
-        # URL encode the instrument key
         encoded_key = requests.utils.quote(instrument_key, safe="")
 
-        url = (
-            f"{self._base_url}/historical-candle"
-            f"/{encoded_key}/{interval}/{to_date}/{from_date}"
-        )
+        # Use V3 API with proper unit/interval format
+        v3_mapping = UPSTOX_INTERVALS_V3.get(interval)
+        if v3_mapping:
+            unit, interval_num = v3_mapping
+            url = (
+                f"https://api.upstox.com/v3/historical-candle"
+                f"/{encoded_key}/{unit}/{interval_num}/{to_date}/{from_date}"
+            )
+        else:
+            # Fallback to V2 for unmapped intervals
+            url = (
+                f"{self._base_url}/historical-candle"
+                f"/{encoded_key}/{interval}/{to_date}/{from_date}"
+            )
 
         headers = {
             "Authorization": f"Bearer {token}",

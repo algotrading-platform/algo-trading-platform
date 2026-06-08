@@ -62,6 +62,7 @@ class AlertManager:
         price:          float,
         strategy:       str  = "RSI Reversal",
         signal_result   = None,
+        data_source:    str  = "yfinance",  # "upstox" or "yfinance"
     ) -> dict | None:
 
         previous_signal = db.get_alert_state(stock, timeframe)
@@ -87,6 +88,7 @@ class AlertManager:
             "price":         round(float(price), 2),
             "strategy":      strategy,
             "signal_result": signal_result,
+            "data_source":   data_source,
         }
 
         if self._bot_token and self._chat_id:
@@ -140,15 +142,17 @@ class AlertManager:
 
         # ── RSI / other strategy format — Jwala's spec ──
         else:
-            nifty_line = f"N{_trend_arrow(nifty_trend)}"
-            stock_line = f"S{_trend_arrow(stock_trend)}"
-            str_emoji  = _strength_emoji(strength)
+            nifty_line  = f"N{_trend_arrow(nifty_trend)}"
+            stock_line  = f"S{_trend_arrow(stock_trend)}"
+            str_emoji   = _strength_emoji(strength)
+            data_source = alert.get("data_source", "yfinance")
+            src_tag     = "✅" if data_source == "upstox" else "⚠"
 
             # Line 1: emoji  NAME  B/S  price  time
-            # Line 2: strength emoji + label  |  strategy  |  Nifty↑ Stock↑
+            # Line 2: strength | strategy | trend | timeframe | data source
             message = (
                 f"{sig_emoji} *{name}  {sig_letter}  {price_str}  {ist_now}*\n"
-                f"{str_emoji} {strength}  |  {strategy}  |  {nifty_line} {stock_line}  |  {tf}"
+                f"{str_emoji} {strength}  |  {strategy}  |  {nifty_line} {stock_line}  |  {tf}  |  {src_tag}"
             )
 
         url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"

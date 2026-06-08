@@ -20,6 +20,8 @@ from core.strategies.strategies import get_strategy, STRATEGY_NAMES
 from core.strategies.arbitrage_strategy import ArbitrageStrategy, arbitrage_strategy
 from core.indicators.indicators import (
     add_rsi,
+    get_nifty_trend,
+    get_stock_daily_trend,
     get_daily_trend,
     calculate_signal_strength,
     should_suppress_signal,
@@ -60,9 +62,9 @@ def get_nifty_daily_trend(provider) -> str:
         df = provider.fetch_data(
             symbol=NIFTY_SYMBOL,
             interval="1d",
-            period="3mo",
+            period="5d",   # only need last 2 days for today vs yesterday
         )
-        trend = get_daily_trend(df)
+        trend = get_nifty_trend(df)   # today's close vs yesterday's close
         _nifty_trend_cache = {"trend": trend, "date": today}
         log.info(f"Nifty daily trend: {trend}")
         return trend
@@ -122,9 +124,9 @@ class StrategyEngine:
             df_daily = provider.fetch_data(
                 symbol=symbol,
                 interval="1d",
-                period="3mo",
+                period="3mo",   # need 3 months for 20D EMA + higher highs
             )
-            return get_daily_trend(df_daily)
+            return get_stock_daily_trend(df_daily)
         except Exception:
             return "NEUTRAL"
 
@@ -353,7 +355,7 @@ class StrategyEngine:
         interval:    str,
         period:      str,
         instruments: list[dict],
-        max_workers: int = 5,   # reduced to stay within 1GB RAM
+        max_workers: int = 10,
     ) -> list[dict]:
 
         if not instruments:

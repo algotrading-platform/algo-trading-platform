@@ -1,12 +1,26 @@
 # ============================================================
 # core/scheduler/signal_scheduler.py
 #
-# Runs TWO strategies simultaneously on every scan:
-#   1. RSI Reversal    — all 182 instruments
-#   2. Cash-Futures Arbitrage — F&O stocks only (needs Upstox)
+# Market hours: 9:15 AM – 3:30 PM IST  Mon–Fri
+# All instruments scanned together: Indexes + Stocks + Commodities
 #
-# Both strategies always run. Dashboard filters by strategy.
-# No Railway restart needed to switch strategy view.
+# Strategy selection:
+#   Set SIGNAL_STRATEGY env variable to choose strategy.
+#   Default: "RSI Reversal"
+#
+#   Available strategies:
+#     RSI Reversal
+#     RSI + Pivot Confluence
+#     Bollinger Bands
+#     EMA Crossover
+#     MACD
+#     Volume Breakout
+#     Cash-Futures Arbitrage
+#
+# Instrument universe:
+#   ~180 NSE F&O stocks (fetched dynamically from NSE API)
+#   + 3 Indexes
+#   + 4 Commodities
 # ============================================================
 
 import os
@@ -15,7 +29,6 @@ import time
 import logging
 import calendar
 from datetime import datetime, date
-from concurrent.futures import ThreadPoolExecutor
 
 import pytz
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -28,8 +41,9 @@ sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 )
 
-from data.providers.upstox_provider import UpstoxProvider, get_token
+from data.providers.upstox_provider import UpstoxProvider
 from core.engine.strategy_engine import StrategyEngine
+from core.strategies.strategies import STRATEGY_NAMES
 from configs.universe import get_all_instruments_extended
 from configs.timeframes import TIMEFRAMES, PERIOD_MAP
 
@@ -43,6 +57,22 @@ log = logging.getLogger("scheduler")
 IST = pytz.timezone("Asia/Kolkata")
 
 # ============================================================
+# STRATEGY SELECTION
+# ============================================================
+
+_DEFAULT_STRATEGY = "RSI Reversal"
+_ACTIVE_STRATEGY  = os.getenv("SIGNAL_STRATEGY", _DEFAULT_STRATEGY)
+
+ALL_STRATEGY_NAMES = STRATEGY_NAMES + ["Cash-Futures Arbitrage"]
+
+if _ACTIVE_STRATEGY not in ALL_STRATEGY_NAMES:
+    log.warning(
+        f"Unknown strategy '{_ACTIVE_STRATEGY}'. "
+        f"Falling back to '{_DEFAULT_STRATEGY}'."
+    )
+    _ACTIVE_STRATEGY = _DEFAULT_STRATEGY
+
+# ============================================================
 # NSE HOLIDAYS 2025–2027
 # ============================================================
 
@@ -52,12 +82,14 @@ NSE_HOLIDAYS = {
     date(2025, 5, 1),  date(2025, 8, 15), date(2025, 8, 27),
     date(2025, 10, 2), date(2025, 10, 20),date(2025, 10, 21),
     date(2025, 11, 5), date(2025, 12, 25),
+
     date(2026, 1, 26), date(2026, 2, 26), date(2026, 3, 20),
     date(2026, 3, 25), date(2026, 4, 2),  date(2026, 4, 3),
     date(2026, 4, 14), date(2026, 4, 30), date(2026, 6, 27),
     date(2026, 7, 17), date(2026, 8, 15), date(2026, 8, 27),
     date(2026, 9, 25), date(2026, 10, 2), date(2026, 10, 20),
     date(2026, 10, 21),date(2026, 11, 25),date(2026, 12, 25),
+
     date(2027, 1, 26), date(2027, 2, 17), date(2027, 3, 10),
     date(2027, 3, 19), date(2027, 3, 26), date(2027, 4, 2),
     date(2027, 4, 14), date(2027, 4, 30), date(2027, 8, 15),
@@ -66,7 +98,7 @@ NSE_HOLIDAYS = {
 }
 
 # ============================================================
-# MARKET HOURS
+# MARKET HOURS CHECKS
 # ============================================================
 
 def is_market_day() -> bool:
@@ -75,6 +107,7 @@ def is_market_day() -> bool:
 
 
 def is_market_hours() -> bool:
+    """Single window: 9:15 AM – 3:30 PM IST"""
     if not is_market_day():
         return False
     from datetime import time as dtime
@@ -82,6 +115,7 @@ def is_market_hours() -> bool:
     return dtime(9, 15) <= t <= dtime(15, 30)
 
 
+# Keep for backward compatibility
 def is_equity_hours() -> bool:
     return is_market_hours()
 
@@ -104,23 +138,46 @@ def is_last_trading_day_of_month() -> bool:
 # ENGINES & INSTRUMENTS
 # ============================================================
 
-provider    = UpstoxProvider()
-instruments = get_all_instruments_extended()
+provider         = UpstoxProvider()
+instruments      = get_all_instruments_extended()
+fno_instruments  = [i for i in instruments if i["category"] == "STOCK"]
 
-# F&O stocks only for arbitrage (has futures contracts)
-fno_instruments = [i for i in instruments if i["category"] == "STOCK"]
-
-# Strategy engines — both always active
-_rsi_engine = StrategyEngine("RSI Reversal")
+# Arbitrage engine — always fixed
 _arb_engine = StrategyEngine("Cash-Futures Arbitrage")
+
+# Primary strategy engine — recreated when strategy changes
+_current_strategy  = None
+_primary_engine    = None
+
+
+def get_primary_engine() -> StrategyEngine:
+    """
+    Returns engine for currently selected strategy.
+    Reads from Supabase app_config on every scan —
+    dashboard can change strategy without Railway restart.
+    """
+    global _primary_engine, _current_strategy
+
+    try:
+        from core.database.db import get_config
+        strategy = get_config("SIGNAL_STRATEGY") or os.getenv("SIGNAL_STRATEGY", "RSI Reversal")
+    except Exception:
+        strategy = os.getenv("SIGNAL_STRATEGY", "RSI Reversal")
+
+    if strategy != _current_strategy:
+        log.info(f"Strategy: {_current_strategy} → {strategy}")
+        _primary_engine    = StrategyEngine(strategy)
+        _current_strategy  = strategy
+
+    return _primary_engine
 
 
 # ============================================================
 # SCAN FUNCTIONS
 # ============================================================
 
-def run_rsi_scan(tf_name: str) -> None:
-    """RSI Reversal scan — all 182 instruments."""
+def run_primary_scan(tf_name: str) -> None:
+    """Primary strategy scan on all 182 instruments."""
     interval = TIMEFRAMES[tf_name]
     period   = PERIOD_MAP[tf_name]
 
@@ -131,7 +188,7 @@ def run_rsi_scan(tf_name: str) -> None:
     if not is_market_hours():
         return
 
-    _rsi_engine.run_scan(
+    get_primary_engine().run_scan(
         provider=provider,
         tf_name=tf_name,
         interval=interval,
@@ -141,19 +198,14 @@ def run_rsi_scan(tf_name: str) -> None:
 
 
 def run_arbitrage_scan(tf_name: str) -> None:
-    """
-    Arbitrage scan — F&O stocks only.
-    Only runs on 5min and 15min (needs live prices).
-    Skips if no valid Upstox token.
-    """
+    """Arbitrage scan on F&O stocks only — 5min and 15min only."""
     if tf_name not in ("5 Minutes", "15 Minutes"):
         return
     if not is_market_hours():
         return
 
-    # Skip if no Upstox token
-    token = get_token()
-    if not token:
+    from data.providers.upstox_provider import get_token
+    if not get_token():
         log.info("Arbitrage scan skipped — no valid Upstox token")
         return
 
@@ -171,13 +223,11 @@ def run_arbitrage_scan(tf_name: str) -> None:
 
 def run_scan(tf_name: str, mode: str = "all") -> None:
     """
-    Runs RSI then Arbitrage sequentially.
+    Runs primary strategy then Arbitrage sequentially.
     Sequential to stay within Railway 1GB RAM limit.
-    Both always active — dashboard filters by strategy.
-    Total scan time ~60-70s, well within 5-min cycle.
     """
-    run_rsi_scan(tf_name)        # RSI first — frees memory before arbitrage
-    run_arbitrage_scan(tf_name)  # Arbitrage after RSI completes
+    run_primary_scan(tf_name)
+    run_arbitrage_scan(tf_name)
 
 
 # ============================================================
@@ -188,7 +238,7 @@ def build_scheduler() -> BlockingScheduler:
     scheduler = BlockingScheduler(timezone=IST)
 
     scheduler.add_job(
-        lambda: run_scan("5 Minutes"),
+        lambda: run_scan("5 Minutes", "all"),
         CronTrigger(
             minute="1,6,11,16,21,26,31,36,41,46,51,56",
             hour="9,10,11,12,13,14",
@@ -199,7 +249,7 @@ def build_scheduler() -> BlockingScheduler:
     )
 
     scheduler.add_job(
-        lambda: run_scan("15 Minutes"),
+        lambda: run_scan("15 Minutes", "all"),
         CronTrigger(
             minute="1,16,31,46",
             hour="9,10,11,12,13,14,15",
@@ -210,7 +260,7 @@ def build_scheduler() -> BlockingScheduler:
     )
 
     scheduler.add_job(
-        lambda: run_scan("1 Hour"),
+        lambda: run_scan("1 Hour", "all"),
         CronTrigger(
             minute="16", hour="10,11,12,13,14,15",
             day_of_week="mon-fri", timezone=IST,
@@ -220,7 +270,7 @@ def build_scheduler() -> BlockingScheduler:
     )
 
     scheduler.add_job(
-        lambda: run_scan("1 Day"),
+        lambda: run_scan("1 Day", "all"),
         CronTrigger(
             hour="15", minute="31",
             day_of_week="mon-fri", timezone=IST,
@@ -230,7 +280,7 @@ def build_scheduler() -> BlockingScheduler:
     )
 
     scheduler.add_job(
-        lambda: run_scan("1 Week"),
+        lambda: run_scan("1 Week", "all"),
         CronTrigger(
             hour="15", minute="32",
             day_of_week="fri", timezone=IST,
@@ -240,7 +290,7 @@ def build_scheduler() -> BlockingScheduler:
     )
 
     scheduler.add_job(
-        lambda: run_scan("1 Month"),
+        lambda: run_scan("1 Month", "all"),
         CronTrigger(
             hour="15", minute="33",
             day_of_week="mon-fri", timezone=IST,
@@ -253,12 +303,18 @@ def build_scheduler() -> BlockingScheduler:
 
 
 def start() -> None:
+    try:
+        from core.database.db import get_config
+        active_strat = get_config("SIGNAL_STRATEGY") or os.getenv("SIGNAL_STRATEGY", "RSI Reversal")
+    except Exception:
+        active_strat = os.getenv("SIGNAL_STRATEGY", "RSI Reversal")
+
     log.info("=" * 60)
     log.info("Algo Trading Signal Scheduler")
-    log.info(f"Instruments : {len(instruments)} total")
-    log.info(f"F&O stocks  : {len(fno_instruments)} (for arbitrage)")
+    log.info(f"Instruments : {len(instruments)} total | {len(fno_instruments)} F&O")
     log.info(f"Timeframes  : {list(TIMEFRAMES.keys())}")
-    log.info("Strategies  : RSI Reversal + Cash-Futures Arbitrage (parallel)")
+    log.info(f"Strategy    : {active_strat} + Arbitrage (always active)")
+    log.info("Dynamic     : Strategy reads from Supabase every scan")
     log.info("Data source : Upstox API (primary) + yfinance (fallback)")
     log.info("Market hours: 9:15 AM – 3:30 PM IST")
     log.info("=" * 60)
