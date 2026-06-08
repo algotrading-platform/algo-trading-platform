@@ -225,9 +225,18 @@ def run_scan(tf_name: str, mode: str = "all") -> None:
     """
     Runs primary strategy then Arbitrage sequentially.
     Sequential to stay within Railway 1GB RAM limit.
+    Updates LAST_SCAN_TIME in Supabase after every scan
+    so dashboard timer is accurate even when all signals are HOLD.
     """
     run_primary_scan(tf_name)
     run_arbitrage_scan(tf_name)
+
+    # Always update scan time — even if all results were HOLD
+    try:
+        from core.database.db import set_config
+        set_config("LAST_SCAN_TIME", datetime.now(IST).isoformat())
+    except Exception:
+        pass
 
 
 # ============================================================

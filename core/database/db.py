@@ -143,9 +143,35 @@ def get_last_signal(stock: str, timeframe: str) -> str | None:
 
 def get_last_scan_time() -> str | None:
     """
-    Returns how long ago the last signal was written.
-    Used for scheduler status in dashboard sidebar.
+    Returns how long ago the last scan ran.
+    Reads from app_config LAST_SCAN_TIME — updated after every scan
+    even when all results are HOLD (no signals).
+    Falls back to last signal timestamp if app_config not set.
     """
+    import pytz
+    IST = pytz.timezone("Asia/Kolkata")
+
+    def _format(last_ts):
+        now = datetime.now(IST)
+        if last_ts.tzinfo is None:
+            last_ts = IST.localize(last_ts)
+        diff = now - last_ts.astimezone(IST)
+        mins = int(diff.total_seconds() / 60)
+        if mins < 2:    return "just now"
+        if mins < 60:   return f"{mins}m ago"
+        hours = mins // 60
+        return f"{hours}h {mins % 60}m ago"
+
+    # Check app_config first — updated every scan
+    try:
+        val = get_config("LAST_SCAN_TIME")
+        if val:
+            last_ts = datetime.fromisoformat(val)
+            return _format(last_ts)
+    except Exception:
+        pass
+
+    # Fallback — last signal timestamp
     try:
         client = get_client()
         result = (
@@ -157,21 +183,8 @@ def get_last_scan_time() -> str | None:
         )
         if not result.data:
             return None
-
         last_ts = datetime.fromisoformat(result.data[0]["timestamp"])
-        import pytz
-        IST  = pytz.timezone("Asia/Kolkata")
-        now  = datetime.now(IST)
-        if last_ts.tzinfo is None:
-            last_ts = IST.localize(last_ts)
-        diff = now - last_ts.astimezone(IST)
-        mins = int(diff.total_seconds() / 60)
-
-        if mins < 2:    return "just now"
-        if mins < 60:   return f"{mins}m ago"
-        hours = mins // 60
-        return f"{hours}h {mins % 60}m ago"
-
+        return _format(last_ts)
     except Exception as e:
         print(f"[DB] get_last_scan_time error: {e}")
         return None
