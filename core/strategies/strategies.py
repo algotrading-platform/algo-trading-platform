@@ -77,8 +77,8 @@ class RSIReversalStrategy(BaseStrategy):
             return SignalResult("BUY", strength, reason, indicators, self.name)
 
         # SELL: RSI reversed from overbought
-        if prev2 > 65 and prev < prev2 and current < prev and current < 65:
-            strength = "STRONG" if prev2 > 72 else "MODERATE"
+        if prev2 > 75 and prev < prev2 and current < prev and current < 75:
+            strength = "STRONG" if prev2 > 80 else "MODERATE"
             reason = (
                 f"RSI reversed from overbought zone. "
                 f"RSI was {round(prev2,1)} (above 70), now falling to {round(current,1)}. "
@@ -142,7 +142,7 @@ class RSIPivotStrategy(BaseStrategy):
 
         # Check RSI reversal
         rsi_buy  = prev2 < 35 and prev > prev2 and current > prev and current > 35
-        rsi_sell = prev2 > 65 and prev < prev2 and current < prev and current < 65
+        rsi_sell = prev2 > 75 and prev < prev2 and current < prev and current < 75
 
         def near_level(level_price: float) -> bool:
             if level_price <= 0:

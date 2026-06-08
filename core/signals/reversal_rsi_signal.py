@@ -22,7 +22,7 @@
 # ============================================================
 
 RSI_OVERSOLD  = 35   # BUY trigger level (Jwala 06-Jun-2026: broaden to 35)
-RSI_OVERBOUGHT = 65  # SELL trigger level (Jwala 06-Jun-2026: broaden to 65)
+RSI_OVERBOUGHT = 75  # SELL trigger level (Jwala 06-Jun-2026)
 
 
 class ReversalRSISignal:
@@ -64,10 +64,10 @@ class ReversalRSISignal:
 
         # --------------------------------------------------
         # SELL: RSI pushed above 75, now reversing
-        #   prev2 > 65  → was in overbought zone
+        #   prev2 > 75  → was in overbought zone
         #   prev  < prev2  → first drop candle
         #   current < prev → second drop candle (confirmation)
-        #   current < 65   → crossed back out of overbought zone
+        #   current < 75   → crossed back out of overbought zone
         # --------------------------------------------------
         if (
             prev2 > RSI_OVERBOUGHT
