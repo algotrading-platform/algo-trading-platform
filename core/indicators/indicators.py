@@ -325,48 +325,7 @@ def get_daily_trend(df_daily: pd.DataFrame) -> str:
     return get_stock_daily_trend(df_daily)
 
 
-def calculate_signal_strength(
-    signal:       str,
-    nifty_trend:  str,
-    stock_trend:  str,
-) -> str:
-    """
-    Determine signal strength based on Nifty + stock daily trends.
-
-    BUY strength:
-      Nifty RISING + Stock RISING  → STRONG
-      Stock RISING only             → MODERATE
-      Nifty RISING only             → MODERATE
-      Both FALLING                  → WEAK (will be suppressed)
-
-    SELL strength:
-      Nifty FALLING + Stock FALLING → STRONG
-      Stock FALLING only            → MODERATE
-      Nifty FALLING only            → MODERATE
-      Both RISING                   → WEAK (will be suppressed)
-    """
-    if signal == "BUY":
-        if nifty_trend == "RISING" and stock_trend == "RISING":
-            return "STRONG"
-        elif stock_trend == "RISING":
-            return "MODERATE"
-        elif nifty_trend == "RISING":
-            return "MODERATE"
-        else:
-            return "WEAK"
-
-    elif signal == "SELL":
-        if nifty_trend == "FALLING" and stock_trend == "FALLING":
-            return "STRONG"
-        elif stock_trend == "FALLING":
-            return "MODERATE"
-        elif nifty_trend == "FALLING":
-            return "MODERATE"
-        else:
-            return "WEAK"
-
-    return "WEAK"
-
+# calculate_signal_strength — see updated version below with volume_ratio
 
 def should_suppress_signal(
     signal:      str,
@@ -463,3 +422,118 @@ def get_nifty_multi_trend(provider) -> dict:
     Uses ^NSEI symbol.
     """
     return get_multi_timeframe_trend(provider, "^NSEI")
+
+
+# ============================================================
+# VOLUME SPIKE DETECTION — Jwala's primary confirmation
+# ============================================================
+
+VOLUME_SPIKE_STRONG   = 20.0   # 2000% = STRONG confirmation
+VOLUME_SPIKE_MODERATE = 10.0   # 1000% = MODERATE confirmation
+
+
+def get_volume_spike_ratio(df: pd.DataFrame) -> float:
+    """
+    Calculate current candle volume vs 2-week average.
+    Returns ratio: 20.0 = 2000% spike.
+    Jwala: "8 out of 10 stocks rise when volume > 2000% of average"
+    """
+    if df is None or df.empty or "Volume" not in df.columns:
+        return 0.0
+
+    try:
+        df = df.copy()
+        df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce")
+        df.dropna(subset=["Volume"], inplace=True)
+
+        if len(df) < 15:
+            return 0.0
+
+        # 14 candles = 2 weeks of daily / recent intraday
+        avg_volume  = float(df["Volume"].iloc[-15:-1].mean())
+        curr_volume = float(df["Volume"].iloc[-1])
+
+        if avg_volume <= 0:
+            return 0.0
+
+        return round(curr_volume / avg_volume, 2)
+
+    except Exception:
+        return 0.0
+
+
+def get_volume_spike_label(ratio: float) -> str:
+    """Human readable volume spike description."""
+    pct = round(ratio * 100)
+    if ratio >= VOLUME_SPIKE_STRONG:
+        return f"VOL {pct}% 🔥"
+    if ratio >= VOLUME_SPIKE_MODERATE:
+        return f"VOL {pct}% ↑"
+    return f"VOL {pct}%"
+
+
+# ============================================================
+# VOLUME SPIKE DETECTION — Jwala's primary confirmation
+# ============================================================
+
+VOLUME_SPIKE_STRONG   = 20.0   # 2000% = STRONG confirmation
+VOLUME_SPIKE_MODERATE = 10.0   # 1000% = MODERATE confirmation
+
+
+def get_volume_spike_ratio(df: pd.DataFrame) -> float:
+    """
+    Calculate current candle volume vs 2-week average.
+    Returns ratio: 20.0 = 2000% spike.
+    """
+    if df is None or df.empty or "Volume" not in df.columns:
+        return 0.0
+    try:
+        df = df.copy()
+        df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce")
+        df.dropna(subset=["Volume"], inplace=True)
+        if len(df) < 15:
+            return 0.0
+        avg_volume  = float(df["Volume"].iloc[-15:-1].mean())
+        curr_volume = float(df["Volume"].iloc[-1])
+        if avg_volume <= 0:
+            return 0.0
+        return round(curr_volume / avg_volume, 2)
+    except Exception:
+        return 0.0
+
+
+def get_volume_spike_label(ratio: float) -> str:
+    pct = round(ratio * 100)
+    if ratio >= VOLUME_SPIKE_STRONG:   return f"VOL {pct}% 🔥"
+    if ratio >= VOLUME_SPIKE_MODERATE: return f"VOL {pct}% ↑"
+    return f"VOL {pct}%"
+
+
+def calculate_signal_strength(
+    signal:        str,
+    nifty_trend:   str,
+    stock_trend:   str,
+    volume_ratio:  float = 0.0,
+) -> str:
+    """
+    Clean 2-factor strength — Volume spike is primary confirmation.
+    """
+    has_vol_spike = volume_ratio >= VOLUME_SPIKE_STRONG
+
+    if signal == "BUY":
+        trends_aligned = nifty_trend == "RISING" and stock_trend == "RISING"
+        if has_vol_spike and trends_aligned:  return "VERY STRONG"
+        if has_vol_spike:                     return "STRONG"
+        if trends_aligned:                    return "MODERATE"
+        if nifty_trend == "RISING" or stock_trend == "RISING": return "MODERATE"
+        return "WEAK"
+
+    elif signal == "SELL":
+        trends_aligned = nifty_trend == "FALLING" and stock_trend == "FALLING"
+        if has_vol_spike and trends_aligned:  return "VERY STRONG"
+        if has_vol_spike:                     return "STRONG"
+        if trends_aligned:                    return "MODERATE"
+        if nifty_trend == "FALLING" or stock_trend == "FALLING": return "MODERATE"
+        return "WEAK"
+
+    return "WEAK"
