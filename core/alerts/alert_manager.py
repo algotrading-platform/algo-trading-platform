@@ -42,8 +42,9 @@ def _trend_arrow(trend: str) -> str:
 
 
 def _strength_emoji(strength: str) -> str:
-    if strength == "STRONG":   return "💪"
-    if strength == "MODERATE": return "👍"
+    if strength == "VERY STRONG": return "💎"
+    if strength == "STRONG":      return "💪"
+    if strength == "MODERATE":    return "👍"
     return "👌"
 
 
@@ -151,14 +152,35 @@ class AlertManager:
             nifty_label  = indicators.get("nifty_trend_label") or f"N{_trend_arrow(nifty_trend)}"
             stock_label  = indicators.get("stock_trend_label") or f"S{_trend_arrow(stock_trend)}"
 
+            # Volume spike info
+            vol_label = indicators.get("volume_label", "")
+            vol_line  = f"  |  {vol_label}" if vol_label and "🔥" in vol_label else ""
+
+            # RSI D/H/5m values
+            def _rsi_str(val):
+                if val is None: return "–"
+                return str(val)
+
+            n_d = _rsi_str(indicators.get("nifty_rsi_daily"))
+            n_h = _rsi_str(indicators.get("nifty_rsi_hourly"))
+            n_5 = _rsi_str(indicators.get("nifty_rsi_5min"))
+            s_d = _rsi_str(indicators.get("stock_rsi_daily"))
+            s_h = _rsi_str(indicators.get("stock_rsi_hourly"))
+            s_5 = _rsi_str(indicators.get("stock_rsi_5min"))
+
             # Format:
             # 🔴 GODREJCP  S  ₹995.10  14:11 IST
-            # 💪 STRONG  |  RSI Reversal
-            # Nifty: D↓ H↓ 5m↓  Stock: D↑ H↑ 5m↑  |  5 Minutes  ⚠
+            # 💎 VERY STRONG  |  RSI Reversal  |  VOL 2400% 🔥
+            # Nifty: D↓(44) H↓(38) 5m↓(29)
+            # Stock: D↑(58) H↑(62) 5m↑(34)  |  1H  ⚠
+            nifty_rsi_line = f"Nifty: D{_trend_arrow(nifty_trend)}({n_d}) H{_trend_arrow(nifty_trend)}({n_h}) 5m{_trend_arrow(nifty_trend)}({n_5})"
+            stock_rsi_line = f"Stock: D{_trend_arrow(stock_trend)}({s_d}) H{_trend_arrow(stock_trend)}({s_h}) 5m{_trend_arrow(stock_trend)}({s_5})"
+
             message = (
                 f"{sig_emoji} *{name}  {sig_letter}  {price_str}  {ist_now}*\n"
-                f"{str_emoji} {strength}  |  {strategy}\n"
-                f"Nifty: {nifty_label}  |  Stock: {stock_label}  |  {tf}  {src_tag}"
+                f"{str_emoji} {strength}  |  {strategy}{vol_line}\n"
+                f"{nifty_rsi_line}\n"
+                f"{stock_rsi_line}  |  {tf}  {src_tag}"
             )
 
         url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"

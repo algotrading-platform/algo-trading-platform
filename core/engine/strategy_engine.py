@@ -26,6 +26,8 @@ from core.indicators.indicators import (
     calculate_signal_strength,
     should_suppress_signal,
     get_multi_timeframe_trend,
+    get_volume_spike_ratio,
+    get_volume_spike_label,
 )
 from core.logger.signal_logger import SignalLogger
 from core.alerts.alert_manager import AlertManager
@@ -44,7 +46,83 @@ NIFTY_SYMBOL = "^NSEI"
 # ============================================================
 
 _nifty_trend_cache: dict = {"trend": "NEUTRAL", "date": None}
-_nifty_multi_cache: dict = {"label": "D→ H→ 5m→", "date": None}
+_nifty_multi_cache: dict  = {"label": "D→ H→ 5m→", "date": None}
+_nifty_rsi_cache: dict   = {"rsi": {}, "date": None}
+
+
+def _fetch_rsi_value(provider, symbol: str, interval: str, period: str) -> float | None:
+    """Fetch RSI value for a specific timeframe. Returns latest RSI or None."""
+    try:
+        df = provider.fetch_data(symbol=symbol, interval=interval, period=period)
+        if df is None or df.empty or len(df) < 15:
+            return None
+        df_rsi = add_rsi(df.copy())
+        df_rsi.dropna(subset=["RSI"], inplace=True)
+        if df_rsi.empty:
+            return None
+        return round(float(df_rsi["RSI"].iloc[-1]), 1)
+    except Exception:
+        return None
+
+
+def _get_nifty_rsi_values(provider) -> dict:
+    """
+    Get Nifty RSI for Daily, Hourly, 5min. Cached per day.
+    Returns: {"daily": 52.3, "hourly": 44.1, "5min": 31.2}
+    """
+    global _nifty_rsi_cache
+    from datetime import date
+    today = date.today().isoformat()
+
+    if _nifty_rsi_cache["date"] == today:
+        return _nifty_rsi_cache["rsi"]
+
+    rsi = {}
+    rsi["daily"]  = _fetch_rsi_value(provider, "^NSEI", "1d",  "3mo")
+    rsi["hourly"] = _fetch_rsi_value(provider, "^NSEI", "1h",  "5d")
+    rsi["5min"]   = _fetch_rsi_value(provider, "^NSEI", "15m", "3d")
+
+    _nifty_rsi_cache = {"rsi": rsi, "date": today}
+    return rsi
+
+
+def _fetch_rsi_value(provider, symbol: str, interval: str, period: str):
+    """Fetch RSI for a specific timeframe. Returns float or None."""
+    try:
+        df = provider.fetch_data(symbol=symbol, interval=interval, period=period)
+        if df is None or df.empty or len(df) < 15:
+            return None
+        df_r = add_rsi(df.copy())
+        df_r.dropna(subset=["RSI"], inplace=True)
+        if df_r.empty:
+            return None
+        return round(float(df_r["RSI"].iloc[-1]), 1)
+    except Exception:
+        return None
+
+
+_nifty_rsi_cache: dict = {"rsi": {}, "date": None}
+
+
+def _get_nifty_rsi_values(provider) -> dict:
+    """
+    Get Nifty RSI for Daily, Hourly, 5min. Cached per day.
+    Returns: {"daily": 52.3, "hourly": 44.1, "5min": 31.2}
+    """
+    global _nifty_rsi_cache
+    from datetime import date
+    today = date.today().isoformat()
+
+    if _nifty_rsi_cache["date"] == today:
+        return _nifty_rsi_cache["rsi"]
+
+    rsi = {
+        "daily":  _fetch_rsi_value(provider, "^NSEI", "1d",  "3mo"),
+        "hourly": _fetch_rsi_value(provider, "^NSEI", "1h",  "5d"),
+        "5min":   _fetch_rsi_value(provider, "^NSEI", "15m", "3d"),
+    }
+    _nifty_rsi_cache = {"rsi": rsi, "date": today}
+    return rsi
 
 
 def _get_nifty_multi_label(provider) -> str:
@@ -209,23 +287,42 @@ class StrategyEngine:
                         signal = "HOLD"
 
                     else:
-                        # Recalculate strength based on trends
+                        # ── Volume spike check (Jwala's primary confirmation) ──
+                        volume_ratio = get_volume_spike_ratio(df.copy())
+
+                        # ── Unified strength: RSI + Volume + Trends ──
                         trend_strength = calculate_signal_strength(
-                            signal, nifty_trend, stock_trend
+                            signal, nifty_trend, stock_trend,
+                            volume_ratio=volume_ratio,
                         )
                         result.strength    = trend_strength
                         result.nifty_trend = nifty_trend
                         result.stock_trend = stock_trend
 
-                        # ── 3-arrow multi-timeframe trend (Jwala's spec) ──
-                        # Only fetch when signal fires — avoids extra API calls for HOLD
+                        # Store volume info in indicators
+                        result.indicators["volume_ratio"] = volume_ratio
+                        result.indicators["volume_label"] = get_volume_spike_label(volume_ratio)
+
+                        # ── Trend labels ──
                         try:
                             multi = get_multi_timeframe_trend(provider, symbol)
-                            result.indicators["nifty_trend_label"]  = _get_nifty_multi_label(provider)
-                            result.indicators["stock_trend_label"]  = multi["label"]
+                            result.indicators["nifty_trend_label"] = _get_nifty_multi_label(provider)
+                            result.indicators["stock_trend_label"] = multi["label"]
                         except Exception:
-                            result.indicators["nifty_trend_label"]  = f"N{nifty_trend[0]}"
-                            result.indicators["stock_trend_label"]  = f"S{stock_trend[0]}"
+                            result.indicators["nifty_trend_label"] = f"N{_trend_arrow(nifty_trend)}"
+                            result.indicators["stock_trend_label"] = f"S{_trend_arrow(stock_trend)}"
+
+                        # ── RSI D/H/5m values (Jwala 09-Jun-2026) ──
+                        try:
+                            nifty_rsi = _get_nifty_rsi_values(provider)
+                            result.indicators["nifty_rsi_daily"]  = nifty_rsi.get("daily")
+                            result.indicators["nifty_rsi_hourly"] = nifty_rsi.get("hourly")
+                            result.indicators["nifty_rsi_5min"]   = nifty_rsi.get("5min")
+                            result.indicators["stock_rsi_daily"]  = _fetch_rsi_value(provider, symbol, "1d",  "3mo")
+                            result.indicators["stock_rsi_hourly"] = _fetch_rsi_value(provider, symbol, "1h",  "5d")
+                            result.indicators["stock_rsi_5min"]   = _fetch_rsi_value(provider, symbol, "15m", "3d")
+                        except Exception:
+                            pass
                 else:
                     stock_trend = "NEUTRAL"
 
