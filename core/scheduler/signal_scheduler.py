@@ -249,8 +249,10 @@ def build_scheduler() -> BlockingScheduler:
     scheduler.add_job(
         lambda: run_scan("5 Minutes", "all"),
         CronTrigger(
-            minute="1,6,11,16,21,26,31,36,41,46,51,56",
-            hour="9,10,11,12,13,14",
+            #minute="1,6,11,16,21,26,31,36,41,46,51,56",
+            #hour="9,10,11,12,13,14",
+            minute="16",
+            hour="9,10,11,12,13,14,15",
             day_of_week="mon-fri", timezone=IST,
         ),
         id="scan_5min", name="5 Minute Scan",
