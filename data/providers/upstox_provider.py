@@ -257,58 +257,24 @@ _mcx_cache_date: str = ""
 
 def get_token() -> str | None:
     """
-    Fetch the current Upstox access token from Supabase.
+    Fetch the current Upstox access token from Azure PostgreSQL.
     Returns None if not found or expired.
     """
     try:
-        from core.database.db import get_client
-        client = get_client()
-        result = (
-            client.table("upstox_tokens")
-            .select("access_token, expires_at")
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        if not result.data:
-            return None
-
-        row = result.data[0]
-        expires_at = datetime.fromisoformat(row["expires_at"])
-
-        if expires_at.tzinfo is None:
-            expires_at = IST.localize(expires_at)
-
-        if datetime.now(IST) >= expires_at:
-            return None
-
-        return row["access_token"]
-
+        from core.database.db import get_upstox_token
+        return get_upstox_token()
     except Exception as e:
         print(f"[Upstox] get_token error: {e}")
         return None
 
-
 def save_token(access_token: str) -> bool:
-    """Save access token to Supabase. Expires at 3:30 AM next day IST."""
+    """Save access token to Azure PostgreSQL. Expires at 3:30 AM next day IST."""
     try:
-        from core.database.db import get_client
-        now = datetime.now(IST)
-        # Token valid until 3:30 AM next day
-        expires_at = (now + timedelta(days=1)).replace(
-            hour=3, minute=30, second=0, microsecond=0
-        )
-        client = get_client()
-        client.table("upstox_tokens").insert({
-            "access_token": access_token,
-            "created_at":   now.isoformat(),
-            "expires_at":   expires_at.isoformat(),
-        }).execute()
-        return True
+        from core.database.db import save_upstox_token
+        return save_upstox_token(access_token)
     except Exception as e:
         print(f"[Upstox] save_token error: {e}")
         return False
-
 
 # ============================================================
 # UPSTOX PROVIDER

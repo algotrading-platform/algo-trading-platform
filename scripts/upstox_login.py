@@ -4,7 +4,7 @@
 #
 # Run this ONCE every morning before 9:15 AM IST.
 # Generates a fresh Upstox access token and saves it
-# to Supabase so the Railway scheduler can use it all day.
+# to Azure PostgreSQL so the scheduler can use it all day.
 #
 # Usage:
 #   python scripts/upstox_login.py
@@ -16,7 +16,7 @@
 #   4. Upstox redirects to http://127.0.0.1:8000/callback?code=XXX
 #   5. This script catches the code automatically
 #   6. Exchanges it for an access token
-#   7. Saves token to Supabase
+#   7. Saves token to Azure PostgreSQL
 #   8. Done — scheduler will use it for the whole day
 #
 # Time required: ~30 seconds
@@ -75,7 +75,7 @@ class CallbackHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"""
                 <html><body style='font-family:sans-serif;text-align:center;padding:60px;'>
                 <h2 style='color:#1a9e75;'>Login successful!</h2>
-                <p>Access token saved to Supabase.</p>
+                <p>Access token saved to Azure PostgreSQL.</p>
                 <p>You can close this tab.</p>
                 <p style='color:#888;font-size:13px;'>Scheduler is now ready for market hours.</p>
                 </body></html>
@@ -160,21 +160,22 @@ def main():
         print("ERROR: Failed to get access token. Check API credentials.")
         sys.exit(1)
 
-    print("Access token received. Saving to Supabase...")
+    print("Access token received. Saving to Azure PostgreSQL...")
 
-    from data.providers.upstox_provider import save_token
-    success = save_token(token)
+    # Use Azure PostgreSQL directly
+    from core.database.db import save_upstox_token
+    success = save_upstox_token(token)
 
     if success:
         print()
         print("=" * 55)
-        print("  SUCCESS — Token saved to Supabase")
+        print("  SUCCESS — Token saved to Azure PostgreSQL")
         print("  Scheduler will use Upstox data all day.")
         print("  Market opens at 9:15 AM IST.")
         print("=" * 55)
     else:
-        print("ERROR: Failed to save token to Supabase.")
-        print("Check SUPABASE_URL and SUPABASE_KEY in .env")
+        print("ERROR: Failed to save token to Azure PostgreSQL.")
+        print("Check DATABASE_URL in .env")
         sys.exit(1)
 
 
