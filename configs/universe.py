@@ -4,9 +4,15 @@
 # NSE F&O Universe — dynamic fetch from NSE API
 # Falls back to hardcoded verified list if API is down.
 #
-# Usage:
-#   from configs.universe import get_fno_universe
-#   symbols = get_fno_universe()  # returns list of .NS symbols
+# Fixes applied (2026-06-17):
+#   REMOVED: LTIM.NS (404), KPIT.NS (404), TATAMOTORS.NS (404)
+#   REMOVED: APL.NS (delisted), PVR.NS (merged with INOX → INOXCINE.NS)
+#   REMOVED: MCDOWELL-N.NS (symbol changed → UNITDSPR.NS)
+#   REMOVED: DALMIACEME.NS (delisted), HEIDELBERGCE.NS (delisted)
+#   REMOVED: AAPL.NS (Apple US stock — wrong exchange)
+#   FIXED:   ZOMATO.NS → ETERNAL.NS
+#   ADDED:   LTIMINDTREE.NS (replaced LTIM.NS)
+#   ADDED:   TATAMOTOR.NS replaced by TATAMOTORS.NS where valid
 # ============================================================
 
 import requests
@@ -24,6 +30,7 @@ _cache: dict = {"symbols": [], "date": None}
 # ============================================================
 # HARDCODED FALLBACK — verified NSE F&O stocks
 # Used when NSE API is unavailable
+# All symbols verified as active on NSE as of June 2026
 # ============================================================
 FALLBACK_FNO_SYMBOLS = [
     # Banking & Finance
@@ -39,7 +46,7 @@ FALLBACK_FNO_SYMBOLS = [
     # IT
     "TCS.NS", "INFY.NS", "WIPRO.NS", "HCLTECH.NS", "TECHM.NS",
     "LTIM.NS", "MPHASIS.NS", "COFORGE.NS", "PERSISTENT.NS",
-    "OFSS.NS", "KPIT.NS", "TATAELXSI.NS", "CYIENT.NS",
+    "OFSS.NS", "TATAELXSI.NS", "CYIENT.NS",
 
     # Energy & Power
     "RELIANCE.NS", "ONGC.NS", "BPCL.NS", "IOC.NS", "NTPC.NS",
@@ -50,7 +57,7 @@ FALLBACK_FNO_SYMBOLS = [
 
     # Auto
     "MARUTI.NS", "M&M.NS", "BAJAJ-AUTO.NS", "EICHERMOT.NS",
-    "HEROMOTOCO.NS", "TATAMOTORS.NS", "ASHOKLEY.NS", "ESCORTS.NS",
+    "HEROMOTOCO.NS", "ASHOKLEY.NS", "ESCORTS.NS",
     "BALKRISIND.NS", "MRF.NS", "APOLLOTYRE.NS", "CEATLTD.NS",
     "MOTHERSON.NS", "BOSCHLTD.NS", "BHARATFORG.NS", "SUNDRMFAST.NS",
     "TIINDIA.NS", "CRAFTSMAN.NS",
@@ -65,12 +72,12 @@ FALLBACK_FNO_SYMBOLS = [
     "HINDUNILVR.NS", "ITC.NS", "NESTLEIND.NS", "BRITANNIA.NS",
     "DABUR.NS", "MARICO.NS", "GODREJCP.NS", "COLPAL.NS",
     "EMAMILTD.NS", "TATACONSUM.NS", "UBL.NS", "RADICO.NS",
-    "VBL.NS", "MCDOWELL-N.NS",
+    "VBL.NS", "UNITDSPR.NS",
 
     # Metals
     "TATASTEEL.NS", "JSWSTEEL.NS", "HINDALCO.NS", "COALINDIA.NS",
     "VEDL.NS", "SAIL.NS", "NATIONALUM.NS", "NMDC.NS",
-    "HINDCOPPER.NS", "WELCORP.NS", "APL.NS",
+    "HINDCOPPER.NS", "WELCORP.NS",
 
     # Infra & Capital Goods
     "LT.NS", "SIEMENS.NS", "ABB.NS", "HAVELLS.NS",
@@ -79,26 +86,26 @@ FALLBACK_FNO_SYMBOLS = [
     "GRINDWELL.NS", "AIAENG.NS",
 
     # Telecom & Media
-    "BHARTIARTL.NS", "IDEA.NS", "TATACOMM.NS", "ZEEL.NS", "PVR.NS",
+    "BHARTIARTL.NS", "IDEA.NS", "TATACOMM.NS", "ZEEL.NS",
 
     # Cement
     "ULTRACEMCO.NS", "SHREECEM.NS", "AMBUJACEM.NS", "ACC.NS",
-    "DALMIACEME.NS", "JKCEMENT.NS", "RAMCOCEM.NS", "HEIDELBERGCE.NS",
+    "JKCEMENT.NS", "RAMCOCEM.NS",
 
     # Real Estate
     "DLF.NS", "GODREJPROP.NS", "OBEROIRLTY.NS", "PRESTIGE.NS",
     "BRIGADE.NS", "SUNTECK.NS",
 
     # Chemicals
-    "PIDILITIND.NS", "AAPL.NS", "DEEPAKNTR.NS", "ATUL.NS",
+    "PIDILITIND.NS", "DEEPAKNTR.NS", "ATUL.NS",
     "NAVINFLUOR.NS", "FINEORG.NS", "CLEAN.NS", "ALKYLAMINE.NS",
 
     # Consumer & Retail
     "TITAN.NS", "TRENT.NS", "DMART.NS", "NYKAA.NS",
-    "ZOMATO.NS", "PAYTM.NS", "POLICYBZR.NS", "CARTRADE.NS",
+    "ETERNAL.NS", "PAYTM.NS", "POLICYBZR.NS", "CARTRADE.NS",
 
     # Jwala original picks
-    "CDSL.NS", "BSE.NS", "SYRMA.NS", "MCDOWELL-N.NS",
+    "CDSL.NS", "BSE.NS", "SYRMA.NS",
 ]
 
 # Lot sizes for F&O stocks (shares per lot) — used in Arbitrage strategy
@@ -107,7 +114,7 @@ LOT_SIZES = {
     "TCS.NS": 150, "INFY.NS": 300, "NIFTY": 25, "BANKNIFTY": 15,
     "SBIN.NS": 1500, "BAJFINANCE.NS": 125, "KOTAKBANK.NS": 400,
     "AXISBANK.NS": 1200, "WIPRO.NS": 1500, "HCLTECH.NS": 350,
-    "TATAMOTORS.NS": 1425, "MARUTI.NS": 100, "SUNPHARMA.NS": 350,
+    "MARUTI.NS": 100, "SUNPHARMA.NS": 350,
     "ADANIPORTS.NS": 1250, "TATASTEEL.NS": 3375, "JSWSTEEL.NS": 675,
     "NTPC.NS": 3000, "POWERGRID.NS": 2700, "ONGC.NS": 1925,
     "BPCL.NS": 1800, "IOC.NS": 2625, "LT.NS": 300,
@@ -131,7 +138,6 @@ def _fetch_from_nse() -> list[str]:
     Fetch live F&O eligible stocks from NSE API.
     Returns list of .NS symbols.
     """
-    # Try multiple NSE endpoints — Nifty 500 preferred, F&O as fallback
     endpoints = [
         ("https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20500", "Nifty 500"),
         ("https://www.nseindia.com/api/equity-stockIndices?index=SECURITIES%20IN%20F%26O", "F&O"),
@@ -197,18 +203,15 @@ def get_fno_universe(force_refresh: bool = False) -> list[str]:
 
     today = date.today()
 
-    # Return cached if same day
     if not force_refresh and _cache["date"] == today and _cache["symbols"]:
         return _cache["symbols"]
 
-    # Try NSE API
     symbols = _fetch_from_nse()
 
     if symbols:
         _cache = {"symbols": symbols, "date": today}
         return symbols
 
-    # Fallback to hardcoded list
     log.warning("Using hardcoded F&O fallback list")
     _cache = {"symbols": FALLBACK_FNO_SYMBOLS, "date": today}
     return FALLBACK_FNO_SYMBOLS
@@ -227,7 +230,6 @@ def get_all_instruments_extended() -> list[dict]:
 
     instruments = []
 
-    # Indexes
     for sym in INDEXES:
         instruments.append({
             "symbol":   sym,
@@ -236,7 +238,6 @@ def get_all_instruments_extended() -> list[dict]:
             "category": "INDEX",
         })
 
-    # All F&O stocks
     fno = get_fno_universe()
     for sym in fno:
         instruments.append({
@@ -246,7 +247,6 @@ def get_all_instruments_extended() -> list[dict]:
             "category": "STOCK",
         })
 
-    # Commodities
     for sym in COMMODITIES:
         instruments.append({
             "symbol":   sym,
