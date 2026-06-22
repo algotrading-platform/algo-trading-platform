@@ -3,24 +3,15 @@
 #
 # Cash-Futures Arbitrage Strategy — Jwala's exact logic
 #
-# Conditions (from Jwala's explanation):
-#   1. Future price MUST be > Spot price (contango only)
-#   2. Basis = (Futures - Spot) / Spot × 100
-#   3. Normal days (not expiry week): Basis > 2% → SIGNAL
-#   4. Expiry week (last 7 days of month): Basis > 1% → SIGNAL
-#
-# Action: BUY Spot + SELL Futures simultaneously
-# Profit: Locked at entry. Realised at expiry when prices converge.
-#
-# Jwala's exact words:
-#   "If I see a basis of more than 1% I would enter the trade"
-#   "For normal days basis should be better than 2%"
-#   "Expiry week — 1% will work — capturing 1% in 7 days"
-#   "Yearly 12% for 30 days — okay but not wow"
-#   "1% in one week — circulate money — nothing like that"
+# FIXES (2026-06-19):
+#   - Futures contracts cached in PostgreSQL (persists across jobs)
+#   - Added timeout to all API calls (prevent hanging)
+#   - Added rate limiting delay between calls
+#   - In-memory cache as L1, PostgreSQL as L2
 # ============================================================
 
 import os
+import time
 import requests
 import logging
 from datetime import datetime, date
@@ -36,13 +27,26 @@ log = logging.getLogger("arbitrage")
 IST = pytz.timezone("Asia/Kolkata")
 
 # ── Threshold constants ──────────────────────────────────────
-NORMAL_BASIS_PCT  = 0.5   # Reduced to 0.5% for signal testing (Jwala 06-Jun-2026)
-EXPIRY_BASIS_PCT  = 0.5   # Expiry week — same 0.5% for testing
-EXPIRY_WEEK_DAYS  = 7     # Last 7 calendar days of month = expiry week
-MAX_BASIS_PCT     = 10.0  # Sanity check — above this = data error
+NORMAL_BASIS_PCT  = 0.5
+EXPIRY_BASIS_PCT  = 0.5
+EXPIRY_WEEK_DAYS  = 7
+MAX_BASIS_PCT     = 10.0
 
-# In-memory cache for futures contracts {symbol: {key, expiry, fetched_at}}
+# ── In-memory L1 cache {symbol: {key, expiry, fetched_at, date}} ──
 _futures_cache: dict = {}
+
+# ── Rate limiting ────────────────────────────────────────────
+_last_api_call: float = 0.0
+_API_MIN_INTERVAL = 0.3  # 300ms between calls = max 3 calls/sec
+
+
+def _rate_limit():
+    """Enforce minimum interval between Upstox API calls."""
+    global _last_api_call
+    elapsed = time.time() - _last_api_call
+    if elapsed < _API_MIN_INTERVAL:
+        time.sleep(_API_MIN_INTERVAL - elapsed)
+    _last_api_call = time.time()
 
 
 # ============================================================
@@ -50,33 +54,16 @@ _futures_cache: dict = {}
 # ============================================================
 
 def is_expiry_week() -> bool:
-    """
-    Returns True if today is within the last 7 calendar days of the month.
-    This is the NSE F&O monthly expiry window.
-
-    Jwala: "In the last week we can execute this strategy at 1% basis.
-            Not now — in last week of month."
-    """
     today    = datetime.now(IST).date()
     last_day = calendar.monthrange(today.year, today.month)[1]
-    days_to_expiry = last_day - today.day
-    return days_to_expiry <= EXPIRY_WEEK_DAYS
+    return (last_day - today.day) <= EXPIRY_WEEK_DAYS
 
 
 def get_basis_threshold() -> float:
-    """
-    Returns the applicable basis threshold based on current date.
-
-    Expiry week  → 1%  (capturing 1% in 7 days is excellent)
-    Normal days  → 2%  (need higher spread for 30-day hold)
-    """
-    if is_expiry_week():
-        return EXPIRY_BASIS_PCT
-    return NORMAL_BASIS_PCT
+    return EXPIRY_BASIS_PCT if is_expiry_week() else NORMAL_BASIS_PCT
 
 
 def days_to_expiry() -> int:
-    """Returns number of calendar days to end of month."""
     today    = datetime.now(IST).date()
     last_day = calendar.monthrange(today.year, today.month)[1]
     return last_day - today.day
@@ -96,7 +83,43 @@ def _get_upstox_token() -> Optional[str]:
 
 
 # ============================================================
+# POSTGRESQL CACHE FOR FUTURES CONTRACTS
+# Persists across Container Job runs — fixes 429 rate limiting
+# ============================================================
+
+def _load_futures_from_db(symbol: str) -> Optional[dict]:
+    """Load futures contract from PostgreSQL cache."""
+    try:
+        from core.database.db import get_config
+        import json
+        val = get_config(f"futures_contract_{symbol.replace('.', '_')}")
+        if not val:
+            return None
+        data = json.loads(val)
+        # Check if cached today
+        if data.get("date") == date.today().isoformat():
+            return data
+        return None
+    except Exception:
+        return None
+
+
+def _save_futures_to_db(symbol: str, contract: dict) -> None:
+    """Save futures contract to PostgreSQL cache."""
+    try:
+        from core.database.db import set_config
+        import json
+        key = f"futures_contract_{symbol.replace('.', '_')}"
+        set_config(key, json.dumps(contract))
+    except Exception:
+        pass
+
+
+# ============================================================
 # FUTURES CONTRACT LOOKUP
+# L1: in-memory cache
+# L2: PostgreSQL cache (persists across job runs)
+# L3: Upstox API (rate-limited)
 # ============================================================
 
 def get_active_futures_contract(
@@ -105,17 +128,30 @@ def get_active_futures_contract(
     base_url: str = "https://api.upstox.com/v2",
 ) -> Optional[dict]:
     """
-    Fetch active (front-month) futures contract from Upstox.
-    Caches result per day to avoid repeated API calls.
+    Fetch active (front-month) futures contract.
+    Uses 3-level cache to avoid repeated API calls:
+      L1: in-memory (fast, lost on restart)
+      L2: PostgreSQL (persists across Container Job runs)
+      L3: Upstox API (rate-limited, last resort)
     """
     global _futures_cache
 
-    today = datetime.now(IST).strftime("%Y-%m-%d")
+    today = date.today().isoformat()
 
+    # L1: in-memory cache
     if symbol in _futures_cache:
         cached = _futures_cache[symbol]
         if cached.get("date") == today:
             return cached
+
+    # L2: PostgreSQL cache
+    db_cached = _load_futures_from_db(symbol)
+    if db_cached:
+        _futures_cache[symbol] = db_cached
+        return db_cached
+
+    # L3: Upstox API (rate-limited)
+    _rate_limit()
 
     search_name = symbol.replace(".NS", "")
 
@@ -124,7 +160,16 @@ def get_active_futures_contract(
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
         params  = {"q": search_name, "asset_type": "FO"}
 
-        response = requests.get(url, headers=headers, params=params, timeout=10)
+        response = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=8,  # FIXED: 8 second timeout (was no timeout = hangs forever)
+        )
+
+        if response.status_code == 429:
+            log.warning(f"Futures search rate limited for {symbol} — skipping")
+            return None
 
         if response.status_code != 200:
             log.warning(f"Futures search failed for {symbol}: {response.status_code}")
@@ -136,7 +181,6 @@ def get_active_futures_contract(
         if not instruments:
             return None
 
-        # Filter NSE futures only, matching symbol name
         nse_futures = [
             inst for inst in instruments
             if inst.get("exchange", "").upper() == "NSE"
@@ -147,7 +191,6 @@ def get_active_futures_contract(
         if not nse_futures:
             return None
 
-        # Sort by expiry — pick front month (nearest expiry)
         nse_futures.sort(key=lambda x: x.get("expiry", "9999-99-99"))
         active = nse_futures[0]
 
@@ -159,14 +202,20 @@ def get_active_futures_contract(
             "date":           today,
         }
 
+        # Save to both caches
         _futures_cache[symbol] = result
+        _save_futures_to_db(symbol, result)
+
         log.info(
-            f"Futures contract: {symbol} → {result['tradingsymbol']} "
+            f"Futures contract fetched: {symbol} → {result['tradingsymbol']} "
             f"(expiry: {result['expiry']})"
         )
 
         return result
 
+    except requests.exceptions.Timeout:
+        log.warning(f"Futures search timed out for {symbol}")
+        return None
     except Exception as e:
         log.error(f"Futures contract lookup error for {symbol}: {e}")
         return None
@@ -177,13 +226,23 @@ def get_futures_price(
     token:          str,
     base_url:       str = "https://api.upstox.com/v2",
 ) -> Optional[float]:
-    """Fetch latest price for a futures contract from Upstox market quote API."""
+    """Fetch latest price for a futures contract from Upstox."""
+    _rate_limit()
+
     try:
         encoded_key = requests.utils.quote(instrument_key, safe="")
         url = f"{base_url}/market-quote/quotes?instrument_key={encoded_key}"
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=8,  # FIXED: 8 second timeout
+        )
+
+        if response.status_code == 429:
+            log.warning("Futures price rate limited")
+            return None
 
         if response.status_code != 200:
             log.warning(f"Futures quote failed: {response.status_code}")
@@ -199,6 +258,9 @@ def get_futures_price(
 
         return None
 
+    except requests.exceptions.Timeout:
+        log.warning("Futures price fetch timed out")
+        return None
     except Exception as e:
         log.error(f"Futures price fetch error: {e}")
         return None
@@ -214,28 +276,20 @@ class ArbitrageStrategy(BaseStrategy):
 
     Entry conditions:
         1. Futures price > Spot price (contango)
-        2. Basis > 2% on normal days
-        3. Basis > 1% in expiry week (last 7 days of month)
+        2. Basis > 0.5% (current testing threshold)
 
     Entry action:
         BUY spot shares + SELL futures contract simultaneously
         Profit is locked at entry = basis amount per share
 
-    Exit:
-        At futures expiry — prices converge — profit realised automatically
-        No directional risk — purely a spread capture
-
-    Jwala's insight:
-        1% in 30 days = 12% annualised = "okay but not wow"
-        1% in 7 days  = ~52% annualised = "nothing like that"
-        Therefore, last week of month is the prime window.
+    Exit: At futures expiry — prices converge — profit realised automatically
     """
 
     name = "Cash-Futures Arbitrage"
     description = (
         "Captures risk-free spread between NSE spot and futures price. "
-        "Normal days: enters when basis > 2%. "
-        "Expiry week (last 7 days): enters when basis > 1%. "
+        "Normal days: enters when basis > 0.5%. "
+        "Expiry week (last 7 days): enters when basis > 0.5%. "
         "Action: Buy spot + Sell futures. Profit locked at entry."
     )
 
@@ -253,16 +307,8 @@ class ArbitrageStrategy(BaseStrategy):
         spot_price: float,
         token:      str,
     ) -> SignalResult:
-        """
-        Full arbitrage signal with live futures price lookup.
+        """Full arbitrage signal with live futures price lookup."""
 
-        Parameters:
-            symbol:     yfinance symbol (e.g. "HDFCBANK.NS")
-            spot_price: current spot/cash market price
-            token:      valid Upstox access token
-        """
-
-        # Get active futures contract
         contract = get_active_futures_contract(symbol, token)
 
         if not contract:
@@ -280,7 +326,6 @@ class ArbitrageStrategy(BaseStrategy):
                 strategy=self.name,
             )
 
-        # Get live futures price
         futures_price = get_futures_price(instrument_key, token)
 
         if futures_price is None:
@@ -290,36 +335,32 @@ class ArbitrageStrategy(BaseStrategy):
                 strategy=self.name,
             )
 
-        # ── Condition 1: Futures must be > Spot (contango) ──
+        # Condition 1: Futures must be > Spot (contango)
         if futures_price <= spot_price:
             spread_pct = round((futures_price - spot_price) / spot_price * 100, 2)
             return SignalResult(
                 "HOLD", "WEAK",
                 f"Futures ₹{futures_price:,.2f} ≤ Spot ₹{spot_price:,.2f} "
-                f"(backwardation: {spread_pct}%). "
-                f"Possible dividend pricing. No arbitrage.",
+                f"(backwardation: {spread_pct}%). No arbitrage.",
                 {"Spot_Price": round(spot_price, 2),
                  "Futures_Price": round(futures_price, 2),
                  "Spread_Pct": spread_pct},
                 self.name,
             )
 
-        # ── Calculate basis ──
         spread_abs = futures_price - spot_price
         spread_pct = round((spread_abs / spot_price) * 100, 2)
 
-        # ── Determine threshold based on expiry week ──
-        threshold    = get_basis_threshold()
-        in_exp_week  = is_expiry_week()
-        days_to_exp  = days_to_expiry()
-        expiry       = contract.get("expiry", "")
+        threshold     = get_basis_threshold()
+        in_exp_week   = is_expiry_week()
+        days_to_exp   = days_to_expiry()
+        expiry        = contract.get("expiry", "")
         tradingsymbol = contract.get("tradingsymbol", "")
-        lot_size     = contract.get("lot_size", get_lot_size(symbol))
+        lot_size      = contract.get("lot_size", get_lot_size(symbol))
 
-        # ── P&L calculation ──
-        gross_profit  = round(spread_abs * lot_size, 2)
-        brokerage_est = round(lot_size * 3.5, 2)  # ~₹3.5/share
-        net_profit    = round(gross_profit - brokerage_est, 2)
+        gross_profit   = round(spread_abs * lot_size, 2)
+        brokerage_est  = round(lot_size * 3.5, 2)
+        net_profit     = round(gross_profit - brokerage_est, 2)
         annualised_pct = round((spread_pct / max(days_to_exp, 1)) * 365, 1)
 
         indicators = {
@@ -338,7 +379,6 @@ class ArbitrageStrategy(BaseStrategy):
             "Expiry_Week":      in_exp_week,
         }
 
-        # ── Sanity check ──
         if spread_pct > MAX_BASIS_PCT:
             return SignalResult(
                 "HOLD", "WEAK",
@@ -346,14 +386,8 @@ class ArbitrageStrategy(BaseStrategy):
                 indicators, self.name,
             )
 
-        # ── Signal decision ──
         if spread_pct >= threshold:
-            # Strength based on how much above threshold
-            if spread_pct >= threshold * 1.5:
-                strength = "STRONG"
-            else:
-                strength = "MODERATE"
-
+            strength   = "STRONG" if spread_pct >= threshold * 1.5 else "MODERATE"
             week_label = "EXPIRY WEEK" if in_exp_week else "NORMAL DAY"
 
             reason = (
@@ -363,10 +397,8 @@ class ArbitrageStrategy(BaseStrategy):
                 f"Gross ₹{gross_profit:,.0f} | Net ~₹{net_profit:,.0f} | "
                 f"Expiry: {expiry} ({days_to_exp}d) | ~{annualised_pct}% p.a."
             )
-
             return SignalResult("BUY", strength, reason, indicators, self.name)
 
-        # Below threshold — no trade
         week_label = f"expiry week (need >{EXPIRY_BASIS_PCT}%)" if in_exp_week \
                      else f"normal day (need >{NORMAL_BASIS_PCT}%)"
         return SignalResult(

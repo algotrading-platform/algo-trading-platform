@@ -1,12 +1,12 @@
 # ============================================================
 # core/engine/strategy_engine.py
 #
-# Runs the selected strategy on all instruments.
-# Applies Jwala's trend-based signal strength logic:
-#   - Fetches Nifty daily trend once per scan cycle
-#   - Fetches each stock's daily trend per instrument
-#   - Calculates STRONG / MODERATE / WEAK from trends
-#   - Suppresses signals when both trends oppose the signal
+# FIXES (2026-06-19):
+#   - Fetches Nifty D/H/5m trends correctly per Jwala spec
+#   - Fetches Stock D/H/5m trends correctly per Jwala spec
+#   - Passes all trend values to calculate_signal_strength
+#   - Stores trend values in indicators for alert message
+#   - Added timeout to ThreadPoolExecutor (fixes job hanging)
 # ============================================================
 
 import time
@@ -21,7 +21,11 @@ from core.strategies.arbitrage_strategy import ArbitrageStrategy, arbitrage_stra
 from core.indicators.indicators import (
     add_rsi,
     get_nifty_trend,
+    get_nifty_hourly_trend,
+    get_nifty_5min_trend,
     get_stock_daily_trend,
+    get_stock_hourly_trend,
+    get_stock_5min_trend,
     get_daily_trend,
     calculate_signal_strength,
     should_suppress_signal,
@@ -40,50 +44,19 @@ IST = pytz.timezone("Asia/Kolkata")
 ARBITRAGE_STRATEGY_NAME = "Cash-Futures Arbitrage"
 NIFTY_SYMBOL = "^NSEI"
 
-
-# ============================================================
-# NIFTY TREND — fetched once per scan cycle
-# ============================================================
-
-_nifty_trend_cache: dict = {"trend": "NEUTRAL", "date": None}
-_nifty_multi_cache: dict  = {"label": "D→ H→ 5m→", "date": None}
-_nifty_rsi_cache: dict   = {"rsi": {}, "date": None}
-
-
-def _fetch_rsi_value(provider, symbol: str, interval: str, period: str) -> float | None:
-    """Fetch RSI value for a specific timeframe. Returns latest RSI or None."""
-    try:
-        df = provider.fetch_data(symbol=symbol, interval=interval, period=period)
-        if df is None or df.empty or len(df) < 15:
-            return None
-        df_rsi = add_rsi(df.copy())
-        df_rsi.dropna(subset=["RSI"], inplace=True)
-        if df_rsi.empty:
-            return None
-        return round(float(df_rsi["RSI"].iloc[-1]), 1)
-    except Exception:
-        return None
+# ── Cache for Nifty trends ───────────────────────────────────
+_nifty_trend_cache: dict = {
+    "daily":  "NEUTRAL",
+    "hourly": "NEUTRAL",
+    "5min":   "NEUTRAL",
+    "date":   None,
+}
 
 
-def _get_nifty_rsi_values(provider) -> dict:
-    """
-    Get Nifty RSI for Daily, Hourly, 5min. Cached per day.
-    Returns: {"daily": 52.3, "hourly": 44.1, "5min": 31.2}
-    """
-    global _nifty_rsi_cache
-    from datetime import date
-    today = date.today().isoformat()
-
-    if _nifty_rsi_cache["date"] == today:
-        return _nifty_rsi_cache["rsi"]
-
-    rsi = {}
-    rsi["daily"]  = _fetch_rsi_value(provider, "^NSEI", "1d",  "3mo")
-    rsi["hourly"] = _fetch_rsi_value(provider, "^NSEI", "1h",  "5d")
-    rsi["5min"]   = _fetch_rsi_value(provider, "^NSEI", "15m", "3d")
-
-    _nifty_rsi_cache = {"rsi": rsi, "date": today}
-    return rsi
+def _trend_arrow(trend: str) -> str:
+    if trend == "RISING":  return "↑"
+    if trend == "FALLING": return "↓"
+    return "→"
 
 
 def _fetch_rsi_value(provider, symbol: str, interval: str, period: str):
@@ -101,56 +74,16 @@ def _fetch_rsi_value(provider, symbol: str, interval: str, period: str):
         return None
 
 
-_nifty_rsi_cache: dict = {"rsi": {}, "date": None}
-
-
-def _get_nifty_rsi_values(provider) -> dict:
+def get_nifty_all_trends(provider) -> dict:
     """
-    Get Nifty RSI for Daily, Hourly, 5min. Cached per day.
-    Returns: {"daily": 52.3, "hourly": 44.1, "5min": 31.2}
-    """
-    global _nifty_rsi_cache
-    from datetime import date
-    today = date.today().isoformat()
+    Fetch Nifty trends for D, H, 5m. Cached per calendar day.
 
-    if _nifty_rsi_cache["date"] == today:
-        return _nifty_rsi_cache["rsi"]
+    Per Jwala's EXACT spec:
+      Daily  → current day close vs previous day close
+      Hourly → current hour close vs previous hour close
+      5min   → current 15min close vs previous 15min close
 
-    rsi = {
-        "daily":  _fetch_rsi_value(provider, "^NSEI", "1d",  "3mo"),
-        "hourly": _fetch_rsi_value(provider, "^NSEI", "1h",  "5d"),
-        "5min":   _fetch_rsi_value(provider, "^NSEI", "15m", "3d"),
-    }
-    _nifty_rsi_cache = {"rsi": rsi, "date": today}
-    return rsi
-
-
-def _get_nifty_multi_label(provider) -> str:
-    """
-    Get Nifty 3-arrow trend label. Cached per calendar day.
-    Returns: "D↓ H↓ 5m↑" format
-    """
-    global _nifty_multi_cache
-    from datetime import date
-    today = date.today().isoformat()
-
-    if _nifty_multi_cache["date"] == today:
-        return _nifty_multi_cache["label"]
-
-    try:
-        from core.indicators.indicators import get_multi_timeframe_trend
-        multi = get_multi_timeframe_trend(provider, "^NSEI")
-        label = multi["label"].replace("D", "D").replace("H", "H")  # keep as-is
-        _nifty_multi_cache = {"label": label, "date": today}
-        return label
-    except Exception:
-        return "D→ H→ 5m→"
-
-
-def get_nifty_daily_trend(provider) -> str:
-    """
-    Fetch Nifty daily trend. Cached per calendar day.
-    Returns RISING | FALLING | NEUTRAL.
+    Returns: {"daily": "RISING", "hourly": "NEUTRAL", "5min": "FALLING"}
     """
     global _nifty_trend_cache
 
@@ -158,28 +91,47 @@ def get_nifty_daily_trend(provider) -> str:
     today = date.today().isoformat()
 
     if _nifty_trend_cache["date"] == today:
-        return _nifty_trend_cache["trend"]
+        return _nifty_trend_cache
+
+    result = {"daily": "NEUTRAL", "hourly": "NEUTRAL", "5min": "NEUTRAL", "date": today}
 
     try:
-        df = provider.fetch_data(
-            symbol=NIFTY_SYMBOL,
-            interval="1d",
-            period="5d",   # only need last 2 days for today vs yesterday
-        )
-        trend = get_nifty_trend(df)   # today's close vs yesterday's close
-        _nifty_trend_cache = {"trend": trend, "date": today}
-        log.info(f"Nifty daily trend: {trend}")
-        return trend
-    except Exception as e:
-        log.warning(f"Could not fetch Nifty trend: {e}")
-        return "NEUTRAL"
+        df_daily = provider.fetch_data(symbol=NIFTY_SYMBOL, interval="1d", period="5d")
+        result["daily"] = get_nifty_trend(df_daily)
+    except Exception:
+        pass
+
+    try:
+        df_1h = provider.fetch_data(symbol=NIFTY_SYMBOL, interval="1h", period="5d")
+        result["hourly"] = get_nifty_hourly_trend(df_1h)
+    except Exception:
+        pass
+
+    try:
+        # CRITICAL: use 15min candles for 5min trend per Jwala
+        df_15m = provider.fetch_data(symbol=NIFTY_SYMBOL, interval="15m", period="3d")
+        result["5min"] = get_nifty_5min_trend(df_15m)
+    except Exception:
+        pass
+
+    _nifty_trend_cache = result
+    log.info(
+        f"Nifty trends: D{_trend_arrow(result['daily'])} "
+        f"H{_trend_arrow(result['hourly'])} "
+        f"5m{_trend_arrow(result['5min'])}"
+    )
+    return result
+
+
+def get_nifty_daily_trend(provider) -> str:
+    """Backward compatibility — returns daily trend only."""
+    return get_nifty_all_trends(provider)["daily"]
 
 
 class StrategyEngine:
     """
     Runs a selected strategy on a list of instruments.
-    Enriches every signal with Nifty + stock trend context.
-    Suppresses low-quality signals automatically.
+    Enriches every signal with Nifty + stock D/H/5m trend context.
     """
 
     def __init__(self, strategy_name: str):
@@ -201,49 +153,69 @@ class StrategyEngine:
     def scan_instrument(
         self,
         provider,
+        symbol:        str,
+        name:          str,
+        category:      str,
+        tf_name:       str,
+        interval:      str,
+        period:        str,
+        nifty_trends:  dict = None,
+        retries:       int  = 3,
+    ) -> dict | None:
+        if nifty_trends is None:
+            nifty_trends = {"daily": "NEUTRAL", "hourly": "NEUTRAL", "5min": "NEUTRAL"}
+
+        if self.is_arbitrage:
+            return self._scan_arbitrage(
+                provider, symbol, name, category,
+                tf_name, interval, period, nifty_trends, retries
+            )
+        return self._scan_standard(
+            provider, symbol, name, category,
+            tf_name, interval, period, nifty_trends, retries
+        )
+
+    def _get_stock_all_trends(self, provider, symbol: str) -> dict:
+        """
+        Fetch stock trends for D, H, 5m per Jwala's spec.
+        Returns dict with daily, hourly, 5min trends.
+        """
+        result = {"daily": "NEUTRAL", "hourly": "NEUTRAL", "5min": "NEUTRAL"}
+        try:
+            df_daily = provider.fetch_data(symbol=symbol, interval="1d", period="3mo")
+            result["daily"] = get_stock_daily_trend(df_daily)
+        except Exception:
+            pass
+        try:
+            df_1h = provider.fetch_data(symbol=symbol, interval="1h", period="5d")
+            result["hourly"] = get_stock_hourly_trend(df_1h)
+        except Exception:
+            pass
+        try:
+            # CRITICAL: use 15min candles for 5min trend per Jwala
+            df_15m = provider.fetch_data(symbol=symbol, interval="15m", period="3d")
+            result["5min"] = get_stock_5min_trend(df_15m)
+        except Exception:
+            pass
+        return result
+
+    def _scan_standard(
+        self,
+        provider,
         symbol:       str,
         name:         str,
         category:     str,
         tf_name:      str,
         interval:     str,
         period:       str,
-        nifty_trend:  str = "NEUTRAL",
-        retries:      int = 3,
+        nifty_trends: dict = None,
+        retries:      int  = 3,
     ) -> dict | None:
-        if self.is_arbitrage:
-            return self._scan_arbitrage(
-                provider, symbol, name, category,
-                tf_name, interval, period, nifty_trend, retries
-            )
-        return self._scan_standard(
-            provider, symbol, name, category,
-            tf_name, interval, period, nifty_trend, retries
-        )
 
-    def _get_stock_daily_trend(self, provider, symbol: str) -> str:
-        """Fetch stock's own daily trend for strength calculation."""
-        try:
-            df_daily = provider.fetch_data(
-                symbol=symbol,
-                interval="1d",
-                period="3mo",   # need 3 months for 20D EMA + higher highs
-            )
-            return get_stock_daily_trend(df_daily)
-        except Exception:
-            return "NEUTRAL"
+        if nifty_trends is None:
+            nifty_trends = {"daily": "NEUTRAL", "hourly": "NEUTRAL", "5min": "NEUTRAL"}
 
-    def _scan_standard(
-        self,
-        provider,
-        symbol:      str,
-        name:        str,
-        category:    str,
-        tf_name:     str,
-        interval:    str,
-        period:      str,
-        nifty_trend: str = "NEUTRAL",
-        retries:     int = 3,
-    ) -> dict | None:
+        nifty_trend = nifty_trends.get("daily", "NEUTRAL")
 
         for attempt in range(1, retries + 1):
             try:
@@ -266,19 +238,19 @@ class StrategyEngine:
                 rsi_val   = round(float(latest["RSI"]), 2)
                 price_val = round(float(latest["Close"]), 2)
 
-                # Run strategy
                 result = self.strategy.generate_signal(df.copy())
                 signal = result.signal
 
-                # ── Trend-based strength (Jwala's logic) ──
-                if signal in ("BUY", "SELL"):
-                    # For indexes and commodities use NEUTRAL stock trend
-                    if category in ("INDEX", "COMMODITY"):
-                        stock_trend = "NEUTRAL"
-                    else:
-                        stock_trend = self._get_stock_daily_trend(provider, symbol)
+                stock_trends = {"daily": "NEUTRAL", "hourly": "NEUTRAL", "5min": "NEUTRAL"}
 
-                    # Check suppression
+                if signal in ("BUY", "SELL"):
+                    if category in ("INDEX", "COMMODITY"):
+                        stock_trends = {"daily": "NEUTRAL", "hourly": "NEUTRAL", "5min": "NEUTRAL"}
+                    else:
+                        stock_trends = self._get_stock_all_trends(provider, symbol)
+
+                    stock_trend = stock_trends.get("daily", "NEUTRAL")
+
                     if should_suppress_signal(signal, nifty_trend, stock_trend):
                         log.debug(
                             f"SUPPRESSED {symbol} {signal} — "
@@ -287,46 +259,46 @@ class StrategyEngine:
                         signal = "HOLD"
 
                     else:
-                        # ── Volume spike check (Jwala's primary confirmation) ──
                         volume_ratio = get_volume_spike_ratio(df.copy())
 
-                        # ── Unified strength: RSI + Volume + Trends ──
+                        # Calculate strength with full Jwala spec
                         trend_strength = calculate_signal_strength(
-                            signal, nifty_trend, stock_trend,
+                            signal=signal,
+                            nifty_trend=nifty_trend,
+                            stock_trend=stock_trends.get("daily", "NEUTRAL"),
                             volume_ratio=volume_ratio,
+                            tf_name=tf_name,
+                            nifty_hourly=nifty_trends.get("hourly", "NEUTRAL"),
+                            nifty_5min=nifty_trends.get("5min", "NEUTRAL"),
+                            stock_hourly=stock_trends.get("hourly", "NEUTRAL"),
+                            stock_5min=stock_trends.get("5min", "NEUTRAL"),
+                            rsi_val=rsi_val,
                         )
                         result.strength    = trend_strength
                         result.nifty_trend = nifty_trend
-                        result.stock_trend = stock_trend
+                        result.stock_trend = stock_trends.get("daily", "NEUTRAL")
 
-                        # Store volume info in indicators
-                        result.indicators["volume_ratio"] = volume_ratio
-                        result.indicators["volume_label"] = get_volume_spike_label(volume_ratio)
+                        # Store all trend info in indicators for alert message
+                        result.indicators["volume_ratio"]       = volume_ratio
+                        result.indicators["volume_label"]       = get_volume_spike_label(volume_ratio)
+                        result.indicators["nifty_daily_trend"]  = nifty_trends.get("daily", "NEUTRAL")
+                        result.indicators["nifty_hourly_trend"] = nifty_trends.get("hourly", "NEUTRAL")
+                        result.indicators["nifty_5min_trend"]   = nifty_trends.get("5min", "NEUTRAL")
+                        result.indicators["stock_daily_trend"]  = stock_trends.get("daily", "NEUTRAL")
+                        result.indicators["stock_hourly_trend"] = stock_trends.get("hourly", "NEUTRAL")
+                        result.indicators["stock_5min_trend"]   = stock_trends.get("5min", "NEUTRAL")
 
-                        # ── Trend labels ──
+                        # Stock RSI D/H/5m values
                         try:
-                            multi = get_multi_timeframe_trend(provider, symbol)
-                            result.indicators["nifty_trend_label"] = _get_nifty_multi_label(provider)
-                            result.indicators["stock_trend_label"] = multi["label"]
-                        except Exception:
-                            result.indicators["nifty_trend_label"] = f"N{_trend_arrow(nifty_trend)}"
-                            result.indicators["stock_trend_label"] = f"S{_trend_arrow(stock_trend)}"
-
-                        # ── RSI D/H/5m values (Jwala 09-Jun-2026) ──
-                        try:
-                            nifty_rsi = _get_nifty_rsi_values(provider)
-                            result.indicators["nifty_rsi_daily"]  = nifty_rsi.get("daily")
-                            result.indicators["nifty_rsi_hourly"] = nifty_rsi.get("hourly")
-                            result.indicators["nifty_rsi_5min"]   = nifty_rsi.get("5min")
                             result.indicators["stock_rsi_daily"]  = _fetch_rsi_value(provider, symbol, "1d",  "3mo")
                             result.indicators["stock_rsi_hourly"] = _fetch_rsi_value(provider, symbol, "1h",  "5d")
                             result.indicators["stock_rsi_5min"]   = _fetch_rsi_value(provider, symbol, "15m", "3d")
                         except Exception:
                             pass
+
                 else:
                     stock_trend = "NEUTRAL"
 
-                # Log signal
                 self.logger.log_signal(
                     stock=symbol,
                     timeframe=tf_name,
@@ -336,7 +308,6 @@ class StrategyEngine:
                     strategy=self.strategy_name,
                 )
 
-                # Alert on state change
                 alert = self.alerts.check_alert(
                     timeframe=tf_name,
                     stock=symbol,
@@ -352,10 +323,11 @@ class StrategyEngine:
                         f"ALERT  {symbol:20s}  {tf_name:12s}  "
                         f"{alert['previous']:5s} → {signal:5s}  "
                         f"[{result.strength}]  "
-                        f"Nifty:{nifty_trend}  Stock:{stock_trend}"
+                        f"Nifty:D{_trend_arrow(nifty_trends.get('daily','NEUTRAL'))}"
+                        f"H{_trend_arrow(nifty_trends.get('hourly','NEUTRAL'))}"
+                        f"5m{_trend_arrow(nifty_trends.get('5min','NEUTRAL'))}"
                     )
 
-                # Backtest
                 trades  = self.backtest.run(df_with_rsi)
                 summary = self.backtest.summarise(trades)
 
@@ -375,7 +347,7 @@ class StrategyEngine:
                     "strength":    result.strength,
                     "reason":      result.reason,
                     "nifty_trend": nifty_trend,
-                    "stock_trend": stock_trend,
+                    "stock_trend": stock_trends.get("daily", "NEUTRAL"),
                     "rsi":         rsi_val,
                     "price":       price_val,
                     "trades":      summary["trades"],
@@ -395,14 +367,14 @@ class StrategyEngine:
     def _scan_arbitrage(
         self,
         provider,
-        symbol:      str,
-        name:        str,
-        category:    str,
-        tf_name:     str,
-        interval:    str,
-        period:      str,
-        nifty_trend: str = "NEUTRAL",
-        retries:     int = 3,
+        symbol:       str,
+        name:         str,
+        category:     str,
+        tf_name:      str,
+        interval:     str,
+        period:       str,
+        nifty_trends: dict = None,
+        retries:      int  = 3,
     ) -> dict | None:
 
         if category != "STOCK":
@@ -485,19 +457,23 @@ class StrategyEngine:
         tf_name:     str,
         interval:    str,
         period:      str,
-        instruments: list[dict],
+        instruments: list,
         max_workers: int = 10,
-    ) -> list[dict]:
+    ) -> list:
 
         if not instruments:
             return []
 
-        # Fetch Nifty trend ONCE per scan cycle
-        nifty_trend = get_nifty_daily_trend(provider)
+        # Fetch all Nifty trends ONCE per scan cycle
+        nifty_trends = get_nifty_all_trends(provider)
+        nifty_trend  = nifty_trends.get("daily", "NEUTRAL")
 
         log.info(
             f"SCAN START  [{self.strategy_name}]  {tf_name}  "
-            f"{len(instruments)} instruments  Nifty:{nifty_trend}"
+            f"{len(instruments)} instruments  "
+            f"Nifty:D{_trend_arrow(nifty_trends['daily'])}"
+            f"H{_trend_arrow(nifty_trends['hourly'])}"
+            f"5m{_trend_arrow(nifty_trends['5min'])}"
         )
 
         start_time = time.time()
@@ -515,17 +491,21 @@ class StrategyEngine:
                     tf_name,
                     interval,
                     period,
-                    nifty_trend,
+                    nifty_trends,  # Pass full trends dict
                 ): inst
                 for inst in instruments
             }
 
-            for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    results.append(result)
-                    if result["signal"] != "HOLD":
-                        signals += 1
+            # FIXED: added timeout=300 (5 min max per scan) to prevent hanging
+            for future in as_completed(futures, timeout=300):
+                try:
+                    result = future.result(timeout=30)
+                    if result:
+                        results.append(result)
+                        if result["signal"] != "HOLD":
+                            signals += 1
+                except Exception as e:
+                    log.warning(f"Instrument scan error: {e}")
 
         elapsed = round(time.time() - start_time, 1)
         log.info(

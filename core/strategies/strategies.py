@@ -588,8 +588,8 @@ class VolumeSpikeStrategy(BaseStrategy):
 
     # 14 candles = 2 weeks of daily candles
     LOOKBACK_CANDLES   = 14
-    SPIKE_THRESHOLD    = 20.0   # 2000% = 20x average
-    STRONG_THRESHOLD   = 30.0   # 3000% = STRONG signal
+    SPIKE_THRESHOLD    = 5.0   # 2000% = 20x average
+    STRONG_THRESHOLD   = 10.0   # 3000% = STRONG signal
 
     def generate_signal(self, df) -> "SignalResult":
         if df is None or df.empty or len(df) < self.LOOKBACK_CANDLES + 1:

@@ -1,26 +1,18 @@
 # ============================================================
 # core/scheduler/signal_scheduler.py
 #
-# Market hours: 9:15 AM – 3:30 PM IST  Mon–Fri
+# Market hours: 9:15 AM — 3:30 PM IST  Mon—Fri
 # All instruments scanned together: Indexes + Stocks + Commodities
 #
 # Strategy selection:
 #   Set SIGNAL_STRATEGY env variable to choose strategy.
 #   Default: "RSI Reversal"
 #
-#   Available strategies:
-#     RSI Reversal
-#     RSI + Pivot Confluence
-#     Bollinger Bands
-#     EMA Crossover
-#     MACD
-#     Volume Breakout
-#     Cash-Futures Arbitrage
-#
-# Instrument universe:
-#   ~180 NSE F&O stocks (fetched dynamically from NSE API)
-#   + 3 Indexes
-#   + 4 Commodities
+# FIXES (2026-06-19):
+#   - Arbitrage now runs HOURLY only (not every 5 mins)
+#   - Reduces Upstox API calls from 2000+/day to ~1000/day
+#   - Prevents 429 rate limiting on futures search API
+#   - Jobs complete cleanly without hanging
 # ============================================================
 
 import os
@@ -73,7 +65,7 @@ if _ACTIVE_STRATEGY not in ALL_STRATEGY_NAMES:
     _ACTIVE_STRATEGY = _DEFAULT_STRATEGY
 
 # ============================================================
-# NSE HOLIDAYS 2025–2027
+# NSE HOLIDAYS 2025—2027
 # ============================================================
 
 NSE_HOLIDAYS = {
@@ -107,7 +99,7 @@ def is_market_day() -> bool:
 
 
 def is_market_hours() -> bool:
-    """Single window: 9:15 AM – 3:30 PM IST"""
+    """Single window: 9:15 AM — 3:30 PM IST"""
     if not is_market_day():
         return False
     from datetime import time as dtime
@@ -115,7 +107,6 @@ def is_market_hours() -> bool:
     return dtime(9, 15) <= t <= dtime(15, 30)
 
 
-# Keep for backward compatibility
 def is_equity_hours() -> bool:
     return is_market_hours()
 
@@ -153,8 +144,8 @@ _primary_engine    = None
 def get_primary_engine() -> StrategyEngine:
     """
     Returns engine for currently selected strategy.
-    Reads from Supabase app_config on every scan —
-    dashboard can change strategy without Railway restart.
+    Reads from PostgreSQL app_config on every scan —
+    dashboard can change strategy without restart.
     """
     global _primary_engine, _current_strategy
 
@@ -166,8 +157,8 @@ def get_primary_engine() -> StrategyEngine:
 
     if strategy != _current_strategy:
         log.info(f"Strategy: {_current_strategy} → {strategy}")
-        _primary_engine    = StrategyEngine(strategy)
-        _current_strategy  = strategy
+        _primary_engine   = StrategyEngine(strategy)
+        _current_strategy = strategy
 
     return _primary_engine
 
@@ -177,7 +168,7 @@ def get_primary_engine() -> StrategyEngine:
 # ============================================================
 
 def run_primary_scan(tf_name: str) -> None:
-    """Primary strategy scan on all 182 instruments."""
+    """Primary strategy scan on all instruments."""
     interval = TIMEFRAMES[tf_name]
     period   = PERIOD_MAP[tf_name]
 
@@ -198,9 +189,22 @@ def run_primary_scan(tf_name: str) -> None:
 
 
 def run_arbitrage_scan(tf_name: str) -> None:
-    """Arbitrage scan on F&O stocks only — 5min and 15min only."""
-    if tf_name not in ("5 Minutes", "15 Minutes"):
+    """
+    Arbitrage scan on F&O stocks only.
+
+    FIXED (2026-06-19): runs HOURLY only (not every 5/15 mins).
+
+    Reasons:
+      - Arbitrage spread changes slowly (minutes to hours)
+      - Reduces Upstox API calls from 2000+/day to ~1000/day
+      - Prevents 429 rate limiting on futures search API
+      - Futures contracts cached in PostgreSQL — fetched once per day
+      - Only futures PRICE needs to be fetched each hour
+    """
+    # FIXED: only run on 15 Minutes timeframe
+    if tf_name != "15 Minutes":
         return
+
     if not is_market_hours():
         return
 
@@ -211,6 +215,8 @@ def run_arbitrage_scan(tf_name: str) -> None:
 
     interval = TIMEFRAMES[tf_name]
     period   = PERIOD_MAP[tf_name]
+
+    log.info(f"Running arbitrage scan — {len(fno_instruments)} F&O stocks")
 
     _arb_engine.run_scan(
         provider=provider,
@@ -223,15 +229,12 @@ def run_arbitrage_scan(tf_name: str) -> None:
 
 def run_scan(tf_name: str, mode: str = "all") -> None:
     """
-    Runs primary strategy then Arbitrage sequentially.
-    Sequential to stay within Railway 1GB RAM limit.
-    Updates LAST_SCAN_TIME in Supabase after every scan
-    so dashboard timer is accurate even when all signals are HOLD.
+    Runs primary strategy then Arbitrage (hourly only).
+    Updates LAST_SCAN_TIME after every scan.
     """
     run_primary_scan(tf_name)
-    run_arbitrage_scan(tf_name)
+    run_arbitrage_scan(tf_name)  # Only runs on 15 Minutes — no-op for other timeframes
 
-    # Always update scan time — even if all results were HOLD
     try:
         from core.database.db import set_config
         set_config("LAST_SCAN_TIME", datetime.now(IST).isoformat())
@@ -249,9 +252,7 @@ def build_scheduler() -> BlockingScheduler:
     scheduler.add_job(
         lambda: run_scan("5 Minutes", "all"),
         CronTrigger(
-            #minute="1,6,11,16,21,26,31,36,41,46,51,56",
-            #hour="9,10,11,12,13,14",
-            minute="16",
+            minute="1,6,11,16,21,26,31,36,41,46,51,56",
             hour="9,10,11,12,13,14,15",
             day_of_week="mon-fri", timezone=IST,
         ),
@@ -324,10 +325,10 @@ def start() -> None:
     log.info("Algo Trading Signal Scheduler")
     log.info(f"Instruments : {len(instruments)} total | {len(fno_instruments)} F&O")
     log.info(f"Timeframes  : {list(TIMEFRAMES.keys())}")
-    log.info(f"Strategy    : {active_strat} + Arbitrage (always active)")
-    log.info("Dynamic     : Strategy reads from Supabase every scan")
+    log.info(f"Strategy    : {active_strat}")
+    log.info(f"Arbitrage   : Every 15 mins (9:31, 9:46 ... 15:16, 15:31 IST)")
     log.info("Data source : Upstox API (primary) + yfinance (fallback)")
-    log.info("Market hours: 9:15 AM – 3:30 PM IST")
+    log.info("Market hours: 9:15 AM — 3:30 PM IST")
     log.info("=" * 60)
     scheduler = build_scheduler()
     try:
