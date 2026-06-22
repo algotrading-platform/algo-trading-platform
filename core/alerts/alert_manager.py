@@ -6,6 +6,14 @@
 #   - Stock RSI: shows D/H/5m separately per Jwala spec
 #   - Email fallback when Telegram fails/banned
 #   - Clean message format per Jwala's requirements
+#
+# UPDATE (2026-06-22):
+#   - ALERT_PRIMARY_CHANNEL toggle.
+#       "telegram" (default) -> Telegram primary, email backup
+#       "email"              -> Email primary, Telegram backup
+#     Set ALERT_PRIMARY_CHANNEL=email while Telegram ban rollback
+#     is still propagating; change back to telegram (or remove the
+#     variable) once Telegram delivery is confirmed. No code change.
 # ============================================================
 
 import os
@@ -66,6 +74,33 @@ class AlertManager:
         self._email_pass  = os.getenv("ALERT_EMAIL_PASSWORD", "")
         self._smtp_host   = os.getenv("ALERT_SMTP_HOST", "smtp.gmail.com")
         self._smtp_port   = int(os.getenv("ALERT_SMTP_PORT", "587"))
+        # Which channel sends first. "telegram" (default) or "email".
+        # While Telegram is being un-banned, set ALERT_PRIMARY_CHANNEL=email.
+        self._primary     = os.getenv("ALERT_PRIMARY_CHANNEL", "telegram").strip().lower()
+
+    def _telegram_ready(self) -> bool:
+        return bool(self._bot_token and self._chat_id)
+
+    def _email_ready(self) -> bool:
+        return bool(self._email_from and self._email_to and self._email_pass)
+
+    def _dispatch(self, alert: dict) -> None:
+        """
+        Send the alert through the configured primary channel, and fall
+        back to the other channel if the primary fails or is not configured.
+        """
+        if self._primary == "email":
+            # Email primary, Telegram backup
+            sent = self._send_email(alert) if self._email_ready() else False
+            if not sent and self._telegram_ready():
+                log.info("Email primary failed/unconfigured — falling back to Telegram")
+                self._send_telegram(alert)
+        else:
+            # Telegram primary (default), email backup
+            sent = self._send_telegram(alert) if self._telegram_ready() else False
+            if not sent and self._email_ready():
+                log.info("Telegram primary failed/unconfigured — falling back to email")
+                self._send_email(alert)
 
     def check_alert(
         self,
@@ -105,13 +140,8 @@ class AlertManager:
             "data_source":   data_source,
         }
 
-        # Try Telegram first, fallback to email
-        telegram_sent = False
-        if self._bot_token and self._chat_id:
-            telegram_sent = self._send_telegram(alert)
-
-        if not telegram_sent and self._email_from and self._email_to:
-            self._send_email(alert)
+        # Deliver via primary channel with automatic fallback
+        self._dispatch(alert)
 
         return alert
 
@@ -228,7 +258,7 @@ class AlertManager:
 
     def _send_email(self, alert: dict) -> bool:
         """
-        Email fallback alert — used when Telegram is unavailable/banned.
+        Email alert — primary or fallback depending on ALERT_PRIMARY_CHANNEL.
         Configure via environment variables:
           ALERT_EMAIL_FROM     : sender email (e.g. alerts@gmail.com)
           ALERT_EMAIL_TO       : recipient email (Jwala's email)
