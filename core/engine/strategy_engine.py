@@ -364,6 +364,186 @@ class StrategyEngine:
                     log.error(f"FAILED {symbol}  {tf_name}  after {retries} attempts: {e}")
                     return None
 
+    # ========================================================
+    # MULTI-STRATEGY SCAN (parallel strategies, shared fetch)
+    #
+    # Runs several standard strategies (e.g. RSI Reversal +
+    # Volume Spike) on the SAME instrument with a SINGLE data
+    # fetch and a SINGLE enrichment pass per instrument.
+    #
+    # This is what keeps Upstox API load flat: without it, every
+    # extra strategy would re-fetch the candles and re-run the
+    # ~6 enrichment fetches (D/H/5m trend + 3 RSI values) per
+    # signal — the exact thing that caused the earlier 429s/OOM.
+    # ========================================================
+
+    def _enrich_once(self, provider, symbol: str, category: str) -> dict:
+        """
+        Compute the expensive per-instrument context ONCE:
+          - stock D/H/5m trends
+          - stock RSI D/H/5m values
+        Shared across every strategy's signal for this instrument.
+        Indices/commodities get NEUTRAL stock trends (per Jwala).
+        """
+        enrich = {
+            "stock_trends": {"daily": "NEUTRAL", "hourly": "NEUTRAL", "5min": "NEUTRAL"},
+            "rsi_daily":  None,
+            "rsi_hourly": None,
+            "rsi_5min":   None,
+        }
+        if category in ("INDEX", "COMMODITY"):
+            return enrich
+        enrich["stock_trends"] = self._get_stock_all_trends(provider, symbol)
+        try:
+            enrich["rsi_daily"]  = _fetch_rsi_value(provider, symbol, "1d",  "3mo")
+            enrich["rsi_hourly"] = _fetch_rsi_value(provider, symbol, "1h",  "5d")
+            enrich["rsi_5min"]   = _fetch_rsi_value(provider, symbol, "15m", "3d")
+        except Exception:
+            pass
+        return enrich
+
+    def _scan_multi(
+        self,
+        provider,
+        strategies:   dict,        # {name: strategy_instance}
+        symbol:       str,
+        name:         str,
+        category:     str,
+        tf_name:      str,
+        interval:     str,
+        period:       str,
+        nifty_trends: dict = None,
+        retries:      int  = 3,
+    ) -> list:
+        """
+        Fetch one instrument ONCE, run every strategy in `strategies`
+        on the same dataframe, enrich once, log+alert each tagged signal.
+        Returns a list of per-signal result dicts (one per strategy).
+        """
+        if nifty_trends is None:
+            nifty_trends = {"daily": "NEUTRAL", "hourly": "NEUTRAL", "5min": "NEUTRAL"}
+        nifty_trend = nifty_trends.get("daily", "NEUTRAL")
+
+        for attempt in range(1, retries + 1):
+            try:
+                df = provider.fetch_data(symbol=symbol, interval=interval, period=period)
+
+                if df is None or df.empty or len(df) < 20:
+                    return []
+
+                # Real data source for the truthful Telegram tag (✅/⚠)
+                data_source = "yfinance"
+                try:
+                    data_source = df.attrs.get("data_source", getattr(provider, "last_source", "yfinance"))
+                except Exception:
+                    data_source = getattr(provider, "last_source", "yfinance")
+
+                df_with_rsi = add_rsi(df.copy())
+                df_with_rsi.dropna(subset=["RSI"], inplace=True)
+                if len(df_with_rsi) < 3:
+                    return []
+
+                latest    = df_with_rsi.iloc[-1]
+                rsi_val   = round(float(latest["RSI"]), 2)
+                price_val = round(float(latest["Close"]), 2)
+
+                # Volume ratio computed once — shared by all strategies
+                volume_ratio = get_volume_spike_ratio(df.copy())
+
+                # Lazily computed (only if some strategy actually fires)
+                enrich = None
+                out    = []
+
+                for strat_name, strat in strategies.items():
+                    try:
+                        result = strat.generate_signal(df.copy())
+                    except Exception as e:
+                        log.warning(f"{strat_name} failed on {symbol}: {e}")
+                        continue
+
+                    signal = result.signal
+
+                    if signal in ("BUY", "SELL"):
+                        # Enrich ONCE for this instrument, reuse for every strategy
+                        if enrich is None:
+                            enrich = self._enrich_once(provider, symbol, category)
+                        stock_trends = enrich["stock_trends"]
+                        stock_trend  = stock_trends.get("daily", "NEUTRAL")
+
+                        if should_suppress_signal(signal, nifty_trend, stock_trend):
+                            log.debug(f"SUPPRESSED {symbol} {signal} [{strat_name}] — "
+                                      f"Nifty:{nifty_trend} Stock:{stock_trend}")
+                            signal = "HOLD"
+                        else:
+                            trend_strength = calculate_signal_strength(
+                                signal=signal,
+                                nifty_trend=nifty_trend,
+                                stock_trend=stock_trend,
+                                volume_ratio=volume_ratio,
+                                tf_name=tf_name,
+                                nifty_hourly=nifty_trends.get("hourly", "NEUTRAL"),
+                                nifty_5min=nifty_trends.get("5min", "NEUTRAL"),
+                                stock_hourly=stock_trends.get("hourly", "NEUTRAL"),
+                                stock_5min=stock_trends.get("5min", "NEUTRAL"),
+                                rsi_val=rsi_val,
+                            )
+                            result.strength    = trend_strength
+                            result.nifty_trend = nifty_trend
+                            result.stock_trend = stock_trend
+
+                            result.indicators["volume_ratio"]       = volume_ratio
+                            result.indicators["volume_label"]       = get_volume_spike_label(volume_ratio)
+                            result.indicators["nifty_daily_trend"]  = nifty_trends.get("daily", "NEUTRAL")
+                            result.indicators["nifty_hourly_trend"] = nifty_trends.get("hourly", "NEUTRAL")
+                            result.indicators["nifty_5min_trend"]   = nifty_trends.get("5min", "NEUTRAL")
+                            result.indicators["stock_daily_trend"]  = stock_trends.get("daily", "NEUTRAL")
+                            result.indicators["stock_hourly_trend"] = stock_trends.get("hourly", "NEUTRAL")
+                            result.indicators["stock_5min_trend"]   = stock_trends.get("5min", "NEUTRAL")
+                            result.indicators["stock_rsi_daily"]    = enrich["rsi_daily"]
+                            result.indicators["stock_rsi_hourly"]   = enrich["rsi_hourly"]
+                            result.indicators["stock_rsi_5min"]     = enrich["rsi_5min"]
+
+                    # Log signal (skips HOLD + dups internally), tagged per strategy
+                    self.logger.log_signal(
+                        stock=symbol, timeframe=tf_name, signal=signal,
+                        rsi=rsi_val, price=price_val, strategy=strat_name,
+                    )
+
+                    alert = self.alerts.check_alert(
+                        timeframe=tf_name, stock=symbol, current_signal=signal,
+                        rsi=rsi_val, price=price_val, strategy=strat_name,
+                        signal_result=result, data_source=data_source,
+                    )
+
+                    if alert:
+                        log.info(
+                            f"ALERT  {symbol:20s}  {tf_name:12s}  [{strat_name}]  "
+                            f"{alert['previous']:5s} → {signal:5s}  "
+                            f"[{result.strength}]  src={data_source}"
+                        )
+
+                    out.append({
+                        "symbol":      symbol,
+                        "strategy":    strat_name,
+                        "signal":      signal,
+                        "strength":    result.strength,
+                        "reason":      result.reason,
+                        "rsi":         rsi_val,
+                        "price":       price_val,
+                        "data_source": data_source,
+                        "alerted":     alert is not None,
+                    })
+
+                return out
+
+            except Exception as e:
+                if attempt < retries:
+                    log.warning(f"Retry {attempt}/{retries}  {symbol}  {tf_name} [multi]: {e}")
+                    time.sleep(2 * attempt)
+                else:
+                    log.error(f"FAILED {symbol}  {tf_name} [multi] after {retries} attempts: {e}")
+                    return []
+
     def _scan_arbitrage(
         self,
         provider,
@@ -514,4 +694,91 @@ class StrategyEngine:
             f"{signals} signals  {elapsed}s"
         )
 
+        return results
+
+    def run_multi_scan(
+        self,
+        provider,
+        strategy_names: list,      # e.g. ["RSI Reversal", "Volume Spike"]
+        tf_name:        str,
+        interval:       str,
+        period:         str,
+        instruments:    list,
+        max_workers:    int = 10,
+    ) -> list:
+        """
+        Run MULTIPLE standard strategies in parallel on a shared fetch.
+
+        Each instrument is fetched ONCE; every strategy in
+        `strategy_names` is evaluated on that same dataframe, and the
+        per-instrument enrichment (trends + RSI) is computed once and
+        shared. Each signal is logged/alerted tagged with its strategy.
+
+        Volume Spike is restricted to STOCK instruments (Jwala's
+        institutional-buying framing); other strategies run on all.
+        """
+        if not instruments:
+            return []
+
+        # Build strategy instances once
+        strategies = {}
+        for sname in strategy_names:
+            try:
+                strategies[sname] = get_strategy(sname)
+            except Exception as e:
+                log.warning(f"Skipping unknown strategy '{sname}': {e}")
+
+        if not strategies:
+            log.warning("run_multi_scan: no valid strategies — nothing to do")
+            return []
+
+        # Strategies that only make sense on stocks
+        STOCK_ONLY = {"Volume Spike"}
+
+        nifty_trends = get_nifty_all_trends(provider)
+
+        log.info(
+            f"MULTI SCAN START  {list(strategies.keys())}  {tf_name}  "
+            f"{len(instruments)} instruments  "
+            f"Nifty:D{_trend_arrow(nifty_trends['daily'])}"
+            f"H{_trend_arrow(nifty_trends['hourly'])}"
+            f"5m{_trend_arrow(nifty_trends['5min'])}"
+        )
+
+        start_time = time.time()
+        results    = []
+        signals    = 0
+
+        def _scan_one(inst):
+            category = inst["category"]
+            # Filter strategies applicable to this instrument's category
+            applicable = {
+                n: s for n, s in strategies.items()
+                if not (n in STOCK_ONLY and category != "STOCK")
+            }
+            if not applicable:
+                return []
+            return self._scan_multi(
+                provider, applicable,
+                inst["symbol"], inst["name"], category,
+                tf_name, interval, period, nifty_trends,
+            )
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_scan_one, inst): inst for inst in instruments}
+            for future in as_completed(futures, timeout=300):
+                try:
+                    res_list = future.result(timeout=60)
+                    for r in (res_list or []):
+                        results.append(r)
+                        if r["signal"] != "HOLD":
+                            signals += 1
+                except Exception as e:
+                    log.warning(f"Instrument multi-scan error: {e}")
+
+        elapsed = round(time.time() - start_time, 1)
+        log.info(
+            f"MULTI SCAN DONE   {list(strategies.keys())}  {tf_name}  "
+            f"{len(instruments)} instruments  {signals} signals  {elapsed}s"
+        )
         return results

@@ -30,8 +30,10 @@ class SignalLogger:
         if signal == "HOLD":
             return False
 
-        # Deduplication — skip same consecutive signal
-        last = db.get_last_signal(stock, timeframe)
+        # Deduplication — skip same consecutive signal FOR THIS STRATEGY.
+        # Per-strategy so parallel strategies (RSI, Volume Spike, Arbitrage)
+        # do not mask each other's signals.
+        last = db.get_last_signal(stock, timeframe, strategy)
         if last == signal:
             return False
 

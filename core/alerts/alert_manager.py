@@ -114,10 +114,10 @@ class AlertManager:
         data_source:    str  = "yfinance",
     ) -> dict | None:
 
-        previous_signal = db.get_alert_state(stock, timeframe)
+        previous_signal = db.get_alert_state(stock, timeframe, strategy)
 
         if previous_signal is None:
-            db.upsert_alert_state(stock, timeframe, current_signal)
+            db.upsert_alert_state(stock, timeframe, current_signal, strategy)
             return None
 
         if current_signal == "HOLD":
@@ -126,7 +126,7 @@ class AlertManager:
         if previous_signal == current_signal:
             return None
 
-        db.upsert_alert_state(stock, timeframe, current_signal)
+        db.upsert_alert_state(stock, timeframe, current_signal, strategy)
 
         alert = {
             "stock":         stock,

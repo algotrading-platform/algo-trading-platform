@@ -324,18 +324,29 @@ def fmt_price(val) -> str:
     except: return "—"
 
 def get_latest_signals(tf: str, strategy: str) -> pd.DataFrame:
-    # "All Strategies" shows latest signal regardless of strategy
+    # "All Strategies" shows the latest signal from EACH strategy per stock
+    # (so an RSI signal and a Volume Spike signal on the same stock both
+    #  appear — two strategies agreeing is stronger conviction, not noise).
+    # A single selected strategy collapses to one row per stock as before.
     strat_filter = None if strategy == "All Strategies" else strategy
     logs = logger.get_logs(strategy=strat_filter)
     if logs.empty: return pd.DataFrame()
     tf_logs = logs[logs["Timeframe"] == tf].copy()
     if tf_logs.empty: return pd.DataFrame()
     tf_logs["_sort"] = pd.to_datetime(tf_logs["Timestamp"], errors="coerce")
+
+    if strategy == "All Strategies" and "Strategy" in tf_logs.columns:
+        group_keys = ["Stock", "Strategy"]
+    else:
+        group_keys = ["Stock"]
+
     return (
         tf_logs.sort_values("_sort", ascending=False)
-               .groupby("Stock").first()
+               .groupby(group_keys).first()
                .reset_index()
                .drop(columns=["_sort"], errors="ignore")
+               .sort_values("Stock")
+               .reset_index(drop=True)
     )
 
 def get_last_scan_time() -> str:

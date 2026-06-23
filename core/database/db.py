@@ -171,19 +171,30 @@ def get_signals(
         return pd.DataFrame()
 
 
-def get_last_signal(stock: str, timeframe: str) -> str | None:
+def get_last_signal(stock: str, timeframe: str, strategy: str = None) -> str | None:
     """
-    Returns the most recent signal for a stock+timeframe.
+    Returns the most recent signal for a stock+timeframe (+strategy).
     Used for deduplication in SignalLogger.
+
+    When strategy is given, dedup is per-strategy so parallel strategies
+    (e.g. RSI Reversal and Volume Spike) do not mask each other.
     """
     try:
         with _get_cursor() as cur:
-            cur.execute("""
-                SELECT signal FROM signals
-                WHERE stock = %s AND timeframe = %s
-                ORDER BY timestamp DESC
-                LIMIT 1
-            """, (stock, timeframe))
+            if strategy is not None:
+                cur.execute("""
+                    SELECT signal FROM signals
+                    WHERE stock = %s AND timeframe = %s AND strategy = %s
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                """, (stock, timeframe, strategy))
+            else:
+                cur.execute("""
+                    SELECT signal FROM signals
+                    WHERE stock = %s AND timeframe = %s
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                """, (stock, timeframe))
             row = cur.fetchone()
 
         if row:
@@ -251,15 +262,27 @@ def get_last_scan_time() -> str | None:
 # ALERT STATES TABLE
 # ============================================================
 
-def get_alert_state(stock: str, timeframe: str) -> str | None:
-    """Returns last alerted signal for stock+timeframe."""
+def get_alert_state(stock: str, timeframe: str, strategy: str = None) -> str | None:
+    """
+    Returns last alerted signal for stock+timeframe (+strategy).
+
+    When strategy is given, each strategy keeps its own transition
+    state so parallel strategies do not overwrite each other's alerts.
+    """
     try:
         with _get_cursor() as cur:
-            cur.execute("""
-                SELECT signal FROM alert_states
-                WHERE stock = %s AND timeframe = %s
-                LIMIT 1
-            """, (stock, timeframe))
+            if strategy is not None:
+                cur.execute("""
+                    SELECT signal FROM alert_states
+                    WHERE stock = %s AND timeframe = %s AND strategy = %s
+                    LIMIT 1
+                """, (stock, timeframe, strategy))
+            else:
+                cur.execute("""
+                    SELECT signal FROM alert_states
+                    WHERE stock = %s AND timeframe = %s
+                    LIMIT 1
+                """, (stock, timeframe))
             row = cur.fetchone()
 
         if row:
@@ -271,20 +294,49 @@ def get_alert_state(stock: str, timeframe: str) -> str | None:
         return None
 
 
-def upsert_alert_state(stock: str, timeframe: str, signal: str) -> None:
-    """Insert or update the alert state for stock+timeframe."""
+def upsert_alert_state(
+    stock: str,
+    timeframe: str,
+    signal: str,
+    strategy: str = "RSI Reversal",
+) -> None:
+    """
+    Insert or update the alert state for stock+timeframe+strategy.
+
+    Requires the alert_states table to have a `strategy` column and a
+    UNIQUE (stock, timeframe, strategy) constraint — see
+    core/database/migration_multistrategy.sql.
+
+    Falls back to the legacy (stock, timeframe) conflict target if the
+    migration has not been applied yet, so deploys never hard-fail.
+    """
     try:
         with _get_cursor() as cur:
             cur.execute("""
-                INSERT INTO alert_states (stock, timeframe, signal, updated_at)
-                VALUES (%s, %s, %s, NOW())
-                ON CONFLICT (stock, timeframe)
+                INSERT INTO alert_states (stock, timeframe, strategy, signal, updated_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (stock, timeframe, strategy)
                 DO UPDATE SET
                     signal     = EXCLUDED.signal,
                     updated_at = NOW()
-            """, (stock, timeframe, signal))
+            """, (stock, timeframe, strategy, signal))
     except Exception as e:
-        print(f"[DB] upsert_alert_state error: {e}")
+        # Migration not yet applied — fall back to legacy 2-column upsert
+        # so the scanner keeps working until the SQL migration is run.
+        print(f"[DB] upsert_alert_state (strategy-aware) failed, "
+              f"falling back to legacy: {e}")
+        try:
+            with _get_cursor() as cur:
+                cur.execute("""
+                    INSERT INTO alert_states (stock, timeframe, signal, updated_at)
+                    VALUES (%s, %s, %s, NOW())
+                    ON CONFLICT (stock, timeframe)
+                    DO UPDATE SET
+                        signal     = EXCLUDED.signal,
+                        updated_at = NOW()
+                """, (stock, timeframe, signal))
+        except Exception as e2:
+            print(f"[DB] upsert_alert_state legacy fallback error: {e2}")
 
 
 # ============================================================

@@ -292,6 +292,20 @@ class UpstoxProvider(BaseDataProvider):
     def __init__(self):
         self._yf = YFinanceProvider()
         self._base_url = "https://api.upstox.com/v2"
+        # Tracks where the most recent fetch_data() result came from:
+        # "upstox" or "yfinance". Read by the engine to tag alerts.
+        self.last_source = "yfinance"
+
+    def _yf_fetch(self, symbol, interval, period):
+        """yfinance fallback that records the source as 'yfinance'."""
+        self.last_source = "yfinance"
+        df = self._yf.fetch_data(symbol, interval, period)
+        try:
+            if df is not None:
+                df.attrs["data_source"] = "yfinance"
+        except Exception:
+            pass
+        return df
 
     def fetch_data(
         self,
@@ -304,12 +318,12 @@ class UpstoxProvider(BaseDataProvider):
         token = get_token()
         if not token:
             print(f"[Upstox] No valid token — falling back to yfinance for {symbol}")
-            return self._yf.fetch_data(symbol, interval, period)
+            return self._yf_fetch(symbol, interval, period)
 
         # Get fetch strategy for this interval
         fetch_config = UPSTOX_FETCH_MAP.get(interval)
         if not fetch_config:
-            return self._yf.fetch_data(symbol, interval, period)
+            return self._yf_fetch(symbol, interval, period)
 
         fetch_interval, resample_rule, fetch_period_override = fetch_config
         effective_period = fetch_period_override if fetch_period_override else period
@@ -318,7 +332,7 @@ class UpstoxProvider(BaseDataProvider):
         upstox_sym = self._resolve_symbol(symbol, token)
         if not upstox_sym:
             print(f"[Upstox] No mapping for {symbol} — falling back to yfinance")
-            return self._yf.fetch_data(symbol, interval, period)
+            return self._yf_fetch(symbol, interval, period)
 
         # Calculate date range
         to_date, from_date = self._period_to_dates(effective_period)
@@ -334,20 +348,26 @@ class UpstoxProvider(BaseDataProvider):
 
             if df is None or df.empty:
                 print(f"[Upstox] Empty data for {symbol} — falling back to yfinance")
-                return self._yf.fetch_data(symbol, interval, period)
+                return self._yf_fetch(symbol, interval, period)
 
             # Resample if needed (5m, 15m, 1h)
             if resample_rule:
                 df = self._resample_candles(df, resample_rule)
 
             if df.empty:
-                return self._yf.fetch_data(symbol, interval, period)
+                return self._yf_fetch(symbol, interval, period)
 
+            # Success — data came from Upstox
+            self.last_source = "upstox"
+            try:
+                df.attrs["data_source"] = "upstox"
+            except Exception:
+                pass
             return df
 
         except Exception as e:
             print(f"[Upstox] fetch error {symbol}: {e} — falling back to yfinance")
-            return self._yf.fetch_data(symbol, interval, period)
+            return self._yf_fetch(symbol, interval, period)
 
     def _resample_candles(self, df: pd.DataFrame, rule: str) -> pd.DataFrame:
         """

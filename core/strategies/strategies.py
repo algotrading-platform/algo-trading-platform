@@ -564,32 +564,34 @@ def get_strategy(name: str) -> BaseStrategy:
 
 class VolumeSpikeStrategy(BaseStrategy):
     """
-    Volume Spike Strategy — Jwala's exact spec (06-Jun-2026):
+    Volume Spike Strategy — Jwala's latest spec (18-Jun-2026):
 
-    Condition: Current candle volume > 2000% of 2-week average volume
-    Signal   : BUY — institutional buying detected
-    Strength : STRONG if volume > 3000%, MODERATE if > 2000%
+    Condition: Current candle volume > 500% (5x) of the previous
+               14-candle average volume.
+    Signal   : BUY — institutional buying detected.
+    Strength : STRONG if volume >= 1000% (10x), else MODERATE.
 
     Jwala's insight from Business Standard research:
+    "5 minute volume if it is greater than 500% of the fourteen
+     previous 5 minute volume average — buy."
     "From past 20 days tracking — 8 out of 10 stocks rise on that day.
      Some rising by 20% on same day, 4-5% next day."
-    "Someone who is having some kind of info is buying that stock heavily."
 
     This is an INDEPENDENT strategy — does not require RSI.
-    Also works as RSI confirmation — RSI reversal + volume spike = STRONG BUY.
+    It also reinforces RSI: RSI reversal + volume spike = stronger BUY.
     """
 
     name = "Volume Spike"
     description = (
         "Detects institutional buying via abnormal volume surge. "
-        "Signals when volume exceeds 2000% of 2-week average. "
-        "Based on Jwala's Business Standard research."
+        "Signals BUY when current candle volume exceeds 500% (5x) of "
+        "the previous 14-candle average. Based on Jwala's spec."
     )
 
-    # 14 candles = 2 weeks of daily candles
+    # 14 candles average (excluding the current candle)
     LOOKBACK_CANDLES   = 14
-    SPIKE_THRESHOLD    = 5.0   # 2000% = 20x average
-    STRONG_THRESHOLD   = 10.0   # 3000% = STRONG signal
+    SPIKE_THRESHOLD    = 5.0    # 500% = 5x average  → BUY trigger
+    STRONG_THRESHOLD   = 10.0   # 1000% = 10x average → STRONG
 
     def generate_signal(self, df) -> "SignalResult":
         if df is None or df.empty or len(df) < self.LOOKBACK_CANDLES + 1:
@@ -622,8 +624,8 @@ class VolumeSpikeStrategy(BaseStrategy):
             if avg_volume <= 0:
                 return SignalResult("HOLD", "WEAK", "Zero average volume", strategy=self.name)
 
-            volume_ratio = curr_volume / avg_volume  # e.g. 20.0 = 2000%
-            volume_pct   = round(volume_ratio * 100, 0)  # e.g. 2000%
+            volume_ratio = curr_volume / avg_volume  # e.g. 5.0 = 500%
+            volume_pct   = round(volume_ratio * 100, 0)  # e.g. 500%
 
             indicators = {
                 "Volume":       int(curr_volume),
@@ -644,10 +646,19 @@ class VolumeSpikeStrategy(BaseStrategy):
 
             return SignalResult(
                 "HOLD", "WEAK",
-                f"Volume {volume_pct:.0f}% of average (need 2000%+). "
+                f"Volume {volume_pct:.0f}% of average (need 500%+). "
                 f"Current: {int(curr_volume):,} | Avg: {int(avg_volume):,}",
                 indicators, self.name,
             )
 
         except Exception as e:
             return SignalResult("HOLD", "WEAK", f"Volume calculation error: {e}", strategy=self.name)
+# ============================================================
+# REGISTER LATE-DEFINED STRATEGIES
+# VolumeSpikeStrategy is defined after the STRATEGIES dict above,
+# so it is registered here. This makes it selectable in the
+# dashboard and runnable by the engine like any other strategy.
+# ============================================================
+
+STRATEGIES["Volume Spike"] = VolumeSpikeStrategy()
+STRATEGY_NAMES = list(STRATEGIES.keys())

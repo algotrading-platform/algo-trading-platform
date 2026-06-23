@@ -136,7 +136,18 @@ fno_instruments  = [i for i in instruments if i["category"] == "STOCK"]
 # Arbitrage engine — always fixed
 _arb_engine = StrategyEngine("Cash-Futures Arbitrage")
 
+# ── Parallel strategies that run on EVERY scan ───────────────
+# RSI Reversal + Volume Spike both run on the same single fetch
+# per instrument (Volume Spike is stock-only, enforced in engine).
+# Add more names here to run them in parallel too.
+PARALLEL_STRATEGIES = ["RSI Reversal", "Volume Spike"]
+
+# A single engine drives the multi-strategy scan. The label passed
+# here is cosmetic — run_multi_scan() takes the real strategy list.
+_multi_engine = StrategyEngine("RSI Reversal")
+
 # Primary strategy engine — recreated when strategy changes
+# (kept for backward compatibility / single-strategy callers)
 _current_strategy  = None
 _primary_engine    = None
 
@@ -146,6 +157,10 @@ def get_primary_engine() -> StrategyEngine:
     Returns engine for currently selected strategy.
     Reads from PostgreSQL app_config on every scan —
     dashboard can change strategy without restart.
+
+    NOTE: The production scan path now uses run_multi_scan (parallel
+    strategies). This single-strategy engine is retained for any
+    callers/tools that still request one specific strategy.
     """
     global _primary_engine, _current_strategy
 
@@ -154,6 +169,9 @@ def get_primary_engine() -> StrategyEngine:
         strategy = get_config("SIGNAL_STRATEGY") or os.getenv("SIGNAL_STRATEGY", "RSI Reversal")
     except Exception:
         strategy = os.getenv("SIGNAL_STRATEGY", "RSI Reversal")
+
+    if strategy == "All Strategies":
+        strategy = "RSI Reversal"
 
     if strategy != _current_strategy:
         log.info(f"Strategy: {_current_strategy} → {strategy}")
@@ -168,7 +186,18 @@ def get_primary_engine() -> StrategyEngine:
 # ============================================================
 
 def run_primary_scan(tf_name: str) -> None:
-    """Primary strategy scan on all instruments."""
+    """
+    Parallel multi-strategy scan on all instruments.
+
+    Runs every strategy in PARALLEL_STRATEGIES (RSI Reversal +
+    Volume Spike) on a SINGLE data fetch per instrument. Each signal
+    is logged and alerted tagged with its own strategy name, so the
+    dashboard 'All Strategies' view and per-strategy filter both work.
+
+    The dashboard strategy dropdown now only changes the VIEW (filter)
+    — it no longer switches which strategies are scanned. All parallel
+    strategies always run.
+    """
     interval = TIMEFRAMES[tf_name]
     period   = PERIOD_MAP[tf_name]
 
@@ -179,8 +208,9 @@ def run_primary_scan(tf_name: str) -> None:
     if not is_market_hours():
         return
 
-    get_primary_engine().run_scan(
+    _multi_engine.run_multi_scan(
         provider=provider,
+        strategy_names=PARALLEL_STRATEGIES,
         tf_name=tf_name,
         interval=interval,
         period=period,
@@ -192,17 +222,24 @@ def run_arbitrage_scan(tf_name: str) -> None:
     """
     Arbitrage scan on F&O stocks only.
 
-    FIXED (2026-06-19): runs HOURLY only (not every 5/15 mins).
+    Cadence: every 30 minutes (per Jwala — arbitrage spread moves
+    slowly, and the futures-search API is the rate-limit-sensitive one).
 
-    Reasons:
-      - Arbitrage spread changes slowly (minutes to hours)
-      - Reduces Upstox API calls from 2000+/day to ~1000/day
-      - Prevents 429 rate limiting on futures search API
-      - Futures contracts cached in PostgreSQL — fetched once per day
-      - Only futures PRICE needs to be fetched each hour
+    Implementation: only runs on the "15 Minutes" timeframe pass, and
+    only when the current IST minute is at the top/bottom of the hour
+    (minute < 5 or 30–34). With the Container Job firing every 5 min,
+    this yields ~2 arbitrage scans/hour instead of 4 (was 15-min).
+
+    Futures contracts are cached in PostgreSQL (fetched once/day), so
+    only the futures PRICE is fetched each run — keeps API calls low.
     """
-    # FIXED: only run on 15 Minutes timeframe
+    # Only piggyback on the 15-minute pass (avoids running on every tf)
     if tf_name != "15 Minutes":
+        return
+
+    # 30-minute cadence: fire near :00 and :30 only
+    minute = datetime.now(IST).minute
+    if not (minute < 5 or 30 <= minute <= 34):
         return
 
     if not is_market_hours():
@@ -216,7 +253,7 @@ def run_arbitrage_scan(tf_name: str) -> None:
     interval = TIMEFRAMES[tf_name]
     period   = PERIOD_MAP[tf_name]
 
-    log.info(f"Running arbitrage scan — {len(fno_instruments)} F&O stocks")
+    log.info(f"Running arbitrage scan (30-min cadence) — {len(fno_instruments)} F&O stocks")
 
     _arb_engine.run_scan(
         provider=provider,
@@ -325,8 +362,9 @@ def start() -> None:
     log.info("Algo Trading Signal Scheduler")
     log.info(f"Instruments : {len(instruments)} total | {len(fno_instruments)} F&O")
     log.info(f"Timeframes  : {list(TIMEFRAMES.keys())}")
-    log.info(f"Strategy    : {active_strat}")
-    log.info(f"Arbitrage   : Every 15 mins (9:31, 9:46 ... 15:16, 15:31 IST)")
+    log.info(f"Strategies  : {PARALLEL_STRATEGIES} (parallel, every scan)")
+    log.info(f"Arbitrage   : Every 30 mins (F&O stocks only)")
+    log.info(f"Dashboard   : strategy dropdown filters the VIEW only")
     log.info("Data source : Upstox API (primary) + yfinance (fallback)")
     log.info("Market hours: 9:15 AM — 3:30 PM IST")
     log.info("=" * 60)
