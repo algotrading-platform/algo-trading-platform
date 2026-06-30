@@ -59,6 +59,39 @@ def _trend_arrow(trend: str) -> str:
     return "→"
 
 
+# ── Data freshness guard ─────────────────────────────────────
+# Approx minutes per timeframe. Used to reject stale candles so we
+# never generate a signal/price/RSI off an out-of-date candle (the
+# root of the "price/RSI doesn't match TradingView" reports, which
+# happen when a stale fallback source returns an old last candle).
+_INTERVAL_MINUTES = {
+    "5m": 5, "15m": 15, "30m": 30, "1h": 60, "60m": 60,
+    "1d": 1440, "1day": 1440, "1wk": 10080, "1mo": 43200,
+}
+
+
+def _is_stale(df: pd.DataFrame, interval: str, max_factor: float = 3.0) -> bool:
+    """
+    True if the latest candle is older than max_factor * interval.
+    Conservative (3x) so we don't reject legitimately-spaced candles
+    around market open or low-liquidity gaps. Intraday only — daily/
+    weekly/monthly are never treated as stale (their gaps are normal).
+    """
+    mins = _INTERVAL_MINUTES.get(interval, 0)
+    if mins == 0 or mins >= 1440:
+        return False  # only guard intraday timeframes
+    try:
+        ts = df["Datetime"].iloc[-1]
+        ts = pd.Timestamp(ts)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("Asia/Kolkata")
+        now = pd.Timestamp.now(tz="Asia/Kolkata")
+        age_min = (now - ts.tz_convert("Asia/Kolkata")).total_seconds() / 60.0
+        return age_min > (mins * max_factor)
+    except Exception:
+        return False  # never block a scan on a parsing error
+
+
 def _fetch_rsi_value(provider, symbol: str, interval: str, period: str):
     """Fetch RSI for a specific timeframe. Returns float or None."""
     try:
@@ -226,6 +259,12 @@ class StrategyEngine:
                 )
 
                 if df is None or df.empty or len(df) < 20:
+                    return None
+
+                # Skip stale intraday candles (prevents wrong price/RSI vs
+                # live charts when a fallback source returns an old candle).
+                if _is_stale(df, interval):
+                    log.warning(f"{symbol}: stale {interval} candle — skipping")
                     return None
 
                 df_with_rsi = add_rsi(df.copy())
@@ -429,6 +468,11 @@ class StrategyEngine:
                 df = provider.fetch_data(symbol=symbol, interval=interval, period=period)
 
                 if df is None or df.empty or len(df) < 20:
+                    return []
+
+                # Skip stale intraday candles (see _is_stale).
+                if _is_stale(df, interval):
+                    log.warning(f"{symbol}: stale {interval} candle — skipping")
                     return []
 
                 # Real data source for the truthful Telegram tag (✅/⚠)

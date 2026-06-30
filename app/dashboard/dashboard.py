@@ -382,15 +382,22 @@ def build_tv_chart(
         if df is None or df.empty or len(df) < 5:
             return "<div style='padding:20px;color:#6b7fa0;font-family:monospace;'>No data available for chart</div>"
 
+        # IST display offset for Lightweight Charts.
+        # The chart library renders every epoch as if it were UTC. To make
+        # candles/markers show IST wall-clock time (NSE 9:15-15:30), we add
+        # +5h30m (19,800s) to every epoch. Applied identically to candles,
+        # RSI and markers so they stay aligned with each other.
+        IST_OFFSET = 19800
+
         # Prepare candle data
         candles = []
         for _, row in df.iterrows():
             try:
                 ts = row["Datetime"]
                 if hasattr(ts, "timestamp"):
-                    t = int(ts.timestamp())
+                    t = int(ts.timestamp()) + IST_OFFSET
                 else:
-                    t = int(pd.Timestamp(ts).timestamp())
+                    t = int(pd.Timestamp(ts).timestamp()) + IST_OFFSET
                 candles.append({
                     "time":  t,
                     "open":  round(float(row["Open"]),  2),
@@ -409,7 +416,7 @@ def build_tv_chart(
             for _, row in df_rsi.iterrows():
                 try:
                     ts = row["Datetime"]
-                    t  = int(ts.timestamp()) if hasattr(ts, "timestamp") else int(pd.Timestamp(ts).timestamp())
+                    t  = (int(ts.timestamp()) if hasattr(ts, "timestamp") else int(pd.Timestamp(ts).timestamp())) + IST_OFFSET
                     rsi_data.append({"time": t, "value": round(float(row["RSI"]), 2)})
                 except Exception:
                     continue
@@ -443,7 +450,7 @@ def build_tv_chart(
                     if not ts_str:
                         continue
                     ts = pd.to_datetime(ts_str, utc=True)
-                    t  = int(ts.timestamp())
+                    t  = int(ts.timestamp()) + IST_OFFSET
                     signal_type = sig.get("Signal", "")
                     markers.append({
                         "time":     t,

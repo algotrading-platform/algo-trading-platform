@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 # ============================================================
-# scripts/upstox_login.py
+# scripts/upstox_login.py   (CORRECTED — truthful + verify-on-write)
 #
-# Run this ONCE every morning before 9:15 AM IST.
-# Generates a fresh Upstox access token and saves it
-# to Azure PostgreSQL so the scheduler can use it all day.
+# Run ONCE every morning before 9:15 AM IST.
+# Generates a fresh Upstox access token, saves it to Azure
+# PostgreSQL, and VERIFIES the write actually landed.
+#
+# WHAT CHANGED vs the old version (and why it matters):
+#   - The OLD browser page said "Login successful! Token saved"
+#     the instant Upstox redirected back — BEFORE the token was
+#     exchanged or saved. So a silent DB-write failure (e.g. your
+#     IP not allow-listed on the Azure firewall) still showed
+#     "success". That is exactly why the scheduler ran on stale
+#     yfinance data for a week without anyone noticing.
+#   - NOW: the browser page only says "code received — finishing
+#     in the terminal". The TERMINAL is the source of truth, and
+#     we READ THE TOKEN BACK from the DB to confirm it is really
+#     stored and valid before declaring success.
 #
 # Usage:
 #   python scripts/upstox_login.py
-#
-# What it does:
-#   1. Generates the Upstox login URL
-#   2. Opens it in your browser automatically
-#   3. You log in with your Upstox credentials
-#   4. Upstox redirects to http://127.0.0.1:8000/callback?code=XXX
-#   5. This script catches the code automatically
-#   6. Exchanges it for an access token
-#   7. Saves token to Azure PostgreSQL
-#   8. Done — scheduler will use it for the whole day
-#
-# Time required: ~30 seconds
 # ============================================================
 
 import os
@@ -42,7 +42,7 @@ TOKEN_URL    = "https://api.upstox.com/v2/login/authorization/token"
 
 
 # ============================================================
-# STEP 1 — Generate login URL and open browser
+# STEP 1 — Generate login URL
 # ============================================================
 
 def get_login_url() -> str:
@@ -56,6 +56,8 @@ def get_login_url() -> str:
 
 # ============================================================
 # STEP 2 — Local server to catch the OAuth callback
+# NOTE: the callback page is now NEUTRAL. It does NOT claim the
+# token was saved, because at this point it has not been.
 # ============================================================
 
 auth_code = None
@@ -74,10 +76,11 @@ class CallbackHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"""
                 <html><body style='font-family:sans-serif;text-align:center;padding:60px;'>
-                <h2 style='color:#1a9e75;'>Login successful!</h2>
-                <p>Access token saved to Azure PostgreSQL.</p>
+                <h2 style='color:#1a73e8;'>Authorization received.</h2>
+                <p>Finishing token exchange and saving&hellip;</p>
+                <p><b>Check the terminal window</b> for the real result
+                   (success or failure).</p>
                 <p>You can close this tab.</p>
-                <p style='color:#888;font-size:13px;'>Scheduler is now ready for market hours.</p>
                 </body></html>
             """)
         else:
@@ -86,7 +89,7 @@ class CallbackHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"Error: no code received")
 
     def log_message(self, format, *args):
-        pass  # Suppress server logs
+        pass
 
 
 # ============================================================
@@ -110,12 +113,30 @@ def exchange_code(code: str) -> str | None:
             print(f"Token exchange failed: {response.status_code} — {response.text}")
             return None
 
-        data = response.json()
-        return data.get("access_token")
+        return response.json().get("access_token")
 
     except Exception as e:
         print(f"Token exchange error: {e}")
         return None
+
+
+# ============================================================
+# Helpers for truthful banners
+# ============================================================
+
+def banner(lines, char="="):
+    width = 58
+    print(char * width)
+    for ln in lines:
+        print("  " + ln)
+    print(char * width)
+
+
+def fail(lines):
+    print()
+    banner(["LOGIN FAILED — TOKEN NOT SAVED"] + lines, char="!")
+    print()
+    sys.exit(1)
 
 
 # ============================================================
@@ -124,59 +145,78 @@ def exchange_code(code: str) -> str | None:
 
 def main():
     if not API_KEY or not API_SECRET:
-        print("ERROR: UPSTOX_API_KEY and UPSTOX_API_SECRET must be set in .env")
-        sys.exit(1)
+        fail(["UPSTOX_API_KEY and UPSTOX_API_SECRET must be set in .env"])
 
-    print("=" * 55)
-    print("  Upstox Daily Login — Algo Trading Platform")
-    print("=" * 55)
+    banner(["Upstox Daily Login — Algo Trading Platform"])
     print()
 
     login_url = get_login_url()
-
     print("Opening Upstox login in your browser...")
-    print("If browser doesn't open, visit this URL manually:")
+    print("If it doesn't open, visit this URL manually:")
     print(f"\n  {login_url}\n")
-
     webbrowser.open(login_url)
 
-    print("Waiting for login callback on http://127.0.0.1:8000...")
+    print("Waiting for login callback on http://127.0.0.1:8000 ...")
     print("(Log in with your Upstox credentials in the browser)\n")
 
-    # Start local server to catch callback
     server = HTTPServer(("127.0.0.1", 8000), CallbackHandler)
-    server.timeout = 120  # 2 minute timeout
-    server.handle_request()  # Wait for exactly one request
+    server.timeout = 120
+    server.handle_request()
 
     if not auth_code:
-        print("ERROR: No authorization code received. Try again.")
-        sys.exit(1)
+        fail(["No authorization code received from Upstox.",
+              "Try again — make sure you completed the login in the browser."])
 
     print("Authorization code received. Exchanging for access token...")
-
     token = exchange_code(auth_code)
 
     if not token:
-        print("ERROR: Failed to get access token. Check API credentials.")
-        sys.exit(1)
+        fail(["Could not exchange code for an access token.",
+              "Check UPSTOX_API_KEY / UPSTOX_API_SECRET in .env."])
 
     print("Access token received. Saving to Azure PostgreSQL...")
 
-    # Use Azure PostgreSQL directly
-    from core.database.db import save_upstox_token
-    success = save_upstox_token(token)
+    # ---- WRITE ----
+    try:
+        from core.database.db import save_upstox_token, get_upstox_token
+    except Exception as e:
+        fail([f"Could not import the database layer: {e}"])
 
-    if success:
-        print()
-        print("=" * 55)
-        print("  SUCCESS — Token saved to Azure PostgreSQL")
-        print("  Scheduler will use Upstox data all day.")
-        print("  Market opens at 9:15 AM IST.")
-        print("=" * 55)
-    else:
-        print("ERROR: Failed to save token to Azure PostgreSQL.")
-        print("Check DATABASE_URL in .env")
-        sys.exit(1)
+    try:
+        saved = save_upstox_token(token)
+    except Exception as e:
+        # Most common real-world cause: DB unreachable from this network.
+        fail([f"Database write raised an error: {e}",
+              "",
+              "MOST LIKELY CAUSE: your current IP is not allow-listed on the",
+              "Azure PostgreSQL firewall (your home/office IP changes daily).",
+              "Fix: Azure Portal -> ariqt-algo-trading-db-001 -> Networking",
+              "     -> '+ Add current client IP address' -> Save -> re-run."])
+
+    if not saved:
+        fail(["save_upstox_token() returned False — the row was not written.",
+              "Check DATABASE_URL and the Azure firewall allow-list."])
+
+    # ---- VERIFY (read it back) ----
+    # This is the crucial new step: prove the token is actually in the DB
+    # and reads back as VALID, instead of trusting the write blindly.
+    print("Verifying the token is stored and valid...")
+    try:
+        readback = get_upstox_token()
+    except Exception as e:
+        fail([f"Wrote the token but could not read it back: {e}"])
+
+    if not readback:
+        fail(["Token was written but reads back as INVALID/EXPIRED.",
+              "This points to a token-validity (timezone) issue in",
+              "get_upstox_token(), not a write failure. Tell the developer."])
+
+    # ---- TRUE SUCCESS ----
+    print()
+    banner(["SUCCESS — token saved AND verified in Azure PostgreSQL",
+            "The scheduler will use live Upstox data today.",
+            "Market opens at 9:15 AM IST."])
+    print()
 
 
 if __name__ == "__main__":

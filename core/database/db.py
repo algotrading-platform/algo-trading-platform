@@ -18,7 +18,7 @@
 
 import os
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import psycopg2
@@ -126,7 +126,11 @@ def get_signals(
     Returns DataFrame sorted newest first.
     """
     try:
-        cutoff = datetime.now() - timedelta(days=days)
+        # Signals are stored with NOW() (UTC, timestamptz). The cutoff MUST
+        # be timezone-aware UTC too — a naive datetime.now() is local IST and
+        # would shift the window ~5.5h, silently hiding the most recent rows
+        # (this was the "dashboard shows no records" bug).
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
         conditions = ["timestamp >= %s"]
         params     = [cutoff]
