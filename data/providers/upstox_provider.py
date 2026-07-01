@@ -346,6 +346,28 @@ class UpstoxProvider(BaseDataProvider):
                 to_date=to_date,
             )
 
+            # The /historical-candle endpoint excludes the CURRENT day.
+            # For intraday intervals, also pull today's candles from the
+            # intraday endpoint and merge, so the series runs to "now"
+            # (this is what makes intraday RSI/price match TradingView).
+            if fetch_interval in ("1minute", "30minute"):
+                today_df = self._fetch_intraday_candles(
+                    token=token,
+                    instrument_key=upstox_sym,
+                    interval=fetch_interval,
+                )
+                if today_df is not None and not today_df.empty:
+                    if df is None or df.empty:
+                        df = today_df
+                    else:
+                        df = pd.concat([df, today_df], ignore_index=True)
+                    # Dedup on timestamp (keep last), sort ascending
+                    df = (
+                        df.drop_duplicates(subset=["Datetime"], keep="last")
+                          .sort_values("Datetime")
+                          .reset_index(drop=True)
+                    )
+
             if df is None or df.empty:
                 print(f"[Upstox] Empty data for {symbol} — falling back to yfinance")
                 return self._yf_fetch(symbol, interval, period)
@@ -596,11 +618,46 @@ class UpstoxProvider(BaseDataProvider):
 
         candles = data.get("data", {}).get("candles", [])
 
+        return self._parse_candles(candles)
+
+    def _fetch_intraday_candles(
+        self,
+        token:          str,
+        instrument_key: str,
+        interval:       str,
+    ) -> pd.DataFrame:
+        """
+        Call Upstox V2 INTRADAY candle API — returns TODAY's candles
+        (the /historical-candle endpoint excludes the current day, which
+        is why intraday RSI/price previously lagged a full day behind
+        TradingView). interval: 1minute / 30minute / etc.
+        """
+        encoded_key = requests.utils.quote(instrument_key, safe="")
+        url = f"{self._base_url}/historical-candle/intraday/{encoded_key}/{interval}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code != 200:
+                # Non-fatal: we still have historical data to fall back on.
+                print(f"[Upstox] intraday {response.status_code} for {instrument_key}")
+                return pd.DataFrame()
+            data = response.json()
+            if data.get("status") != "success":
+                return pd.DataFrame()
+            return self._parse_candles(data.get("data", {}).get("candles", []))
+        except Exception as e:
+            print(f"[Upstox] intraday fetch error: {e}")
+            return pd.DataFrame()
+
+    def _parse_candles(self, candles: list) -> pd.DataFrame:
+        """Shared parsing for both historical and intraday candle payloads."""
         if not candles:
             return pd.DataFrame()
 
-        # Upstox candle format:
-        # [timestamp, open, high, low, close, volume, oi]
+        # Upstox candle format: [timestamp, open, high, low, close, volume, oi]
         df = pd.DataFrame(candles, columns=[
             "Datetime", "Open", "High", "Low", "Close", "Volume", "OI"
         ])
