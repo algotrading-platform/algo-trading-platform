@@ -59,11 +59,14 @@ def _trend_arrow(trend: str) -> str:
     return "→"
 
 
-# ── Data freshness guard ─────────────────────────────────────
-# Approx minutes per timeframe. Used to reject stale candles so we
-# never generate a signal/price/RSI off an out-of-date candle (the
-# root of the "price/RSI doesn't match TradingView" reports, which
-# happen when a stale fallback source returns an old last candle).
+# ── Data freshness guard (CURRENTLY DISABLED) ────────────────
+# This over-fired in production (11:41 IST it skipped ~the whole
+# universe -> zero signals) due to a timezone-frame mismatch when
+# computing candle age. Kept here for a corrected reimplementation:
+# the fix is to compare candle time and 'now' in the SAME tz frame
+# (both UTC), account for label="left" resampling (a just-closed 1h
+# candle is labeled up to 1h earlier), and TEST against live candle
+# timestamps before re-enabling. Not called anywhere right now.
 _INTERVAL_MINUTES = {
     "5m": 5, "15m": 15, "30m": 30, "1h": 60, "60m": 60,
     "1d": 1440, "1day": 1440, "1wk": 10080, "1mo": 43200,
@@ -261,11 +264,10 @@ class StrategyEngine:
                 if df is None or df.empty or len(df) < 20:
                     return None
 
-                # Skip stale intraday candles (prevents wrong price/RSI vs
-                # live charts when a fallback source returns an old candle).
-                if _is_stale(df, interval):
-                    log.warning(f"{symbol}: stale {interval} candle — skipping")
-                    return None
+                # NOTE: a data-freshness guard was tried here but over-fired
+                # (timezone-frame mismatch made every candle look ~5.5h stale,
+                # skipping the whole universe -> zero signals). Removed until it
+                # can be reimplemented with correct tz handling and tested.
 
                 df_with_rsi = add_rsi(df.copy())
                 df_with_rsi.dropna(subset=["RSI"], inplace=True)
@@ -470,10 +472,7 @@ class StrategyEngine:
                 if df is None or df.empty or len(df) < 20:
                     return []
 
-                # Skip stale intraday candles (see _is_stale).
-                if _is_stale(df, interval):
-                    log.warning(f"{symbol}: stale {interval} candle — skipping")
-                    return []
+                # NOTE: freshness guard removed here too (see multi-scan note).
 
                 # Real data source for the truthful Telegram tag (✅/⚠)
                 data_source = "yfinance"
