@@ -141,12 +141,14 @@ def get_active_futures_contract(
     # L1: in-memory cache
     if symbol in _futures_cache:
         cached = _futures_cache[symbol]
-        if cached.get("date") == today:
+        if cached.get("date") == today and cached.get("instrument_key"):
             return cached
 
-    # L2: PostgreSQL cache
+    # L2: PostgreSQL cache — only trust it if it's from TODAY and has a
+    # real instrument_key (guards against stale/partial entries left by
+    # the old broken search from masking a good fresh fetch).
     db_cached = _load_futures_from_db(symbol)
-    if db_cached:
+    if db_cached and db_cached.get("date") == today and db_cached.get("instrument_key"):
         _futures_cache[symbol] = db_cached
         return db_cached
 
@@ -158,13 +160,14 @@ def get_active_futures_contract(
     try:
         url     = f"{base_url}/instruments/search"
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-        params  = {"q": search_name, "asset_type": "FO"}
+        # Upstox expects the parameter named 'query' (NOT 'q' — 'q' returns HTTP 400).
+        params  = {"query": search_name, "asset_type": "FO"}
 
         response = requests.get(
             url,
             headers=headers,
             params=params,
-            timeout=8,  # FIXED: 8 second timeout (was no timeout = hangs forever)
+            timeout=8,
         )
 
         if response.status_code == 429:
@@ -179,26 +182,37 @@ def get_active_futures_contract(
         instruments = data.get("data", [])
 
         if not instruments:
+            log.warning(f"Futures search returned no instruments for {symbol}")
             return None
 
+        # Filter to the FUTURES contract(s) for THIS underlying.
+        # Correct Upstox response field names (this is what was broken):
+        #   - instrument_type == "FUT"      (excludes EQ / CE / PE options)
+        #   - underlying_symbol == name     (exact match, not a substring)
+        #   - trading_symbol / lot_size      (note: underscores)
         nse_futures = [
             inst for inst in instruments
-            if inst.get("exchange", "").upper() == "NSE"
-            and inst.get("instrument_type", "").upper() in ("FUT", "FO")
-            and search_name.upper() in inst.get("tradingsymbol", "").upper()
+            if str(inst.get("instrument_type", "")).upper() == "FUT"
+            and str(inst.get("underlying_symbol", "")).upper() == search_name.upper()
         ]
 
         if not nse_futures:
+            log.warning(
+                f"No FUT contract matched underlying '{search_name}' for {symbol}"
+            )
             return None
 
+        # Front-month = nearest expiry
         nse_futures.sort(key=lambda x: x.get("expiry", "9999-99-99"))
         active = nse_futures[0]
 
+        # Store with the key names the rest of this module already expects
+        # (tradingsymbol / lot_size / expiry / instrument_key).
         result = {
             "instrument_key": active.get("instrument_key", ""),
             "expiry":         active.get("expiry", ""),
-            "tradingsymbol":  active.get("tradingsymbol", ""),
-            "lot_size":       active.get("lot_size", get_lot_size(symbol)),
+            "tradingsymbol":  active.get("trading_symbol", ""),
+            "lot_size":       active.get("lot_size") or get_lot_size(symbol),
             "date":           today,
         }
 
