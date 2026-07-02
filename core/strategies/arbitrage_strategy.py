@@ -373,8 +373,17 @@ class ArbitrageStrategy(BaseStrategy):
         lot_size      = contract.get("lot_size", get_lot_size(symbol))
 
         gross_profit   = round(spread_abs * lot_size, 2)
-        brokerage_est  = round(lot_size * 3.5, 2)
-        net_profit     = round(gross_profit - brokerage_est, 2)
+
+        # Cost model: ~0.3% of position turnover (brokerage + STT + exchange
+        # fees + GST + stamp duty, round-trip), per Jwala's transcript figure.
+        # NOTE: the old model used lot_size * 3.5 (₹3.5/share), which invented
+        # huge fake costs on large lots (e.g. GAIL 3500-share lot => ₹12,250
+        # "cost", turning a real profit into a fake net loss). Turnover-based
+        # cost is realistic and scales correctly with position size.
+        COST_PCT       = 0.003  # 0.3% of turnover, round-trip
+        turnover       = spot_price * lot_size
+        cost_est       = round(turnover * COST_PCT, 2)
+        net_profit     = round(gross_profit - cost_est, 2)
         annualised_pct = round((spread_pct / max(days_to_exp, 1)) * 365, 1)
 
         indicators = {
