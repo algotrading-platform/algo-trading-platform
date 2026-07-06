@@ -41,6 +41,49 @@ from core.backtesting.backtest_store import write_result
 log = logging.getLogger("strategy_engine")
 IST = pytz.timezone("Asia/Kolkata")
 
+# ── Paper trading integration (lazy singleton) ───────────────
+_paper_trader = None
+
+def _get_paper_trader(provider):
+    """Lazily create one shared PaperTrader. Returns None if unavailable
+    (e.g. sandbox token not set) so signal generation is never affected."""
+    global _paper_trader
+    if _paper_trader is None:
+        try:
+            from core.execution.paper_trader import PaperTrader
+            _paper_trader = PaperTrader(provider=provider)
+        except Exception as e:
+            log.warning(f"PaperTrader unavailable — paper trading disabled: {e}")
+            _paper_trader = False  # sentinel: tried and failed
+    return _paper_trader or None
+
+def _run_paper_trading(provider, results):
+    """Open positions for newly-alerted BUY/SELL signals. Called once per
+    scan, single-threaded, after the scan's thread pool has joined."""
+    pt = _get_paper_trader(provider)
+    if pt is None:
+        return
+    for r in (results or []):
+        # Only act on signals that just ALERTED (a real transition),
+        # matching what we send to Telegram. Skip HOLD / repeats.
+        if not r.get("alerted"):
+            continue
+        if r.get("signal") not in ("BUY", "SELL"):
+            continue
+        try:
+            outcome = pt.on_signal(
+                symbol=r["symbol"],
+                side=r["signal"],
+                price=r["price"],
+                strategy=r["strategy"],
+                timeframe=r.get("timeframe", ""),
+            )
+            if outcome.get("action") == "opened":
+                log.info(f"PAPER OPEN  {r['symbol']}  {r['signal']}  "
+                         f"qty={outcome['quantity']}  @ {outcome['entry']}")
+        except Exception as e:
+            log.warning(f"paper on_signal failed for {r.get('symbol')}: {e}")
+
 ARBITRAGE_STRATEGY_NAME = "Cash-Futures Arbitrage"
 NIFTY_SYMBOL = "^NSEI"
 
@@ -568,6 +611,7 @@ class StrategyEngine:
                     out.append({
                         "symbol":      symbol,
                         "strategy":    strat_name,
+                        "timeframe":   tf_name,
                         "signal":      signal,
                         "strength":    result.strength,
                         "reason":      result.reason,
@@ -824,4 +868,16 @@ class StrategyEngine:
             f"MULTI SCAN DONE   {list(strategies.keys())}  {tf_name}  "
             f"{len(instruments)} instruments  {signals} signals  {elapsed}s"
         )
+
+        # ── Paper trading ─────────────────────────────────────────
+        # Feed newly-alerted BUY/SELL signals to the paper trader (equity
+        # only; the trader itself filters non-equity + enforces RMS limits).
+        # Runs here — AFTER the thread pool joins — so it's single-threaded
+        # and safe (RMS is stateful, DB writes must not race). Fully guarded
+        # so a paper-trading error can never break signal generation.
+        try:
+            _run_paper_trading(provider, results)
+        except Exception as e:
+            log.warning(f"paper trading hook error (non-fatal): {e}")
+
         return results

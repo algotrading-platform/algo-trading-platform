@@ -1145,6 +1145,130 @@ if show_idx: render_section(idx_rows, "INDEXES",                    "#9b6dff")
 if show_stk: render_section(stk_rows, "NSE STOCKS — F&O WATCHLIST", "#4a90e2")
 if show_com: render_section(com_rows, "COMMODITIES — MCX",          "#f7a800")
 
+#============================================================
+#PAPER TRADING DASHBOARD SECTION
+#============================================================
+# ============================================================
+# PAPER TRADING DASHBOARD SECTION
+#
+# Paste this function into app/dashboard/dashboard.py (near the other
+# render functions), then call render_paper_trading() where you want it
+# to appear — e.g. right after the SIGNAL HISTORY section.
+#
+# Uses the paper-trading db functions and your existing CSS variables,
+# so it themes with dark/light mode automatically.
+# ============================================================
+
+def render_paper_trading():
+    from core.database.db import (
+        get_open_paper_positions,
+        get_closed_paper_positions,
+        get_paper_pnl_summary,
+    )
+
+    st.markdown("""
+    <div class="sec-hdr" style='margin-top:30px;'>
+        <div style='width:7px;height:7px;border-radius:50%;background:var(--purple);flex-shrink:0;'></div>
+        <span class="sec-title">Paper Trading — Simulated Portfolio</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    summary = get_paper_pnl_summary(days=30)
+
+    # ── Scorecard KPIs ──
+    p1, p2, p3, p4, p5 = st.columns(5)
+    pnl_val = summary["total_pnl"]
+    p1.metric("Open Positions", summary["open_count"])
+    p2.metric("Closed Trades",  summary["trades"])
+    p3.metric("Realized P&L",   f"₹{pnl_val:,.0f}",
+              delta=f"{'+' if pnl_val>=0 else ''}{pnl_val:,.0f}" if summary["trades"] else None,
+              delta_color="normal" if pnl_val >= 0 else "inverse")
+    p4.metric("Win Rate",       f"{summary['win_rate']}%")
+    p5.metric("Wins / Losses",  f"{summary['wins']} / {summary['losses']}")
+
+    st.markdown("<div style='margin:20px 0 8px;'></div>", unsafe_allow_html=True)
+
+    # ── Open positions ──
+    st.markdown('<div style="font-size:12px;font-weight:700;color:var(--t2);text-transform:uppercase;letter-spacing:2px;margin:10px 0 8px;">Open Positions</div>', unsafe_allow_html=True)
+    open_df = get_open_paper_positions()
+    if open_df is None or open_df.empty:
+        st.markdown('<div class="no-sig">No open positions</div>', unsafe_allow_html=True)
+    else:
+        rows_html = ""
+        for _, r in open_df.iterrows():
+            side_c = "var(--green)" if r["side"] == "BUY" else "var(--red)"
+            try:
+                opened = pd.to_datetime(r["opened_at"], utc=True).tz_convert(IST).strftime("%d-%b %H:%M")
+            except Exception:
+                opened = str(r.get("opened_at", ""))[:16]
+            rows_html += f"""
+            <tr style='border-bottom:1px solid var(--border);'>
+                <td style='padding:8px 12px;font-size:13px;color:var(--t1);font-weight:600;'>{stock_display(r['symbol'])}</td>
+                <td style='padding:8px 12px;'><span style='color:{side_c};font-weight:700;font-family:JetBrains Mono,monospace;'>{r['side']}</span></td>
+                <td style='padding:8px 12px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>{int(r['quantity'])}</td>
+                <td style='padding:8px 12px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>₹{float(r['entry_price']):,.2f}</td>
+                <td style='padding:8px 12px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--red);'>₹{float(r['stop_loss']):,.2f}</td>
+                <td style='padding:8px 12px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--green);'>₹{float(r['target']):,.2f}</td>
+                <td style='padding:8px 12px;font-size:11px;color:var(--t3);'>{r['strategy']}</td>
+                <td style='padding:8px 12px;font-size:11px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{opened}</td>
+            </tr>"""
+        st.markdown(f"""
+<div style='overflow-x:auto;border:1px solid var(--border);border-radius:8px;background:var(--card);'>
+<table style='width:100%;border-collapse:collapse;'>
+    <thead><tr style='border-bottom:2px solid var(--border2);background:var(--card2);'>
+        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Stock</th>
+        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Side</th>
+        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Qty</th>
+        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Entry</th>
+        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Stop</th>
+        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Target</th>
+        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Strategy</th>
+        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Opened</th>
+    </tr></thead>
+    <tbody>{rows_html}</tbody>
+</table></div>
+""", unsafe_allow_html=True)
+
+    # ── Closed trades ──
+    st.markdown('<div style="font-size:12px;font-weight:700;color:var(--t2);text-transform:uppercase;letter-spacing:2px;margin:22px 0 8px;">Closed Trades — Last 30 Days</div>', unsafe_allow_html=True)
+    closed_df = get_closed_paper_positions(days=30)
+    if closed_df is None or closed_df.empty:
+        st.markdown('<div class="no-sig">No closed trades yet</div>', unsafe_allow_html=True)
+    else:
+        rows_html = ""
+        for _, r in closed_df.iterrows():
+            pnl = float(r.get("pnl", 0) or 0)
+            pnl_c = "var(--green)" if pnl >= 0 else "var(--red)"
+            side_c = "var(--green)" if r["side"] == "BUY" else "var(--red)"
+            try:
+                closed = pd.to_datetime(r["closed_at"], utc=True).tz_convert(IST).strftime("%d-%b %H:%M")
+            except Exception:
+                closed = str(r.get("closed_at", ""))[:16]
+            rows_html += f"""
+            <tr style='border-bottom:1px solid var(--border);'>
+                <td style='padding:8px 12px;font-size:13px;color:var(--t1);font-weight:600;'>{stock_display(r['symbol'])}</td>
+                <td style='padding:8px 12px;'><span style='color:{side_c};font-weight:700;font-family:JetBrains Mono,monospace;'>{r['side']}</span></td>
+                <td style='padding:8px 12px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>₹{float(r['entry_price']):,.2f}</td>
+                <td style='padding:8px 12px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>₹{float(r['exit_price']):,.2f}</td>
+                <td style='padding:8px 12px;font-family:JetBrains Mono,monospace;font-size:12px;color:{pnl_c};font-weight:700;'>{'+' if pnl>=0 else ''}₹{pnl:,.0f}</td>
+                <td style='padding:8px 12px;font-size:11px;color:var(--t3);'>{r.get('exit_reason','')}</td>
+                <td style='padding:8px 12px;font-size:11px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{closed}</td>
+            </tr>"""
+        st.markdown(f"""
+<div style='overflow-x:auto;border:1px solid var(--border);border-radius:8px;background:var(--card);'>
+<table style='width:100%;border-collapse:collapse;'>
+    <thead><tr style='border-bottom:2px solid var(--border2);background:var(--card2);'>
+        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Stock</th>
+        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Side</th>
+        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Entry</th>
+        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Exit</th>
+        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>P&L</th>
+        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Exit</th>
+        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Closed</th>
+    </tr></thead>
+    <tbody>{rows_html}</tbody>
+</table></div>
+""", unsafe_allow_html=True)
 
 # ============================================================
 # SIGNAL HISTORY

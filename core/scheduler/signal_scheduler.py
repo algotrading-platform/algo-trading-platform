@@ -146,6 +146,24 @@ PARALLEL_STRATEGIES = ["RSI Reversal", "Volume Spike"]
 # here is cosmetic — run_multi_scan() takes the real strategy list.
 _multi_engine = StrategyEngine("RSI Reversal")
 
+# ── Paper trading: one shared monitor instance ───────────────
+# Opening positions is handled inside the engine (run_multi_scan);
+# here we only MONITOR open positions once per scan cycle to close
+# them on stop-loss / target. Lazy + guarded so it can never break
+# a scan. Shares the same provider the scheduler already built.
+_paper_monitor = None
+
+def _get_paper_monitor():
+    global _paper_monitor
+    if _paper_monitor is None:
+        try:
+            from core.execution.paper_trader import PaperTrader
+            _paper_monitor = PaperTrader(provider=provider)
+        except Exception as e:
+            log.warning(f"PaperTrader monitor unavailable — disabled: {e}")
+            _paper_monitor = False
+    return _paper_monitor or None
+
 # Primary strategy engine — recreated when strategy changes
 # (kept for backward compatibility / single-strategy callers)
 _current_strategy  = None
@@ -271,6 +289,18 @@ def run_scan(tf_name: str, mode: str = "all") -> None:
     """
     run_primary_scan(tf_name)
     run_arbitrage_scan(tf_name)  # Only runs on 15 Minutes — no-op for other timeframes
+
+    # Paper trading: close any open positions that hit stop/target.
+    # Once per scan cycle, single-threaded, fully guarded.
+    try:
+        pm = _get_paper_monitor()
+        if pm is not None:
+            closed = pm.monitor_open()
+            for c in (closed or []):
+                log.info(f"PAPER CLOSE  {c['symbol']}  {c['reason']}  "
+                         f"exit={c['exit']}  pnl={c['pnl']}")
+    except Exception as e:
+        log.warning(f"paper monitor error (non-fatal): {e}")
 
     try:
         from core.database.db import set_config

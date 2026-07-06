@@ -540,3 +540,210 @@ def set_config(key: str, value: str) -> bool:
     except Exception as e:
         print(f"[DB] set_config error: {e}")
         return False
+    
+    # ============================================================
+# PAPER TRADING — append these to core/database/db.py
+#
+# Matches the existing db.py patterns exactly:
+#   - _get_cursor() context manager
+#   - RealDictCursor rows
+#   - server-side NOW() for timestamps (timestamptz)
+#   - returns bool / DataFrame / dict like the rest of the module
+#
+# Requires the paper_positions table — see migration_paper_trading.sql
+# ============================================================
+
+
+def open_paper_position(
+    symbol:      str,
+    side:        str,
+    quantity:    int,
+    entry_price: float,
+    stop_loss:   float,
+    target:      float,
+    strategy:    str,
+    timeframe:   str,
+    risk_amount: float = 0.0,
+    order_id:    str   = "",
+) -> bool:
+    """Insert a new OPEN paper position. Returns True on success."""
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                INSERT INTO paper_positions
+                    (symbol, side, quantity, entry_price, stop_loss, target,
+                     strategy, timeframe, risk_amount, order_id,
+                     status, opened_at)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN', NOW())
+            """, (
+                symbol, side, int(quantity),
+                round(float(entry_price), 2),
+                round(float(stop_loss),   2),
+                round(float(target),      2),
+                strategy, timeframe,
+                round(float(risk_amount), 2),
+                order_id,
+            ))
+        return True
+    except Exception as e:
+        print(f"[DB] open_paper_position error: {e}")
+        return False
+
+
+def close_paper_position(
+    position_id: int,
+    exit_price:  float,
+    exit_reason: str = "signal",
+) -> bool:
+    """
+    Close an OPEN position: set exit price/time, compute realized P&L.
+    P&L = (exit-entry)*qty for BUY, (entry-exit)*qty for SELL.
+    Returns True on success.
+    """
+    try:
+        with _get_cursor() as cur:
+            # fetch the open position
+            cur.execute("""
+                SELECT side, quantity, entry_price
+                FROM paper_positions
+                WHERE id = %s AND status = 'OPEN'
+                LIMIT 1
+            """, (position_id,))
+            row = cur.fetchone()
+            if not row:
+                return False
+
+            qty   = int(row["quantity"])
+            entry = float(row["entry_price"])
+            exitp = round(float(exit_price), 2)
+
+            if row["side"] == "BUY":
+                pnl = (exitp - entry) * qty
+            else:  # SELL (short)
+                pnl = (entry - exitp) * qty
+
+            cur.execute("""
+                UPDATE paper_positions
+                SET status      = 'CLOSED',
+                    exit_price  = %s,
+                    exit_reason = %s,
+                    pnl         = %s,
+                    closed_at   = NOW()
+                WHERE id = %s
+            """, (exitp, exit_reason, round(pnl, 2), position_id))
+        return True
+    except Exception as e:
+        print(f"[DB] close_paper_position error: {e}")
+        return False
+
+
+def get_open_paper_positions(symbol: str = None) -> pd.DataFrame:
+    """Return OPEN positions (optionally for one symbol), newest first."""
+    try:
+        with _get_cursor() as cur:
+            if symbol:
+                cur.execute("""
+                    SELECT * FROM paper_positions
+                    WHERE status = 'OPEN' AND symbol = %s
+                    ORDER BY opened_at DESC
+                """, (symbol,))
+            else:
+                cur.execute("""
+                    SELECT * FROM paper_positions
+                    WHERE status = 'OPEN'
+                    ORDER BY opened_at DESC
+                """)
+            rows = cur.fetchall()
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame([dict(r) for r in rows])
+    except Exception as e:
+        print(f"[DB] get_open_paper_positions error: {e}")
+        return pd.DataFrame()
+
+
+def get_closed_paper_positions(days: int = 30) -> pd.DataFrame:
+    """Return CLOSED positions from the last N days, newest first."""
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        with _get_cursor() as cur:
+            cur.execute("""
+                SELECT * FROM paper_positions
+                WHERE status = 'CLOSED' AND closed_at >= %s
+                ORDER BY closed_at DESC
+            """, (cutoff,))
+            rows = cur.fetchall()
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame([dict(r) for r in rows])
+    except Exception as e:
+        print(f"[DB] get_closed_paper_positions error: {e}")
+        return pd.DataFrame()
+
+
+def count_open_paper_positions() -> int:
+    """How many positions are currently OPEN (for the max-concurrent cap)."""
+    try:
+        with _get_cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM paper_positions WHERE status = 'OPEN'")
+            row = cur.fetchone()
+        return int(row["n"]) if row else 0
+    except Exception as e:
+        print(f"[DB] count_open_paper_positions error: {e}")
+        return 0
+
+
+def is_paper_position_open(symbol: str) -> bool:
+    """True if there is an OPEN position for this symbol (idempotency check)."""
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                SELECT 1 FROM paper_positions
+                WHERE status = 'OPEN' AND symbol = %s
+                LIMIT 1
+            """, (symbol,))
+            return cur.fetchone() is not None
+    except Exception as e:
+        print(f"[DB] is_paper_position_open error: {e}")
+        return False
+
+
+def get_paper_pnl_summary(days: int = 30) -> dict:
+    """
+    Scorecard: totals over CLOSED positions in the last N days.
+    Returns dict with total_pnl, trades, wins, losses, win_rate, open_count.
+    """
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        with _get_cursor() as cur:
+            cur.execute("""
+                SELECT
+                    COUNT(*)                                   AS trades,
+                    COALESCE(SUM(pnl), 0)                       AS total_pnl,
+                    COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
+                    COALESCE(SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), 0) AS losses
+                FROM paper_positions
+                WHERE status = 'CLOSED' AND closed_at >= %s
+            """, (cutoff,))
+            row = cur.fetchone() or {}
+            cur.execute("SELECT COUNT(*) AS n FROM paper_positions WHERE status = 'OPEN'")
+            open_row = cur.fetchone() or {"n": 0}
+
+        trades = int(row.get("trades", 0) or 0)
+        wins   = int(row.get("wins", 0) or 0)
+        losses = int(row.get("losses", 0) or 0)
+        win_rate = round((wins / trades * 100), 1) if trades else 0.0
+
+        return {
+            "total_pnl":  round(float(row.get("total_pnl", 0) or 0), 2),
+            "trades":     trades,
+            "wins":       wins,
+            "losses":     losses,
+            "win_rate":   win_rate,
+            "open_count": int(open_row.get("n", 0) or 0),
+        }
+    except Exception as e:
+        print(f"[DB] get_paper_pnl_summary error: {e}")
+        return {"total_pnl": 0.0, "trades": 0, "wins": 0, "losses": 0,
+                "win_rate": 0.0, "open_count": 0}
