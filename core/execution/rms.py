@@ -31,7 +31,7 @@ class RMSConfig:
     CAPITAL              = 1_000_000.0   # ₹10L simulated capital
     RISK_PCT_PER_TRADE   = 0.01          # 1% of capital risked per trade
     STOP_LOSS_PCT        = 0.015         # 1.5% stop from entry
-    RISK_REWARD          = 2.0           # target = 2× the stop distance
+    RISK_REWARD          = 1.2           # target = 1.2× the stop distance (per Jwala, reduced from 2.0)
     DAILY_MAX_LOSS_PCT   = 0.03          # stop trading after -3% in a day
     MAX_POSITION_PCT     = 0.20          # no single position > 20% of capital
     MIN_QUANTITY         = 1             # need at least 1 share to trade

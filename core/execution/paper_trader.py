@@ -67,6 +67,23 @@ class PaperTrader:
         if not _is_equity(symbol):
             return {"action": "skip", "reason": f"{symbol} not equity — not paper-traded"}
 
+        # ── SELL = exit an existing long (reversal exit) ──────────
+        # Long-only cash-equity model: a SELL reversal signal CLOSES an
+        # open long for this symbol. If we hold nothing, do nothing —
+        # we never open shorts. (Target/stop exits are handled
+        # separately in monitor_open, so a position exits on whichever
+        # comes first: the target/stop OR an opposite reversal signal.)
+        if side == "SELL":
+            if db.is_paper_position_open(symbol):
+                closed = self.close_by_symbol(symbol, price, reason="reversal")
+                if closed:
+                    return {"action": "closed", "symbol": symbol,
+                            "reason": "reversal", "exit": price}
+                return {"action": "error", "reason": f"failed to close {symbol} on reversal"}
+            return {"action": "skip", "reason": f"SELL for {symbol} but no open long — no short opened"}
+
+        # ── BUY = open a long (below) ─────────────────────────────
+
         # Concurrency cap
         if db.count_open_paper_positions() >= MAX_OPEN_POSITIONS:
             return {"action": "reject", "reason": f"max {MAX_OPEN_POSITIONS} open positions"}
