@@ -124,6 +124,14 @@ class OrderManager:
         # 5. LIMIT price = entry price (safety: never a bare market order)
         limit_price = round(float(decision.entry_price), 2)
 
+        # 6. Product type — realistic constraint (Jwala Jul 8: "let's add
+        # both buying and selling"). Cash-equity SELL-to-open (a short)
+        # cannot be a delivery ("D") order on NSE — it must be intraday
+        # ("I") and squared off same-day. BUY (long) stays delivery.
+        # PaperTrader.monitor_open() enforces the matching square-off by
+        # ~15:15 IST so the paper track record stays realistic.
+        product = "I" if side == "SELL" else "D"
+
         # Record the key so a re-fire is blocked
         self._placed_keys.add(key)
 
@@ -134,7 +142,7 @@ class OrderManager:
             quantity=qty,
             order_type="LIMIT",
             price=limit_price,
-            product="D",
+            product=product,
             stop_loss=decision.stop_loss,
             target=decision.target,
             idempotency_key=key,

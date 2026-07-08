@@ -5,16 +5,45 @@
 #
 #   Signal → RMS → Order Manager → Sandbox → Position Tracker (DB)
 #
+# SYMMETRIC BUY/SELL (Jwala Jul 8: "let's add both buying and
+# selling... let us see how it works"). Each symbol holds at most
+# ONE position at a time — flat, LONG, or SHORT:
+#
+#   flat + BUY  -> opens a LONG        flat + SELL -> opens a SHORT
+#   LONG + SELL -> closes (reversal)   SHORT + BUY -> closes (reversal)
+#   LONG + BUY  -> skip (no re-entry)  SHORT + SELL-> skip (no re-entry)
+#
+# Stop/target math is mirrored for shorts (handled in rms.py, already
+# symmetric) and monitor_open() checks both directions.
+#
+# REALISTIC CONSTRAINT: cash-equity shorts can't carry overnight, so
+# any open SHORT is force-closed at SQUARE_OFF_TIME regardless of
+# stop/target (reason "square_off"). Longs are unaffected.
+#
 # Two entry points:
-#   on_signal(...)  — a BUY/SELL fired; open a paper position if RMS
-#                     approves, Order Manager validates, sandbox accepts.
+#   on_signal(...)  — a BUY/SELL fired; open/close per the table above.
 #   monitor_open()  — check open positions against current price; close
-#                     on opposite exit (stop/target) and record P&L.
+#                     on stop/target/square-off and record P&L.
+#
+# Manual controls (Jwala Jul 8 — dashboard buttons):
+#   close_manual(...) — book P&L now regardless of stop/target.
+#   update_stop(...)  — move the stop (e.g. to breakeven) by hand.
+#   These act directly via db.py (no RMS/order-manager involvement —
+#   there's no new order being placed). NOTE: the RMS daily-loss kill
+#   switch tracks realized P&L in-memory in the SCHEDULER process only;
+#   manual closes issued from the dashboard (a separate process) won't
+#   feed into that counter in real time. Doesn't affect correctness of
+#   the manual action itself, but is worth fixing later (e.g. compute
+#   daily P&L from the DB each scan instead of an in-memory counter)
+#   if the kill switch needs to see manual closes immediately.
 #
 # EQUITY-first. Indexes/commodities are skipped (not equity-tradeable).
 # ============================================================
 
 import logging
+from datetime import datetime, time as dtime
+
+import pytz
 
 from core.execution.rms import RMS, RMSConfig
 from core.execution.order_manager import OrderManager
@@ -23,8 +52,20 @@ from core.database import db
 
 log = logging.getLogger("paper_trader")
 
+IST = pytz.timezone("Asia/Kolkata")
+
 # Max concurrent open paper positions (per earlier decision).
 MAX_OPEN_POSITIONS = 15
+
+# Cash-equity shorts cannot carry overnight — force-close any open
+# SHORT once this IST time is reached, regardless of stop/target.
+# (Jwala confirmed "realistic expectations" — Jul 8.) Set a few
+# minutes ahead of the 15:30 close so it lands on a real scan cycle.
+SQUARE_OFF_TIME = dtime(15, 15)
+
+
+def _past_square_off_time() -> bool:
+    return datetime.now(IST).time() >= SQUARE_OFF_TIME
 
 # Only equities are paper-traded. Skip index/commodity symbols.
 def _is_equity(symbol: str) -> bool:
@@ -59,7 +100,10 @@ class PaperTrader:
     ) -> dict:
         """
         Full pipeline for one signal. Returns a result dict describing
-        what happened (opened / rejected / error), for logging/alerting.
+        what happened (opened / closed / rejected / error), for
+        logging/alerting.
+
+        Symmetric BUY/SELL — see module docstring for the state table.
         """
         if side not in ("BUY", "SELL"):
             return {"action": "skip", "reason": f"non-tradeable signal {side}"}
@@ -67,28 +111,34 @@ class PaperTrader:
         if not _is_equity(symbol):
             return {"action": "skip", "reason": f"{symbol} not equity — not paper-traded"}
 
-        # ── SELL = exit an existing long (reversal exit) ──────────
-        # Long-only cash-equity model: a SELL reversal signal CLOSES an
-        # open long for this symbol. If we hold nothing, do nothing —
-        # we never open shorts. (Target/stop exits are handled
-        # separately in monitor_open, so a position exits on whichever
-        # comes first: the target/stop OR an opposite reversal signal.)
-        if side == "SELL":
-            if db.is_paper_position_open(symbol):
+        # ── What (if anything) is currently open for this symbol? ──
+        existing = db.get_open_position(symbol)
+
+        if existing is not None:
+            held_side = existing["side"]
+
+            # Opposite signal to what's held = reversal exit.
+            if held_side != side:
                 closed = self.close_by_symbol(symbol, price, reason="reversal")
                 if closed:
                     return {"action": "closed", "symbol": symbol,
                             "reason": "reversal", "exit": price}
                 return {"action": "error", "reason": f"failed to close {symbol} on reversal"}
-            return {"action": "skip", "reason": f"SELL for {symbol} but no open long — no short opened"}
 
-        # ── BUY = open a long (below) ─────────────────────────────
+            # Same-direction signal while already holding that
+            # direction — no duplicate entry, no action.
+            return {"action": "skip",
+                    "reason": f"{side} for {symbol} but already {held_side} — no re-entry"}
 
-        # Concurrency cap
+        # ── Flat: BUY opens a LONG, SELL opens a SHORT ─────────────
+
+        # Concurrency cap (applies across longs + shorts combined).
         if db.count_open_paper_positions() >= MAX_OPEN_POSITIONS:
             return {"action": "reject", "reason": f"max {MAX_OPEN_POSITIONS} open positions"}
 
-        # 1. RMS
+        # 1. RMS — evaluate() is already symmetric: for SELL it sizes
+        # and mirrors stop/target for a short (stop above entry,
+        # target below). No change needed there.
         decision = self.rms.evaluate(symbol, side, price)
         if not decision.approved:
             return {"action": "reject", "reason": f"RMS: {decision.reason}"}
@@ -141,8 +191,12 @@ class PaperTrader:
     # --------------------------------------------------------
     def monitor_open(self) -> list[dict]:
         """
-        For each open position, fetch current price and close it if the
-        stop-loss or target has been hit. Returns list of close events.
+        For each open position, fetch current price and close it if:
+          - a SHORT and we're past SQUARE_OFF_TIME (forced, realistic
+            constraint — checked FIRST, ahead of stop/target), or
+          - the stop-loss or target has been hit (direction-aware —
+            a short's stop is above entry, target below).
+        Returns list of close events.
         (Exit-on-opposite-signal is handled via on_signal + close_by_symbol.)
         """
         closed = []
@@ -150,22 +204,44 @@ class PaperTrader:
         if open_df is None or open_df.empty:
             return closed
 
+        square_off_now = _past_square_off_time()
+
         for _, pos in open_df.iterrows():
             symbol = pos["symbol"]
-            price  = self._current_price(symbol)
+            side   = pos["side"]
+            pid    = int(pos["id"])
+
+            # ── Forced square-off: cash-equity shorts can't carry
+            # overnight. Close any open SHORT once the square-off
+            # window starts, regardless of stop/target. Longs are
+            # unaffected — this check only applies to SELL positions.
+            if side == "SELL" and square_off_now:
+                price = self._current_price(symbol)
+                if price is None:
+                    continue
+                if db.close_paper_position(pid, price, exit_reason="square_off"):
+                    qty   = int(pos["quantity"])
+                    entry = float(pos["entry_price"])
+                    pnl   = (entry - price) * qty
+                    self.rms.record_realized_pnl(pnl)
+                    closed.append({
+                        "symbol": symbol, "reason": "square_off",
+                        "exit": price, "pnl": round(pnl, 2),
+                    })
+                continue  # already resolved — skip the stop/target check below
+
+            price = self._current_price(symbol)
             if price is None:
                 continue
 
-            side   = pos["side"]
             stop   = float(pos["stop_loss"])
             target = float(pos["target"])
-            pid    = int(pos["id"])
 
             hit = None
             if side == "BUY":
                 if price <= stop:   hit = "stop"
                 elif price >= target: hit = "target"
-            else:  # SELL
+            else:  # SELL (short) — mirrored: stop above, target below
                 if price >= stop:   hit = "stop"
                 elif price <= target: hit = "target"
 
@@ -181,6 +257,51 @@ class PaperTrader:
                         "exit": price, "pnl": round(pnl, 2),
                     })
         return closed
+
+    # --------------------------------------------------------
+    # MANUAL CONTROLS — dashboard buttons (Jwala Jul 8)
+    # --------------------------------------------------------
+    def close_manual(self, position_id: int, price: float) -> dict:
+        """
+        Manual "Close" button — book P&L now regardless of stop/target.
+        Looked up by position id (not symbol) so it targets exactly the
+        row the user clicked, even if — in a future world with re-entry
+        timing edge cases — more than one row could match a symbol.
+        """
+        open_df = db.get_open_paper_positions()
+        if open_df is None or open_df.empty:
+            return {"action": "error", "reason": "no open positions"}
+
+        match = open_df[open_df["id"] == position_id]
+        if match.empty:
+            return {"action": "error", "reason": f"position {position_id} not open"}
+
+        pos = match.iloc[0]
+        ok  = db.close_paper_position(position_id, price, exit_reason="manual")
+        if not ok:
+            return {"action": "error", "reason": "close failed"}
+
+        qty   = int(pos["quantity"])
+        entry = float(pos["entry_price"])
+        side  = pos["side"]
+        pnl   = (price - entry) * qty if side == "BUY" else (entry - price) * qty
+        self.rms.record_realized_pnl(pnl)
+
+        return {"action": "closed", "symbol": pos["symbol"], "reason": "manual",
+                "exit": price, "pnl": round(pnl, 2)}
+
+    def update_stop(self, position_id: int, new_stop: float) -> dict:
+        """
+        Manual "Edit Stop" button — move the stop by hand (e.g. to
+        breakeven once a trade is in profit). Does not touch RMS/order
+        logic — it's a direct DB update, no new order is placed.
+        """
+        ok = db.update_paper_position_stop(position_id, new_stop)
+        if not ok:
+            return {"action": "error",
+                    "reason": f"position {position_id} not open or update failed"}
+        return {"action": "stop_updated", "position_id": position_id,
+                "new_stop": round(float(new_stop), 2)}
 
     def close_by_symbol(self, symbol: str, price: float, reason: str = "signal") -> bool:
         """Close an open position for a symbol (e.g. opposite signal fired)."""

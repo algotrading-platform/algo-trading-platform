@@ -5,6 +5,7 @@
 import sys
 import os
 import json
+import contextlib
 
 _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 sys.path.append(_project_root)
@@ -1005,7 +1006,13 @@ def backtest_summary_bar(rows, period):
 # RENDER SECTION
 # ============================================================
 
-def render_section(rows, title, dot_color="#4a90e2"):
+def render_section(rows, title, dot_color="#4a90e2", scroll_height=None):
+    """
+    scroll_height: if given, the header row + all instrument rows render
+    inside a native Streamlit scrollable container of that pixel height
+    (same "scroll, don't paginate" treatment as Signal History). Used
+    for the F&O watchlist (167 instruments) — Jwala Jul 8.
+    """
     if not rows: return
 
     action    = [r for r in rows if r["signal"] in ("BUY", "SELL")]
@@ -1028,6 +1035,12 @@ def render_section(rows, title, dot_color="#4a90e2"):
 
     action = sorted(action, key=lambda r: str(r.get("ts", "—")), reverse=True)
 
+    _scroll_ctx = st.container(height=scroll_height) if scroll_height else contextlib.nullcontext()
+    with _scroll_ctx:
+        _render_action_rows(action)
+
+
+def _render_action_rows(action):
     # Column headers
     h = st.columns([2.2, 0.7, 0.9, 0.8, 1.2, 1.0, 0.9, 1.2, 0.7])
     for col, lbl in zip(h, ["Instrument", "Signal", "Strength", "RSI",
@@ -1138,39 +1151,47 @@ def render_section(rows, title, dot_color="#4a90e2"):
 
 
 # ============================================================
-# RENDER ALL SECTIONS
-# ============================================================
-
-if show_idx: render_section(idx_rows, "INDEXES",                    "#9b6dff")
-if show_stk: render_section(stk_rows, "NSE STOCKS — F&O WATCHLIST", "#4a90e2")
-if show_com: render_section(com_rows, "COMMODITIES — MCX",          "#f7a800")
-
-#============================================================
-#PAPER TRADING DASHBOARD SECTION
-#============================================================
-# ============================================================
 # PAPER TRADING DASHBOARD SECTION
 #
-# Paste this function into app/dashboard/dashboard.py (near the other
-# render functions), then call render_paper_trading() where you want it
-# to appear — e.g. right after the SIGNAL HISTORY section.
-#
-# Uses the paper-trading db functions and your existing CSS variables,
-# so it themes with dark/light mode automatically.
+# Moved above the raw signal feed per Jwala (Jul 8 call): "can we
+# keep this paper trading part on the top page instead of the
+# signals part... so when I open the dashboard I'd have an idea how
+# paper trading is going." Also adds: capital visibility, symmetric
+# LONG/SHORT display, manual Close + Edit-Stop buttons per position,
+# and Opened/Closed/Duration on closed trades — all per the Jul 8 call.
 # ============================================================
+
+def _fmt_duration(opened_at, closed_at) -> str:
+    """Human duration between two timestamps, e.g. '1h 12m' or '43m'."""
+    try:
+        o = pd.to_datetime(opened_at, utc=True)
+        c = pd.to_datetime(closed_at, utc=True)
+        secs = int((c - o).total_seconds())
+        if secs < 0:
+            return "—"
+        h, rem = divmod(secs, 3600)
+        m = rem // 60
+        return f"{h}h {m}m" if h else f"{m}m"
+    except Exception:
+        return "—"
+
 
 def render_paper_trading():
     from core.database.db import (
         get_open_paper_positions,
         get_closed_paper_positions,
         get_paper_pnl_summary,
+        get_capital_deployed,
+        close_paper_position,
+        update_paper_position_stop,
     )
+    from core.execution.rms import RMSConfig
 
     st.markdown("""
-    <div class="sec-hdr" style='margin-top:30px;'>
+    <div class="sec-hdr" style='margin-top:6px;'>
         <div style='width:7px;height:7px;border-radius:50%;background:var(--purple);flex-shrink:0;'></div>
         <span class="sec-title">Paper Trading — Simulated Portfolio</span>
-        <span class="sec-meta">Upstox Sandbox &nbsp;·&nbsp; RSI Reversal + Volume Spike</span>
+        <span class="sec-meta">Upstox Sandbox &nbsp;·&nbsp; RSI Reversal + Volume Spike &nbsp;·&nbsp; Long + Short</span>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1179,7 +1200,8 @@ def render_paper_trading():
 
     # ── Compute UNREALIZED P&L on open positions (needs live CMP) ──
     # CMP is fetched once per open symbol here in the dashboard (the DB
-    # layer has no price feed). For a BUY, unreal = (cmp-entry)*qty.
+    # layer has no price feed). Direction-aware: LONG profits when
+    # cmp > entry, SHORT profits when cmp < entry.
     cmp_map        = {}
     total_unreal   = 0.0
     open_in_profit = 0
@@ -1222,75 +1244,126 @@ def render_paper_trading():
     p6.metric("Win Rate",       f"{summary['win_rate']}%",
               delta=f"{summary['wins']}W / {summary['losses']}L" if summary["trades"] else None)
 
+    # ── Capital scorecard (Jwala Jul 8: "how much capital... how much
+    # has been consumed in the trades... a column for each trade") ──
+    total_capital = RMSConfig.CAPITAL
+    deployed      = get_capital_deployed()
+    available     = total_capital - deployed
+    deployed_pct  = (deployed / total_capital * 100) if total_capital else 0.0
+
+    st.markdown("<div style='margin:14px 0 4px;'></div>", unsafe_allow_html=True)
+    cc1, cc2, cc3 = st.columns(3)
+    cc1.metric("Total Capital",     f"₹{total_capital:,.0f}")
+    cc2.metric("Capital Deployed",  f"₹{deployed:,.0f}", delta=f"{deployed_pct:.1f}% of total")
+    cc3.metric("Capital Available", f"₹{available:,.0f}")
+
     st.markdown("<div style='margin:20px 0 8px;'></div>", unsafe_allow_html=True)
 
     # ── OPEN POSITIONS ──
-    # Colours (per Jwala): STOP = purple, TARGET = yellow/amber,
-    # green/red reserved strictly for P&L.
+    # Colours (per Jwala): STOP = purple, TARGET = amber, green/red
+    # reserved strictly for P&L. Rendered as real Streamlit rows (not
+    # a raw HTML table) so each row can carry a live "Close" button
+    # and an "Edit Stop" popover (Jwala Jul 8 — manual profit-booking
+    # and manual stop-shift, e.g. to breakeven).
     st.markdown('<div style="font-size:12px;font-weight:700;color:var(--t2);text-transform:uppercase;letter-spacing:2px;margin:10px 0 8px;">Open Positions — Unrealized P&L</div>', unsafe_allow_html=True)
+
     if open_df is None or open_df.empty:
         st.markdown('<div class="no-sig">No open positions</div>', unsafe_allow_html=True)
     else:
-        rows_html = ""
+        widths = [1.5, 0.55, 0.55, 0.85, 1.0, 1.0, 0.85, 0.85, 0.95, 1.35, 0.8, 1.0]
+        h = st.columns(widths)
+        for col, lbl in zip(h, ["Stock", "Side", "Qty", "Entry", "CMP", "Unreal. P&L",
+                                 "Stop", "Target", "Capital", "Strategy", "Opened", "Actions"]):
+            col.markdown(f'<div class="col-hdr">{lbl}</div>', unsafe_allow_html=True)
+
         for _, r in open_df.iterrows():
+            pid    = int(r["id"])
             sym    = r["symbol"]
             side   = r["side"]
             qty    = int(r["quantity"])
             entry  = float(r["entry_price"])
+            stop   = float(r["stop_loss"])
+            target = float(r["target"])
             side_c = "var(--green)" if side == "BUY" else "var(--red)"
+            side_lbl = "LONG" if side == "BUY" else "SHORT"
             cmp    = cmp_map.get(sym)
+            capital_used = entry * qty
 
-            # CMP + unrealized P&L
-            if cmp is not None:
-                u      = (cmp - entry) * qty if side == "BUY" else (entry - cmp) * qty
-                u_c    = "var(--green)" if u >= 0 else "var(--red)"
-                arrow  = "▲" if cmp >= entry else "▼"
-                cmp_html = (f"<span style='color:var(--t1);font-weight:600;'>₹{cmp:,.2f}</span> "
-                            f"<span style='font-size:10px;color:{u_c};'>{arrow}{abs(cmp-entry):,.2f}</span>")
-                pnl_html = f"<span style='color:{u_c};font-weight:700;'>{'+' if u>=0 else '-'}₹{abs(u):,.0f}</span>"
-            else:
-                cmp_html = "<span class='badge-pending'>fetching…</span>"
-                pnl_html = "<span class='badge-pending'>–</span>"
+            c = st.columns(widths)
 
-            try:
-                opened = pd.to_datetime(r["opened_at"], utc=True).tz_convert(IST).strftime("%d-%b %H:%M")
-            except Exception:
-                opened = str(r.get("opened_at", ""))[:16]
+            with c[0]:
+                st.markdown(f"<div style='padding:9px 0;font-size:13px;color:var(--t1);font-weight:600;'>{stock_display(sym)}</div>", unsafe_allow_html=True)
+            with c[1]:
+                st.markdown(f"<div style='padding:9px 0;'><span style='color:{side_c};font-weight:700;font-family:JetBrains Mono,monospace;font-size:11px;'>{side_lbl}</span></div>", unsafe_allow_html=True)
+            with c[2]:
+                st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>{qty}</div>", unsafe_allow_html=True)
+            with c[3]:
+                st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>₹{entry:,.2f}</div>", unsafe_allow_html=True)
 
-            rows_html += f"""
-            <tr style='border-bottom:1px solid var(--border);'>
-                <td style='padding:9px 12px;font-size:13px;color:var(--t1);font-weight:600;'>{stock_display(sym)}</td>
-                <td style='padding:9px 12px;'><span style='color:{side_c};font-weight:700;font-family:JetBrains Mono,monospace;font-size:12px;'>{side}</span></td>
-                <td style='padding:9px 12px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>{qty}</td>
-                <td style='padding:9px 12px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>₹{entry:,.2f}</td>
-                <td style='padding:9px 12px;font-family:JetBrains Mono,monospace;font-size:12px;'>{cmp_html}</td>
-                <td style='padding:9px 12px;font-family:JetBrains Mono,monospace;font-size:12px;'>{pnl_html}</td>
-                <td style='padding:9px 12px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--purple);'>₹{float(r['stop_loss']):,.2f}</td>
-                <td style='padding:9px 12px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--amber);'>₹{float(r['target']):,.2f}</td>
-                <td style='padding:9px 12px;'><span class='strategy-pill'>{r['strategy']}</span></td>
-                <td style='padding:9px 12px;font-size:11px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{opened}</td>
-            </tr>"""
+            with c[4]:
+                if cmp is not None:
+                    u_arrow = "▲" if cmp >= entry else "▼"
+                    u_c     = "var(--green)" if cmp >= entry else "var(--red)"
+                    st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;'>"
+                                f"<span style='color:var(--t1);font-weight:600;'>₹{cmp:,.2f}</span> "
+                                f"<span style='font-size:10px;color:{u_c};'>{u_arrow}{abs(cmp-entry):,.2f}</span></div>", unsafe_allow_html=True)
+                else:
+                    st.markdown("<div style='padding:9px 0;'><span class='badge-pending'>fetching…</span></div>", unsafe_allow_html=True)
 
-        st.markdown(f"""
-<div style='overflow-x:auto;border:1px solid var(--border);border-radius:8px;background:var(--card);'>
-<table style='width:100%;border-collapse:collapse;'>
-    <thead><tr style='border-bottom:2px solid var(--border2);background:var(--card2);'>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Stock</th>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Side</th>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Qty</th>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Entry</th>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>CMP</th>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Unreal. P&L</th>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--purple);text-transform:uppercase;letter-spacing:1px;'>Stop</th>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--amber);text-transform:uppercase;letter-spacing:1px;'>Target</th>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Strategy</th>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Opened</th>
-    </tr></thead>
-    <tbody>{rows_html}</tbody>
-</table></div>
-""", unsafe_allow_html=True)
+            with c[5]:
+                if cmp is not None:
+                    u   = (cmp - entry) * qty if side == "BUY" else (entry - cmp) * qty
+                    u_c = "var(--green)" if u >= 0 else "var(--red)"
+                    st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;'>"
+                                f"<span style='color:{u_c};font-weight:700;'>{'+' if u>=0 else '-'}₹{abs(u):,.0f}</span></div>", unsafe_allow_html=True)
+                else:
+                    st.markdown("<div style='padding:9px 0;'><span class='badge-pending'>–</span></div>", unsafe_allow_html=True)
+
+            with c[6]:
+                st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--purple);'>₹{stop:,.2f}</div>", unsafe_allow_html=True)
+            with c[7]:
+                st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--amber);'>₹{target:,.2f}</div>", unsafe_allow_html=True)
+            with c[8]:
+                st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>₹{capital_used:,.0f}</div>", unsafe_allow_html=True)
+            with c[9]:
+                st.markdown(f"<div style='padding:9px 0;'><span class='strategy-pill'>{r['strategy']} · {r['timeframe']}</span></div>", unsafe_allow_html=True)
+
+            with c[10]:
+                try:
+                    opened = pd.to_datetime(r["opened_at"], utc=True).tz_convert(IST).strftime("%d-%b %H:%M")
+                except Exception:
+                    opened = str(r.get("opened_at", ""))[:16]
+                st.markdown(f"<div style='padding:9px 0;font-size:11px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{opened}</div>", unsafe_allow_html=True)
+
+            with c[11]:
+                bcol, scol = st.columns(2)
+                with bcol:
+                    if st.button("Close", key=f"pt_close_{pid}", help=f"Book P&L now for {stock_display(sym)}"):
+                        exit_px = cmp if cmp is not None else entry
+                        if close_paper_position(pid, exit_px, exit_reason="manual"):
+                            st.rerun()
+                        else:
+                            st.error("Close failed")
+                with scol:
+                    with st.popover("Stop"):
+                        new_stop = st.number_input(
+                            "New stop", value=stop, step=0.05, format="%.2f",
+                            key=f"pt_stop_input_{pid}",
+                        )
+                        if st.button("Update", key=f"pt_stop_btn_{pid}"):
+                            if update_paper_position_stop(pid, new_stop):
+                                st.rerun()
+                            else:
+                                st.error("Update failed")
+
+            st.markdown("<div class='row-div'></div>", unsafe_allow_html=True)
+
+    st.markdown("<div style='margin-bottom:10px;'></div>", unsafe_allow_html=True)
 
     # ── CLOSED TRADES — Realized P&L (paginated, 15 per page) ──
+    # Adds Opened + Duration alongside Closed (Jwala Jul 8: "entry
+    # price and... time that this was the price and at what time we
+    # entered and at what time we exited... a column for the duration").
     st.markdown('<div style="font-size:12px;font-weight:700;color:var(--t2);text-transform:uppercase;letter-spacing:2px;margin:22px 0 8px;">Closed Trades — Realized P&L</div>', unsafe_allow_html=True)
     closed_df = get_closed_paper_positions(days=30)
     if closed_df is None or closed_df.empty:
@@ -1298,39 +1371,48 @@ def render_paper_trading():
     else:
         PAGE = 15
         total = len(closed_df)
-        pages = (total + PAGE - 1) // PAGE
+        pages = max(1, (total + PAGE - 1) // PAGE)
         if "pt_closed_page" not in st.session_state:
             st.session_state.pt_closed_page = 0
-        # clamp (in case data shrank)
         st.session_state.pt_closed_page = max(0, min(st.session_state.pt_closed_page, pages - 1))
         pg = st.session_state.pt_closed_page
 
-        page_df = closed_df.iloc[pg * PAGE:(pg + 1) * PAGE]
+        page_df = closed_df.iloc[pg*PAGE : (pg+1)*PAGE]
 
         rows_html = ""
         for _, r in page_df.iterrows():
-            pnl    = float(r.get("pnl", 0) or 0)
-            pnl_c  = "var(--green)" if pnl >= 0 else "var(--red)"
-            side_c = "var(--green)" if r["side"] == "BUY" else "var(--red)"
-            reason = str(r.get("exit_reason", "") or "")
-            # reason colour: target=amber, stop=purple, reversal/signal=neutral
-            if reason == "target":   rc = "var(--amber)"
-            elif reason == "stop":   rc = "var(--purple)"
-            else:                    rc = "var(--t3)"
+            side     = r["side"]
+            side_c   = "var(--green)" if side == "BUY" else "var(--red)"
+            side_lbl = "LONG" if side == "BUY" else "SHORT"
+            pnl      = float(r["pnl"])
+            pnl_c    = "var(--green)" if pnl >= 0 else "var(--red)"
+            reason   = str(r.get("exit_reason", "")).upper()
+            rc = {"STOP": "var(--red)", "TARGET": "var(--green)",
+                  "REVERSAL": "var(--amber)", "MANUAL": "var(--blue)",
+                  "SQUARE_OFF": "var(--purple)"}.get(reason, "var(--t3)")
+
+            try:
+                opened = pd.to_datetime(r["opened_at"], utc=True).tz_convert(IST).strftime("%d-%b %H:%M")
+            except Exception:
+                opened = str(r.get("opened_at", ""))[:16]
             try:
                 closed = pd.to_datetime(r["closed_at"], utc=True).tz_convert(IST).strftime("%d-%b %H:%M")
             except Exception:
                 closed = str(r.get("closed_at", ""))[:16]
+            duration = _fmt_duration(r.get("opened_at"), r.get("closed_at"))
+
             rows_html += f"""
             <tr style='border-bottom:1px solid var(--border);'>
                 <td style='padding:9px 12px;font-size:13px;color:var(--t1);font-weight:600;'>{stock_display(r['symbol'])}</td>
-                <td style='padding:9px 12px;'><span style='color:{side_c};font-weight:700;font-family:JetBrains Mono,monospace;font-size:12px;'>{r['side']}</span></td>
+                <td style='padding:9px 12px;'><span style='color:{side_c};font-weight:700;font-family:JetBrains Mono,monospace;font-size:12px;'>{side_lbl}</span></td>
                 <td style='padding:9px 12px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>₹{float(r['entry_price']):,.2f}</td>
                 <td style='padding:9px 12px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>₹{float(r['exit_price']):,.2f}</td>
                 <td style='padding:9px 12px;font-family:JetBrains Mono,monospace;font-size:12px;color:{pnl_c};font-weight:700;'>{'+' if pnl>=0 else '-'}₹{abs(pnl):,.0f}</td>
                 <td style='padding:9px 12px;font-size:11px;color:{rc};font-family:JetBrains Mono,monospace;text-transform:uppercase;'>{reason}</td>
-                <td style='padding:9px 12px;font-size:11px;color:var(--t3);'>{r.get('strategy','')}</td>
+                <td style='padding:9px 12px;'><span class='strategy-pill'>{r.get('strategy','')} · {r.get('timeframe','')}</span></td>
+                <td style='padding:9px 12px;font-size:11px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{opened}</td>
                 <td style='padding:9px 12px;font-size:11px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{closed}</td>
+                <td style='padding:9px 12px;font-size:11px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{duration}</td>
             </tr>"""
         st.markdown(f"""
 <div style='overflow-x:auto;border:1px solid var(--border);border-radius:8px;background:var(--card);'>
@@ -1343,7 +1425,9 @@ def render_paper_trading():
         <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Realized P&L</th>
         <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Exit Reason</th>
         <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Strategy</th>
+        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Opened</th>
         <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Closed</th>
+        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Duration</th>
     </tr></thead>
     <tbody>{rows_html}</tbody>
 </table></div>
@@ -1368,6 +1452,17 @@ def render_paper_trading():
                     st.session_state.pt_closed_page = min(pages - 1, pg + 1)
                     st.rerun()
 
+
+render_paper_trading()
+
+
+# ============================================================
+# RENDER ALL SECTIONS
+# ============================================================
+
+if show_idx: render_section(idx_rows, "INDEXES",                    "#9b6dff")
+if show_stk: render_section(stk_rows, "NSE STOCKS — F&O WATCHLIST", "#4a90e2", scroll_height=560)
+if show_com: render_section(com_rows, "COMMODITIES — MCX",          "#f7a800")
 
 # ============================================================
 # SIGNAL HISTORY
@@ -1455,13 +1550,6 @@ try:
 """, unsafe_allow_html=True)
 except Exception as e:
     st.warning(f"Signal history unavailable: {e}")
-
-
-# ============================================================
-# PAPER TRADING
-# ============================================================
-
-render_paper_trading()
 
 
 # ============================================================

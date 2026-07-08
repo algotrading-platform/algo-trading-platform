@@ -747,3 +747,75 @@ def get_paper_pnl_summary(days: int = 30) -> dict:
         print(f"[DB] get_paper_pnl_summary error: {e}")
         return {"total_pnl": 0.0, "trades": 0, "wins": 0, "losses": 0,
                 "win_rate": 0.0, "open_count": 0}
+
+
+# ============================================================
+# PAPER TRADING — SYMMETRIC BUY/SELL + MANUAL CONTROLS
+# (added for: symmetric long/short, capital visibility, manual
+#  close/stop-edit buttons — Jwala Jul 8 call)
+# ============================================================
+
+def get_open_position(symbol: str) -> dict | None:
+    """
+    Return the OPEN position row for a symbol (full dict, includes
+    side), or None if nothing is open for it.
+
+    Used by PaperTrader.on_signal() to decide what an incoming signal
+    should do: if a position is open in the OPPOSITE direction, close
+    it (reversal exit); if nothing is open, open a new one in the
+    signal's direction; if a position is already open in the SAME
+    direction, skip (no duplicate entry).
+    """
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                SELECT * FROM paper_positions
+                WHERE status = 'OPEN' AND symbol = %s
+                ORDER BY opened_at DESC
+                LIMIT 1
+            """, (symbol,))
+            row = cur.fetchone()
+        return dict(row) if row else None
+    except Exception as e:
+        print(f"[DB] get_open_position error: {e}")
+        return None
+
+
+def update_paper_position_stop(position_id: int, new_stop: float) -> bool:
+    """
+    Manually move the stop-loss of an OPEN position (Jwala's
+    breakeven/trailing-stop button on the dashboard — a manual
+    override, not automated trailing logic). Returns True on success,
+    False if the position isn't open (or on error).
+    """
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                UPDATE paper_positions
+                SET stop_loss = %s
+                WHERE id = %s AND status = 'OPEN'
+            """, (round(float(new_stop), 2), position_id))
+            return cur.rowcount > 0
+    except Exception as e:
+        print(f"[DB] update_paper_position_stop error: {e}")
+        return False
+
+
+def get_capital_deployed() -> float:
+    """
+    Sum of (entry_price * quantity) across all OPEN positions — how
+    much of total capital is currently tied up. Computed live from
+    existing columns; no new column or migration needed.
+    """
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                SELECT COALESCE(SUM(entry_price * quantity), 0) AS deployed
+                FROM paper_positions
+                WHERE status = 'OPEN'
+            """)
+            row = cur.fetchone()
+        return round(float(row["deployed"]), 2) if row else 0.0
+    except Exception as e:
+        print(f"[DB] get_capital_deployed error: {e}")
+        return 0.0
