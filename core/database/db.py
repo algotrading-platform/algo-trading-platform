@@ -23,7 +23,10 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import psycopg2
 import psycopg2.extras
+import pytz
 from dotenv import load_dotenv
+
+IST = pytz.timezone("Asia/Kolkata")
 
 load_dotenv()
 
@@ -566,16 +569,26 @@ def open_paper_position(
     risk_amount: float = 0.0,
     order_id:    str   = "",
 ) -> bool:
-    """Insert a new OPEN paper position. Returns True on success."""
+    """
+    Insert a new OPEN paper position. Returns True on success.
+
+    peak_price starts at entry_price and initial_stop_distance is
+    snapshotted at open time — both feed the Volume Spike trailing
+    stop in paper_trader.py (Jwala Jul 11: "we can design that
+    trailing stop loss kind of thing for the volume part"). Harmless
+    for RSI Reversal positions, which don't use trailing logic.
+    """
     try:
+        initial_stop_distance = round(abs(float(entry_price) - float(stop_loss)), 2)
         with _get_cursor() as cur:
             cur.execute("""
                 INSERT INTO paper_positions
                     (symbol, side, quantity, entry_price, stop_loss, target,
                      strategy, timeframe, risk_amount, order_id,
+                     peak_price, initial_stop_distance,
                      status, opened_at)
                 VALUES
-                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN', NOW())
+                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN', NOW())
             """, (
                 symbol, side, int(quantity),
                 round(float(entry_price), 2),
@@ -584,6 +597,8 @@ def open_paper_position(
                 strategy, timeframe,
                 round(float(risk_amount), 2),
                 order_id,
+                round(float(entry_price), 2),  # peak_price starts at entry
+                initial_stop_distance,
             ))
         return True
     except Exception as e:
@@ -598,10 +613,15 @@ def close_paper_position(
 ) -> bool:
     """
     Close an OPEN position: set exit price/time, compute realized P&L.
-    P&L = (exit-entry)*qty for BUY, (entry-exit)*qty for SELL.
-    Returns True on success.
+    pnl = (exit-entry)*qty for BUY, (entry-exit)*qty for SELL — this
+    is GROSS P&L, unchanged from before (Jwala Jul 11: "we'll not
+    call this net, we'll call this gross profit and loss"). Also
+    computes charges (estimated brokerage/STT/exchange/GST — see
+    charges.py) and net_pnl = pnl - charges. Returns True on success.
     """
     try:
+        from core.execution.charges import estimate_charges_for_trade
+
         with _get_cursor() as cur:
             # fetch the open position
             cur.execute("""
@@ -616,12 +636,16 @@ def close_paper_position(
 
             qty   = int(row["quantity"])
             entry = float(row["entry_price"])
+            side  = row["side"]
             exitp = round(float(exit_price), 2)
 
-            if row["side"] == "BUY":
+            if side == "BUY":
                 pnl = (exitp - entry) * qty
             else:  # SELL (short)
                 pnl = (entry - exitp) * qty
+
+            charges = estimate_charges_for_trade(side, entry, exitp, qty)
+            net_pnl = round(pnl - charges, 2)
 
             cur.execute("""
                 UPDATE paper_positions
@@ -629,9 +653,11 @@ def close_paper_position(
                     exit_price  = %s,
                     exit_reason = %s,
                     pnl         = %s,
+                    charges     = %s,
+                    net_pnl     = %s,
                     closed_at   = NOW()
                 WHERE id = %s
-            """, (exitp, exit_reason, round(pnl, 2), position_id))
+            """, (exitp, exit_reason, round(pnl, 2), charges, net_pnl, position_id))
         return True
     except Exception as e:
         print(f"[DB] close_paper_position error: {e}")
@@ -682,6 +708,43 @@ def get_closed_paper_positions(days: int = 30) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _ist_today_bounds_utc() -> tuple:
+    """
+    (start, end) of the CURRENT IST calendar day, as UTC datetimes —
+    for querying timestamptz columns against a trading-day boundary.
+    IST, not UTC, since that's what "today" means for this system
+    (Jwala Jul 11: "we would want to start fresh every day").
+    """
+    now_ist   = datetime.now(IST)
+    start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_ist   = start_ist + timedelta(days=1)
+    return start_ist.astimezone(timezone.utc), end_ist.astimezone(timezone.utc)
+
+
+def get_today_closed_paper_positions() -> pd.DataFrame:
+    """
+    CLOSED positions from TODAY (IST calendar day) only — NOT a
+    rolling window. This is the live-board version; get_closed_
+    paper_positions(days=N) above is kept as-is for the eventual
+    multi-day Excel/CSV report feature.
+    """
+    try:
+        start_utc, end_utc = _ist_today_bounds_utc()
+        with _get_cursor() as cur:
+            cur.execute("""
+                SELECT * FROM paper_positions
+                WHERE status = 'CLOSED' AND closed_at >= %s AND closed_at < %s
+                ORDER BY closed_at DESC
+            """, (start_utc, end_utc))
+            rows = cur.fetchall()
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame([dict(r) for r in rows])
+    except Exception as e:
+        print(f"[DB] get_today_closed_paper_positions error: {e}")
+        return pd.DataFrame()
+
+
 def count_open_paper_positions() -> int:
     """How many positions are currently OPEN (for the max-concurrent cap)."""
     try:
@@ -712,7 +775,16 @@ def is_paper_position_open(symbol: str) -> bool:
 def get_paper_pnl_summary(days: int = 30) -> dict:
     """
     Scorecard: totals over CLOSED positions in the last N days.
-    Returns dict with total_pnl, trades, wins, losses, win_rate, open_count.
+    Returns dict with total_pnl (GROSS — unchanged meaning), the new
+    total_net_pnl and total_charges (Jwala Jul 11: Gross vs Net P&L),
+    trades, wins, losses, win_rate, open_count.
+
+    NOTE — a judgment call worth knowing about: win/loss classification
+    below still uses GROSS pnl (pnl > 0), not net_pnl. A trade that's
+    gross-positive but net-negative after charges still counts as a
+    "win" here. Flagging this rather than silently redefining what
+    win_rate has meant up to now — say the word if you'd rather this
+    be net-based going forward.
     """
     try:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
@@ -721,6 +793,8 @@ def get_paper_pnl_summary(days: int = 30) -> dict:
                 SELECT
                     COUNT(*)                                   AS trades,
                     COALESCE(SUM(pnl), 0)                       AS total_pnl,
+                    COALESCE(SUM(net_pnl), 0)                   AS total_net_pnl,
+                    COALESCE(SUM(charges), 0)                   AS total_charges,
                     COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
                     COALESCE(SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), 0) AS losses
                 FROM paper_positions
@@ -736,7 +810,9 @@ def get_paper_pnl_summary(days: int = 30) -> dict:
         win_rate = round((wins / trades * 100), 1) if trades else 0.0
 
         return {
-            "total_pnl":  round(float(row.get("total_pnl", 0) or 0), 2),
+            "total_pnl":     round(float(row.get("total_pnl", 0) or 0), 2),
+            "total_net_pnl": round(float(row.get("total_net_pnl", 0) or 0), 2),
+            "total_charges": round(float(row.get("total_charges", 0) or 0), 2),
             "trades":     trades,
             "wins":       wins,
             "losses":     losses,
@@ -745,7 +821,60 @@ def get_paper_pnl_summary(days: int = 30) -> dict:
         }
     except Exception as e:
         print(f"[DB] get_paper_pnl_summary error: {e}")
-        return {"total_pnl": 0.0, "trades": 0, "wins": 0, "losses": 0,
+        return {"total_pnl": 0.0, "total_net_pnl": 0.0, "total_charges": 0.0,
+                "trades": 0, "wins": 0, "losses": 0,
+                "win_rate": 0.0, "open_count": 0}
+
+
+def get_today_pnl_summary() -> dict:
+    """
+    Scorecard: totals over CLOSED positions from TODAY (IST calendar
+    day) only — NOT a rolling window. This is the fix for the exact
+    bug Jwala flagged (Jul 11, 0:05): "it was 30 day, 30,000 more,
+    and then it added over it, let's say 20,000 more... we would want
+    to start fresh every day." The old get_paper_pnl_summary(days=30)
+    summed every closed trade from the past 30 days, so yesterday's
+    profit visually stacked onto today's. Same return shape as
+    get_paper_pnl_summary — this is the live-board version, that one
+    stays as-is for the eventual multi-day report feature.
+    """
+    try:
+        start_utc, end_utc = _ist_today_bounds_utc()
+        with _get_cursor() as cur:
+            cur.execute("""
+                SELECT
+                    COUNT(*)                                   AS trades,
+                    COALESCE(SUM(pnl), 0)                       AS total_pnl,
+                    COALESCE(SUM(net_pnl), 0)                   AS total_net_pnl,
+                    COALESCE(SUM(charges), 0)                   AS total_charges,
+                    COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
+                    COALESCE(SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), 0) AS losses
+                FROM paper_positions
+                WHERE status = 'CLOSED' AND closed_at >= %s AND closed_at < %s
+            """, (start_utc, end_utc))
+            row = cur.fetchone() or {}
+            cur.execute("SELECT COUNT(*) AS n FROM paper_positions WHERE status = 'OPEN'")
+            open_row = cur.fetchone() or {"n": 0}
+
+        trades = int(row.get("trades", 0) or 0)
+        wins   = int(row.get("wins", 0) or 0)
+        losses = int(row.get("losses", 0) or 0)
+        win_rate = round((wins / trades * 100), 1) if trades else 0.0
+
+        return {
+            "total_pnl":     round(float(row.get("total_pnl", 0) or 0), 2),
+            "total_net_pnl": round(float(row.get("total_net_pnl", 0) or 0), 2),
+            "total_charges": round(float(row.get("total_charges", 0) or 0), 2),
+            "trades":     trades,
+            "wins":       wins,
+            "losses":     losses,
+            "win_rate":   win_rate,
+            "open_count": int(open_row.get("n", 0) or 0),
+        }
+    except Exception as e:
+        print(f"[DB] get_today_pnl_summary error: {e}")
+        return {"total_pnl": 0.0, "total_net_pnl": 0.0, "total_charges": 0.0,
+                "trades": 0, "wins": 0, "losses": 0,
                 "win_rate": 0.0, "open_count": 0}
 
 
@@ -779,6 +908,35 @@ def get_open_position(symbol: str) -> dict | None:
     except Exception as e:
         print(f"[DB] get_open_position error: {e}")
         return None
+
+
+def update_trailing_state(position_id: int, peak_price: float, new_stop: float = None) -> bool:
+    """
+    Persists the Volume Spike trailing-stop state each monitor cycle
+    (Jwala Jul 11: "we can design that trailing stop loss kind of
+    thing for the volume part"). Always updates peak_price (the best
+    price seen since entry); only touches stop_loss if new_stop is
+    given, so a cycle where the peak moved but the stop hasn't been
+    raised yet doesn't disturb the existing stop.
+    """
+    try:
+        with _get_cursor() as cur:
+            if new_stop is not None:
+                cur.execute("""
+                    UPDATE paper_positions
+                    SET peak_price = %s, stop_loss = %s
+                    WHERE id = %s AND status = 'OPEN'
+                """, (round(float(peak_price), 2), round(float(new_stop), 2), position_id))
+            else:
+                cur.execute("""
+                    UPDATE paper_positions
+                    SET peak_price = %s
+                    WHERE id = %s AND status = 'OPEN'
+                """, (round(float(peak_price), 2), position_id))
+            return cur.rowcount > 0
+    except Exception as e:
+        print(f"[DB] update_trailing_state error: {e}")
+        return False
 
 
 def update_paper_position_stop(position_id: int, new_stop: float) -> bool:

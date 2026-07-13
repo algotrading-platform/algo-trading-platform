@@ -27,8 +27,11 @@ log = logging.getLogger("arbitrage")
 IST = pytz.timezone("Asia/Kolkata")
 
 # ── Threshold constants ──────────────────────────────────────
-NORMAL_BASIS_PCT  = 0.5
-EXPIRY_BASIS_PCT  = 0.5
+# Raised from 0.5% (Jwala, Jul 11: "let's increase the value to at
+# least 0.9%" — the 0.5% was an explicit testing value to check
+# whether signals fired at all, not the real target).
+NORMAL_BASIS_PCT  = 0.9
+EXPIRY_BASIS_PCT  = 0.9
 EXPIRY_WEEK_DAYS  = 7
 MAX_BASIS_PCT     = 10.0
 

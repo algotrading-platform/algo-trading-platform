@@ -45,6 +45,73 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ============================================================
+# LOGIN GATE (Jwala, Jul 11: "I think we need to put some login
+# credentials also")
+#
+# Interim app-level auth via streamlit-authenticator — not Azure Easy
+# Auth (confirmed blocked: 401 on Entra ID App registration, Jul 13).
+# Cookie-based session so the 5-min autorefresh below doesn't force
+# re-login on every rerun — only on real browser refresh/cookie
+# expiry (7 days, configs/auth_config.yaml).
+#
+# Must run BEFORE st_autorefresh and everything else, so an
+# unauthenticated visitor never triggers any dashboard logic at all —
+# not even the refresh timer.
+#
+# To add/remove people or set real passwords: see the instructions at
+# the top of configs/auth_config.yaml and scripts/hash_password.py.
+# ============================================================
+
+import yaml
+import streamlit_authenticator as stauth
+from streamlit_authenticator.utilities.exceptions import LoginError
+
+_AUTH_CONFIG_PATH = os.path.join(_project_root, "configs", "auth_config.yaml")
+
+# NOT wrapped in @st.cache_resource — deliberately. Authenticate()
+# constructs a CookieManager, which is a per-browser-session component;
+# caching it as a shared resource would hand every visitor the SAME
+# authenticator/cookie-manager instance, which is wrong for per-user
+# cookies and also triggers Streamlit's "widget created inside a
+# cached function" warning (caught by AppTest before this shipped).
+# Rebuilding it each run is cheap — a small YAML read + dict wrap.
+try:
+    with open(_AUTH_CONFIG_PATH, "r", encoding="utf-8") as f:
+        _auth_cfg = yaml.safe_load(f)
+    authenticator = stauth.Authenticate(
+        credentials=_auth_cfg["credentials"],
+        cookie_name=_auth_cfg["cookie"]["name"],
+        cookie_key=_auth_cfg["cookie"]["key"],
+        cookie_expiry_days=_auth_cfg["cookie"]["expiry_days"],
+    )
+except Exception as e:
+    st.error(
+        f"Login config could not be loaded ({e}). "
+        f"Check configs/auth_config.yaml exists and real password hashes "
+        f"have replaced the REPLACE_ME_* placeholders — see "
+        f"scripts/hash_password.py."
+    )
+    st.stop()
+
+# LoginError fires specifically when someone has a still-valid browser
+# cookie for a username that's since been REMOVED from auth_config.yaml
+# (access revoked) — without this catch it shows an uncaught traceback
+# instead of a clean message. Confirmed by reading the library source:
+# this is the only way LoginError fires given we don't use
+# single_session/max_concurrent_users/max_login_attempts.
+try:
+    authenticator.login(location="main")
+except LoginError:
+    st.error("Your access has been removed. Contact the admin if this is unexpected.")
+    st.stop()
+
+if st.session_state.get("authentication_status") is False:
+    st.error("Username or password is incorrect.")
+    st.stop()
+elif st.session_state.get("authentication_status") is not True:
+    st.stop()  # not yet submitted — login form is already showing, nothing else to render
+
 st_autorefresh(interval=300000, key="dashboard_refresh")  # 5 min — matches scheduler
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -357,6 +424,27 @@ def get_last_scan_time() -> str:
 def stock_display(sym: str) -> str:
     return sym.replace(".NS", "")
 
+# ── Strategy color-coding (Jwala Jul 11: "I see RSI both blue, blue...
+# some kind of colour coding for the strategy itself, so that we can
+# filter it out") — the strategy-pill CSS class was flat blue for
+# every strategy; this makes RSI Reversal / Volume Spike / arbitrage
+# visually distinct at a glance in the paper trading tables. ──
+_STRATEGY_STYLE = {
+    "RSI Reversal":           ("rgba(74,144,226,0.12)",  "rgba(74,144,226,0.35)",  "var(--blue)"),
+    "Volume Spike":           ("rgba(247,168,0,0.12)",   "rgba(247,168,0,0.35)",   "var(--amber)"),
+    "Cash-Futures Arbitrage": ("rgba(155,109,255,0.12)", "rgba(155,109,255,0.35)","var(--purple)"),
+}
+_DEFAULT_STRATEGY_STYLE = ("rgba(74,144,226,0.12)", "rgba(74,144,226,0.35)", "var(--blue)")
+
+def strategy_pill_html(strategy: str, timeframe: str = "") -> str:
+    bg, border, fg = _STRATEGY_STYLE.get(strategy, _DEFAULT_STRATEGY_STYLE)
+    label = f"{strategy} · {timeframe}" if timeframe else strategy
+    return (
+        f"<span style='display:inline-block;background:{bg};border:1px solid {border};"
+        f"color:{fg};font-family:JetBrains Mono,monospace;font-size:10px;font-weight:600;"
+        f"padding:3px 10px;border-radius:20px;letter-spacing:1px;'>{label}</span>"
+    )
+
 
 # ============================================================
 # TRADINGVIEW LIGHTWEIGHT CHART
@@ -665,6 +753,14 @@ with st.sidebar:
     </div>
     <div style='border-top:1px solid var(--border);margin-bottom:18px;'></div>
     """, unsafe_allow_html=True)
+
+    st.markdown(
+        f"<div style='font-size:12px;color:var(--t2);margin-bottom:8px;'>"
+        f"Logged in as <b>{st.session_state.get('name', '')}</b></div>",
+        unsafe_allow_html=True,
+    )
+    authenticator.logout("Logout", "sidebar")
+    st.markdown("<div style='margin:10px 0;border-top:1px solid var(--border);'></div>", unsafe_allow_html=True)
 
     btn_label = "☀️ Light Mode" if st.session_state.dark_mode else "🌙 Dark Mode"
     if st.button(btn_label, use_container_width=True):
@@ -1181,6 +1277,8 @@ def render_paper_trading():
         get_open_paper_positions,
         get_closed_paper_positions,
         get_paper_pnl_summary,
+        get_today_closed_paper_positions,
+        get_today_pnl_summary,
         get_capital_deployed,
         close_paper_position,
         update_paper_position_stop,
@@ -1190,12 +1288,14 @@ def render_paper_trading():
     st.markdown("""
     <div class="sec-hdr" style='margin-top:6px;'>
         <div style='width:7px;height:7px;border-radius:50%;background:var(--purple);flex-shrink:0;'></div>
-        <span class="sec-title">Paper Trading — Simulated Portfolio</span>
+        <span class="sec-title">Paper Trading — Simulated Portfolio (Today)</span>
         <span class="sec-meta">Upstox Sandbox &nbsp;·&nbsp; RSI Reversal + Volume Spike &nbsp;·&nbsp; Long + Short</span>
     </div>
     """, unsafe_allow_html=True)
 
-    summary  = get_paper_pnl_summary(days=30)
+    # Today only, not a rolling 30-day sum (Jwala Jul 11 fix — see
+    # get_today_pnl_summary's docstring for the exact bug this closes).
+    summary  = get_today_pnl_summary()
     open_df  = get_open_paper_positions()
 
     # ── Compute UNREALIZED P&L on open positions (needs live CMP) ──
@@ -1228,20 +1328,32 @@ def render_paper_trading():
             if u >= 0:
                 open_in_profit += 1
 
-    total_real = summary["total_pnl"]
-    net_pnl    = total_real + total_unreal
+    # ── Gross vs Net P&L (Jwala Jul 11: "we'll not call this net,
+    # we'll call this gross profit and loss. Net would be after
+    # minusing the brokerage and taxes.") total_pnl (gross) is
+    # unchanged in meaning from before; total_net_pnl is new. The
+    # combined portfolio total below now uses NET realized (a more
+    # honest "true" total than the old gross-based one it replaces —
+    # renamed from "Net P&L" to "Total P&L" to free that name up for
+    # its new, more specific meaning below).
+    total_gross  = summary["total_pnl"]
+    total_net    = summary.get("total_net_pnl", total_gross)
+    total_charges= summary.get("total_charges", 0.0)
+    total_pnl_combined = total_net + total_unreal
 
-    # ── Net summary scorecard: Unrealized + Realized + Net ──
-    p1, p2, p3, p4, p5, p6 = st.columns(6)
+    # ── Scorecard: Unrealized, Realized (Gross + Net), Total, Win Rate ──
+    p1, p2, p3, p4, p5, p6, p7 = st.columns(7)
     p1.metric("Open Positions", summary["open_count"])
     p2.metric("Open in Profit", f"{open_in_profit} / {summary['open_count']}")
     p3.metric("Unrealized P&L", f"{'+' if total_unreal>=0 else '-'}₹{abs(total_unreal):,.0f}",
               delta_color="normal" if total_unreal >= 0 else "inverse")
-    p4.metric("Realized P&L",   f"{'+' if total_real>=0 else '-'}₹{abs(total_real):,.0f}",
-              delta_color="normal" if total_real >= 0 else "inverse")
-    p5.metric("Net P&L",        f"{'+' if net_pnl>=0 else '-'}₹{abs(net_pnl):,.0f}",
-              delta_color="normal" if net_pnl >= 0 else "inverse")
-    p6.metric("Win Rate",       f"{summary['win_rate']}%",
+    p4.metric("Realized P&L (Gross)", f"{'+' if total_gross>=0 else '-'}₹{abs(total_gross):,.0f}",
+              delta_color="normal" if total_gross >= 0 else "inverse")
+    p5.metric("Realized P&L (Net)", f"{'+' if total_net>=0 else '-'}₹{abs(total_net):,.0f}",
+              delta=f"-₹{total_charges:,.0f} charges", delta_color="off")
+    p6.metric("Total P&L (Net)", f"{'+' if total_pnl_combined>=0 else '-'}₹{abs(total_pnl_combined):,.0f}",
+              delta_color="normal" if total_pnl_combined >= 0 else "inverse")
+    p7.metric("Win Rate",       f"{summary['win_rate']}%",
               delta=f"{summary['wins']}W / {summary['losses']}L" if summary["trades"] else None)
 
     # ── Capital scorecard (Jwala Jul 8: "how much capital... how much
@@ -1262,15 +1374,44 @@ def render_paper_trading():
     # ── OPEN POSITIONS ──
     # Colours (per Jwala): STOP = purple, TARGET = amber, green/red
     # reserved strictly for P&L. Rendered as real Streamlit rows (not
-    # a raw HTML table) so each row can carry a live "Close" button
-    # and an "Edit Stop" popover (Jwala Jul 8 — manual profit-booking
-    # and manual stop-shift, e.g. to breakeven).
-    st.markdown('<div style="font-size:12px;font-weight:700;color:var(--t2);text-transform:uppercase;letter-spacing:2px;margin:10px 0 8px;">Open Positions — Unrealized P&L</div>', unsafe_allow_html=True)
+    # a raw HTML table) so each row can carry a live "Close" button,
+    # an "Edit Stop" popover (Jwala Jul 8 — manual profit-booking and
+    # manual stop-shift, e.g. to breakeven), and a chart button.
+    oph_col, kill_col = st.columns([5, 1.3])
+    with oph_col:
+        st.markdown('<div style="font-size:12px;font-weight:700;color:var(--t2);text-transform:uppercase;letter-spacing:2px;margin:10px 0 8px;">Open Positions — Unrealized P&L</div>', unsafe_allow_html=True)
+    with kill_col:
+        # ── Kill Switch (Jwala Jul 11, reconfirmed 16:21/36:07):
+        # close EVERY open position immediately, not one at a time.
+        # Behind a popover confirm — this is destructive and portfolio-wide.
+        with st.popover("🔴 Kill Switch", use_container_width=True):
+            n_open = 0 if open_df is None else len(open_df)
+            st.markdown(f"**Close all {n_open} open position(s) now?**")
+            st.caption("Each closes at its current market price (or entry price if a live quote isn't available). This can't be undone.")
+            if n_open > 0 and st.button("Yes, close everything", key="pt_kill_switch_confirm", use_container_width=True):
+                _closed, _failed = 0, []
+                for _, _r in open_df.iterrows():
+                    _pid = int(_r["id"])
+                    _sym = _r["symbol"]
+                    _px  = cmp_map.get(_sym) or float(_r["entry_price"])
+                    if close_paper_position(_pid, _px, exit_reason="kill_switch"):
+                        _closed += 1
+                    else:
+                        _failed.append(stock_display(_sym))
+                if _failed:
+                    st.error(f"Closed {_closed}, failed: {', '.join(_failed)}")
+                else:
+                    st.success(f"Closed {_closed} position(s).")
+                st.rerun()
 
     if open_df is None or open_df.empty:
         st.markdown('<div class="no-sig">No open positions</div>', unsafe_allow_html=True)
     else:
-        widths = [1.5, 0.55, 0.55, 0.85, 1.0, 1.0, 0.85, 0.85, 0.95, 1.35, 0.8, 1.0]
+        # Actions widened (0.8 → 1.5) for the Chart button (Jwala Jul 11:
+        # "can I have the link here itself of the chart? Like previous.")
+        # alongside the existing Close / Edit-Stop; Strategy trimmed
+        # slightly (1.35 → 1.05) to make room.
+        widths = [1.5, 0.55, 0.55, 0.85, 1.0, 1.0, 0.85, 0.85, 0.95, 1.05, 0.8, 1.5]
         h = st.columns(widths)
         for col, lbl in zip(h, ["Stock", "Side", "Qty", "Entry", "CMP", "Unreal. P&L",
                                  "Stop", "Target", "Capital", "Strategy", "Opened", "Actions"]):
@@ -1326,7 +1467,7 @@ def render_paper_trading():
             with c[8]:
                 st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>₹{capital_used:,.0f}</div>", unsafe_allow_html=True)
             with c[9]:
-                st.markdown(f"<div style='padding:9px 0;'><span class='strategy-pill'>{r['strategy']} · {r['timeframe']}</span></div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='padding:9px 0;'>{strategy_pill_html(r['strategy'], r['timeframe'])}</div>", unsafe_allow_html=True)
 
             with c[10]:
                 try:
@@ -1336,7 +1477,19 @@ def render_paper_trading():
                 st.markdown(f"<div style='padding:9px 0;font-size:11px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{opened}</div>", unsafe_allow_html=True)
 
             with c[11]:
-                bcol, scol = st.columns(2)
+                chcol, bcol, scol = st.columns(3)
+                with chcol:
+                    # Same inline chart panel the signal feed uses — "like
+                    # previous" (Jwala Jul 11: "can I have the link here
+                    # itself of the chart? Like previous.")
+                    if st.button("📈", key=f"pt_chart_{pid}", help=f"View chart for {stock_display(sym)}"):
+                        if st.session_state.chart_symbol == sym:
+                            st.session_state.chart_symbol = None
+                            st.session_state.chart_name   = None
+                        else:
+                            st.session_state.chart_symbol = sym
+                            st.session_state.chart_name   = stock_display(sym)
+                        st.rerun()
                 with bcol:
                     if st.button("Close", key=f"pt_close_{pid}", help=f"Book P&L now for {stock_display(sym)}"):
                         exit_px = cmp if cmp is not None else entry
@@ -1361,11 +1514,14 @@ def render_paper_trading():
     st.markdown("<div style='margin-bottom:10px;'></div>", unsafe_allow_html=True)
 
     # ── CLOSED TRADES — Realized P&L (paginated, 15 per page) ──
-    # Adds Opened + Duration alongside Closed (Jwala Jul 8: "entry
-    # price and... time that this was the price and at what time we
-    # entered and at what time we exited... a column for the duration").
-    st.markdown('<div style="font-size:12px;font-weight:700;color:var(--t2);text-transform:uppercase;letter-spacing:2px;margin:22px 0 8px;">Closed Trades — Realized P&L</div>', unsafe_allow_html=True)
-    closed_df = get_closed_paper_positions(days=30)
+    # Rebuilt as per-row Streamlit widgets (was a static HTML table) so
+    # a chart button can sit on each row — Jwala Jul 11: "can I have
+    # the link here itself of the chart? ... include the chart option
+    # in the closed trades also." Entry price+time and Exit price+time
+    # are merged into one cell each (Jwala Jul 9/11), and Qty is back
+    # (was missing — Om caught this himself on the Jul 11 call too).
+    st.markdown('<div style="font-size:12px;font-weight:700;color:var(--t2);text-transform:uppercase;letter-spacing:2px;margin:22px 0 8px;">Closed Trades — Realized P&L (Today)</div>', unsafe_allow_html=True)
+    closed_df = get_today_closed_paper_positions()  # today only — see summary fetch above
     if closed_df is None or closed_df.empty:
         st.markdown('<div class="no-sig">No closed trades yet</div>', unsafe_allow_html=True)
     else:
@@ -1379,17 +1535,29 @@ def render_paper_trading():
 
         page_df = closed_df.iloc[pg*PAGE : (pg+1)*PAGE]
 
-        rows_html = ""
+        # Net P&L added alongside Gross (Jwala Jul 11: "we'll call
+        # this gross profit and loss. Net would be after minusing the
+        # brokerage and taxes."). Strategy trimmed slightly to fit.
+        ct_widths = [1.1, 0.5, 0.5, 0.95, 0.95, 0.8, 0.8, 0.75, 1.0, 0.65, 0.5]
+        ct_h = st.columns(ct_widths)
+        for col, lbl in zip(ct_h, ["Stock", "Side", "Qty", "Entry", "Exit", "Gross P&L", "Net P&L",
+                                     "Exit Reason", "Strategy", "Duration", "Chart"]):
+            col.markdown(f'<div class="col-hdr">{lbl}</div>', unsafe_allow_html=True)
+
         for _, r in page_df.iterrows():
+            ct_sym   = r["symbol"]
             side     = r["side"]
             side_c   = "var(--green)" if side == "BUY" else "var(--red)"
             side_lbl = "LONG" if side == "BUY" else "SHORT"
+            qty      = int(r["quantity"])
             pnl      = float(r["pnl"])
             pnl_c    = "var(--green)" if pnl >= 0 else "var(--red)"
+            net_pnl_val = r.get("net_pnl")
+            net_pnl_val = float(net_pnl_val) if net_pnl_val is not None and pd.notna(net_pnl_val) else None
             reason   = str(r.get("exit_reason", "")).upper()
             rc = {"STOP": "var(--red)", "TARGET": "var(--green)",
                   "REVERSAL": "var(--amber)", "MANUAL": "var(--blue)",
-                  "SQUARE_OFF": "var(--purple)"}.get(reason, "var(--t3)")
+                  "SQUARE_OFF": "var(--purple)", "KILL_SWITCH": "var(--red)"}.get(reason, "var(--t3)")
 
             try:
                 opened = pd.to_datetime(r["opened_at"], utc=True).tz_convert(IST).strftime("%d-%b %H:%M")
@@ -1401,37 +1569,52 @@ def render_paper_trading():
                 closed = str(r.get("closed_at", ""))[:16]
             duration = _fmt_duration(r.get("opened_at"), r.get("closed_at"))
 
-            rows_html += f"""
-            <tr style='border-bottom:1px solid var(--border);'>
-                <td style='padding:9px 12px;font-size:13px;color:var(--t1);font-weight:600;'>{stock_display(r['symbol'])}</td>
-                <td style='padding:9px 12px;'><span style='color:{side_c};font-weight:700;font-family:JetBrains Mono,monospace;font-size:12px;'>{side_lbl}</span></td>
-                <td style='padding:9px 12px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>₹{float(r['entry_price']):,.2f}</td>
-                <td style='padding:9px 12px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>₹{float(r['exit_price']):,.2f}</td>
-                <td style='padding:9px 12px;font-family:JetBrains Mono,monospace;font-size:12px;color:{pnl_c};font-weight:700;'>{'+' if pnl>=0 else '-'}₹{abs(pnl):,.0f}</td>
-                <td style='padding:9px 12px;font-size:11px;color:{rc};font-family:JetBrains Mono,monospace;text-transform:uppercase;'>{reason}</td>
-                <td style='padding:9px 12px;'><span class='strategy-pill'>{r.get('strategy','')} · {r.get('timeframe','')}</span></td>
-                <td style='padding:9px 12px;font-size:11px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{opened}</td>
-                <td style='padding:9px 12px;font-size:11px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{closed}</td>
-                <td style='padding:9px 12px;font-size:11px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{duration}</td>
-            </tr>"""
-        st.markdown(f"""
-<div style='overflow-x:auto;border:1px solid var(--border);border-radius:8px;background:var(--card);'>
-<table style='width:100%;border-collapse:collapse;'>
-    <thead><tr style='border-bottom:2px solid var(--border2);background:var(--card2);'>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Stock</th>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Side</th>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Entry</th>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Exit</th>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Realized P&L</th>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Exit Reason</th>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Strategy</th>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Opened</th>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Closed</th>
-        <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;'>Duration</th>
-    </tr></thead>
-    <tbody>{rows_html}</tbody>
-</table></div>
-""", unsafe_allow_html=True)
+            cc = st.columns(ct_widths)
+
+            with cc[0]:
+                st.markdown(f"<div style='padding:9px 0;font-size:13px;color:var(--t1);font-weight:600;'>{stock_display(ct_sym)}</div>", unsafe_allow_html=True)
+            with cc[1]:
+                st.markdown(f"<div style='padding:9px 0;'><span style='color:{side_c};font-weight:700;font-family:JetBrains Mono,monospace;font-size:11px;'>{side_lbl}</span></div>", unsafe_allow_html=True)
+            with cc[2]:
+                st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>{qty}</div>", unsafe_allow_html=True)
+            with cc[3]:
+                st.markdown(
+                    f"<div style='padding:9px 0;'>"
+                    f"<div style='font-family:JetBrains Mono,monospace;font-size:13px;color:var(--t1);font-weight:700;'>₹{float(r['entry_price']):,.2f}</div>"
+                    f"<div style='font-size:10px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{opened}</div>"
+                    f"</div>", unsafe_allow_html=True)
+            with cc[4]:
+                st.markdown(
+                    f"<div style='padding:9px 0;'>"
+                    f"<div style='font-family:JetBrains Mono,monospace;font-size:13px;color:var(--t1);font-weight:700;'>₹{float(r['exit_price']):,.2f}</div>"
+                    f"<div style='font-size:10px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{closed}</div>"
+                    f"</div>", unsafe_allow_html=True)
+            with cc[5]:
+                st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:{pnl_c};font-weight:700;'>{'+' if pnl>=0 else '-'}₹{abs(pnl):,.0f}</div>", unsafe_allow_html=True)
+            with cc[6]:
+                if net_pnl_val is not None:
+                    net_c = "var(--green)" if net_pnl_val >= 0 else "var(--red)"
+                    st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:{net_c};font-weight:700;'>{'+' if net_pnl_val>=0 else '-'}₹{abs(net_pnl_val):,.0f}</div>", unsafe_allow_html=True)
+                else:
+                    st.markdown("<div style='padding:9px 0;'><span class='badge-pending'>–</span></div>", unsafe_allow_html=True)
+            with cc[7]:
+                st.markdown(f"<div style='padding:9px 0;font-size:11px;color:{rc};font-family:JetBrains Mono,monospace;text-transform:uppercase;'>{reason}</div>", unsafe_allow_html=True)
+            with cc[8]:
+                st.markdown(f"<div style='padding:9px 0;'>{strategy_pill_html(r.get('strategy',''), r.get('timeframe',''))}</div>", unsafe_allow_html=True)
+            with cc[9]:
+                st.markdown(f"<div style='padding:9px 0;font-size:11px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{duration}</div>", unsafe_allow_html=True)
+            with cc[10]:
+                _ct_key = f"pt_closed_chart_{int(r['id'])}"
+                if st.button("📈", key=_ct_key, help=f"View chart for {stock_display(ct_sym)}"):
+                    if st.session_state.chart_symbol == ct_sym:
+                        st.session_state.chart_symbol = None
+                        st.session_state.chart_name   = None
+                    else:
+                        st.session_state.chart_symbol = ct_sym
+                        st.session_state.chart_name   = stock_display(ct_sym)
+                    st.rerun()
+
+            st.markdown("<div class='row-div'></div>", unsafe_allow_html=True)
 
         # Pagination controls (only if more than one page)
         if pages > 1:

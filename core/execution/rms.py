@@ -29,12 +29,33 @@ from typing import Optional
 # ============================================================
 class RMSConfig:
     CAPITAL              = 1_000_000.0   # ₹10L simulated capital
-    RISK_PCT_PER_TRADE   = 0.01          # 1% of capital risked per trade
     STOP_LOSS_PCT        = 0.015         # 1.5% stop from entry
-    RISK_REWARD          = 1.2           # target = 1.2× the stop distance (per Jwala, reduced from 2.0)
+    RISK_REWARD          = 1.2           # default target multiple — RSI Reversal (per Jwala, reduced from 2.0)
     DAILY_MAX_LOSS_PCT   = 0.03          # stop trading after -3% in a day
-    MAX_POSITION_PCT     = 0.20          # no single position > 20% of capital
+    MAX_OPEN_POSITIONS   = 15            # single source of truth — paper_trader.py
+                                          # imports this instead of its own copy, so
+                                          # the concurrency cap and the capital-per-
+                                          # trade divisor can never drift apart again.
     MIN_QUANTITY         = 1             # need at least 1 share to trade
+
+    # Strategy-specific reward ratio (Jwala, Jul 11: "once we enter we
+    # can keep a 1 is to 2 ratio" for Volume Spike — wider than RSI's
+    # 1.2×, since volume-driven moves can run further). Anything not
+    # listed here falls back to RISK_REWARD above.
+    RISK_REWARD_BY_STRATEGY = {
+        "Volume Spike": 2.0,
+    }
+
+    # ── RETIRED (Jwala, Jul 9 call) — kept only so nothing importing
+    # these old names breaks; no longer used for sizing. Sizing is now
+    # CAPITAL / MAX_OPEN_POSITIONS per trade (see evaluate() below),
+    # not a risk-budget calc capped at a % of capital. The old
+    # combination (risk-budget sizing capped at MAX_POSITION_PCT=20%)
+    # is exactly what let deployed capital hit ~₹29-30L on a ₹10L
+    # book once 15 positions were open (15 × 20% = 300%) — the bug
+    # Jwala caught live from the capital-deployed card.
+    RISK_PCT_PER_TRADE   = 0.01          # unused — see MAX_OPEN_POSITIONS above
+    MAX_POSITION_PCT     = 0.20          # unused — see MAX_OPEN_POSITIONS above
 
 
 @dataclass
@@ -99,6 +120,7 @@ class RMS:
         symbol:      str,
         side:        str,          # "BUY" or "SELL"
         entry_price: float,
+        strategy:    str = None,   # picks the reward ratio — see RISK_REWARD_BY_STRATEGY
     ) -> RMSDecision:
 
         self._roll_day_if_needed()
@@ -124,36 +146,41 @@ class RMS:
         if side not in ("BUY", "SELL"):
             return reject(f"Unsupported side: {side}")
 
-        # 3. Stop-loss & target
+        # 3. Stop-loss & target — reward ratio is strategy-specific
+        # (Jwala Jul 11: Volume Spike gets 1:2, wider than RSI's 1.2×).
+        reward_ratio = self.cfg.RISK_REWARD_BY_STRATEGY.get(strategy, self.cfg.RISK_REWARD)
         stop_dist = entry_price * self.cfg.STOP_LOSS_PCT
         if side == "BUY":
             stop_loss = round(entry_price - stop_dist, 2)
-            target    = round(entry_price + stop_dist * self.cfg.RISK_REWARD, 2)
+            target    = round(entry_price + stop_dist * reward_ratio, 2)
         else:  # SELL (short)
             stop_loss = round(entry_price + stop_dist, 2)
-            target    = round(entry_price - stop_dist * self.cfg.RISK_REWARD, 2)
+            target    = round(entry_price - stop_dist * reward_ratio, 2)
 
-        # 4. Position size = risk budget ÷ per-share risk
-        risk_budget   = self.cfg.CAPITAL * self.cfg.RISK_PCT_PER_TRADE
-        per_share_risk = stop_dist
-        if per_share_risk <= 0:
-            return reject("Stop distance is zero — cannot size")
+        # 4. Position size — CAPITAL-BASED, not risk-based (Jwala,
+        # Jul 9 call, worked out explicitly on the call): every
+        # concurrent slot gets an equal, fixed share of total capital.
+        #   capital_per_trade = CAPITAL / MAX_OPEN_POSITIONS
+        #   quantity          = floor(capital_per_trade / entry_price)
+        # This structurally caps total deployed capital at
+        # MAX_OPEN_POSITIONS × capital_per_trade == CAPITAL, regardless
+        # of entry price or stop distance — no separate "don't
+        # over-concentrate" cap is needed, this IS that cap.
+        capital_per_trade = self.cfg.CAPITAL / self.cfg.MAX_OPEN_POSITIONS
 
-        quantity = int(risk_budget // per_share_risk)
+        if entry_price <= 0:
+            return reject(f"Invalid entry price for sizing: {entry_price}")
 
-        # 5. Cap position value (don't over-concentrate)
-        max_position_value = self.cfg.CAPITAL * self.cfg.MAX_POSITION_PCT
-        if quantity * entry_price > max_position_value:
-            quantity = int(max_position_value // entry_price)
+        quantity = int(capital_per_trade // entry_price)
 
         if quantity < self.cfg.MIN_QUANTITY:
             return reject(
                 f"Position size < 1 share "
-                f"(price ₹{entry_price:,.0f} too high for risk budget "
-                f"₹{risk_budget:,.0f})"
+                f"(price ₹{entry_price:,.0f} too high for per-trade capital "
+                f"₹{capital_per_trade:,.0f})"
             )
 
-        actual_risk = round(quantity * per_share_risk, 2)
+        actual_risk = round(quantity * stop_dist, 2)
 
         return RMSDecision(
             approved=True,
@@ -166,10 +193,11 @@ class RMS:
             risk_amount=actual_risk,
             reason="approved",
             details={
-                "risk_budget":      round(risk_budget, 2),
-                "per_share_risk":   round(per_share_risk, 2),
-                "position_value":   round(quantity * entry_price, 2),
-                "reward_if_target": round(quantity * stop_dist * self.cfg.RISK_REWARD, 2),
-                "daily_pnl_before": round(self._realized_pnl_today, 2),
+                "capital_per_trade": round(capital_per_trade, 2),
+                "per_share_risk":    round(stop_dist, 2),
+                "position_value":    round(quantity * entry_price, 2),
+                "reward_if_target":  round(quantity * stop_dist * reward_ratio, 2),
+                "reward_ratio":      reward_ratio,
+                "daily_pnl_before":  round(self._realized_pnl_today, 2),
             },
         )

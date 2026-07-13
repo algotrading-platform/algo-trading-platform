@@ -564,18 +564,37 @@ def get_strategy(name: str) -> BaseStrategy:
 
 class VolumeSpikeStrategy(BaseStrategy):
     """
-    Volume Spike Strategy — Jwala's latest spec (18-Jun-2026):
+    Volume Spike Strategy — updated per Jwala Jul 11 fix.
 
-    Condition: Current candle volume > 500% (5x) of the previous
-               14-candle average volume.
-    Signal   : BUY — institutional buying detected.
-    Strength : STRONG if volume >= 1000% (10x), else MODERATE.
+    Bug found on the call: the original single-candle check fired
+    even "when the price is falling, there also volume spikes" — a
+    volume surge alone doesn't distinguish institutional accumulation
+    from a spike into a sell-off. Fix, per the call:
+      "we can include more aspects into it, like we will check for
+       three candles, 3 volume candles. And each of them should be
+       more than 500%[→2000%]... and also we would keep checking the
+       price candles also for these three volume candles. So price
+       should be increasing... we would want to get in after at
+       least two, 3 candles so that we know that we are entering in
+       a buying spree."
 
-    Jwala's insight from Business Standard research:
-    "5 minute volume if it is greater than 500% of the fourteen
-     previous 5 minute volume average — buy."
-    "From past 20 days tracking — 8 out of 10 stocks rise on that day.
-     Some rising by 20% on same day, 4-5% next day."
+    Condition (all three required):
+      1. Each of the last CONFIRM_CANDLES candles has volume >=
+         SPIKE_THRESHOLD × a SINGLE shared baseline average — the
+         LOOKBACK_CANDLES candles immediately before the confirmation
+         window (not each candle's own drifting average — see the
+         comment at baseline_window below for why that matters).
+      2. Close price strictly increases across those same candles.
+      3. (unchanged) BUY only — this strategy detects buying
+         interest, never generates SELL.
+
+    Threshold raised back from the 500% TESTING value to Jwala's
+    original spec ("previously you suggested it to be like around
+    2000"). STRONG_THRESHOLD is my own choice (not restated on this
+    call) — set meaningfully above the new trigger rather than left
+    below it, which the old 500/1000% pairing effectively was once
+    the trigger moves to 2000%. Flag if you want a different STRONG
+    cutoff.
 
     This is an INDEPENDENT strategy — does not require RSI.
     It also reinforces RSI: RSI reversal + volume spike = stronger BUY.
@@ -583,21 +602,25 @@ class VolumeSpikeStrategy(BaseStrategy):
 
     name = "Volume Spike"
     description = (
-        "Detects institutional buying via abnormal volume surge. "
-        "Signals BUY when current candle volume exceeds 500% (5x) of "
-        "the previous 14-candle average. Based on Jwala's spec."
+        "Detects institutional buying via a 3-candle abnormal-volume "
+        "confirmation with price rising throughout — not a single "
+        "spike, which can occur even as price falls. Based on Jwala's "
+        "Jul 11 spec."
     )
 
-    # 14 candles average (excluding the current candle)
-    LOOKBACK_CANDLES   = 14
-    SPIKE_THRESHOLD    = 5.0    # 500% = 5x average  → BUY trigger
-    STRONG_THRESHOLD   = 10.0   # 1000% = 10x average → STRONG
+    LOOKBACK_CANDLES  = 14    # trailing average window (unchanged)
+    CONFIRM_CANDLES   = 3     # consecutive candles required (Jwala Jul 11)
+    SPIKE_THRESHOLD   = 20.0  # 2000% = 20x average → BUY trigger (Jwala's original spec, was 500% for testing)
+    STRONG_THRESHOLD  = 50.0  # 5000% = 50x average → STRONG (my choice — meaningfully above the new trigger)
 
     def generate_signal(self, df) -> "SignalResult":
-        if df is None or df.empty or len(df) < self.LOOKBACK_CANDLES + 1:
+        # Need enough history for one LOOKBACK_CANDLES baseline window
+        # PLUS the CONFIRM_CANDLES confirmation window sitting after it.
+        need = self.LOOKBACK_CANDLES + self.CONFIRM_CANDLES
+        if df is None or df.empty or len(df) < need:
             return SignalResult(
                 "HOLD", "WEAK",
-                f"Insufficient data (need {self.LOOKBACK_CANDLES + 1}+ candles)",
+                f"Insufficient data (need {need}+ candles)",
                 strategy=self.name,
             )
 
@@ -613,40 +636,78 @@ class VolumeSpikeStrategy(BaseStrategy):
             df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce")
             df.dropna(subset=["Volume"], inplace=True)
 
-            if len(df) < self.LOOKBACK_CANDLES + 1:
+            if len(df) < need:
                 return SignalResult("HOLD", "WEAK", "Insufficient volume data", strategy=self.name)
 
-            # 2-week average (excluding current candle)
-            avg_volume   = float(df["Volume"].iloc[-self.LOOKBACK_CANDLES-1:-1].mean())
-            curr_volume  = float(df["Volume"].iloc[-1])
-            curr_close   = float(df["Close"].iloc[-1])
+            # ONE fixed baseline average — the LOOKBACK_CANDLES candles
+            # strictly BEFORE the CONFIRM_CANDLES confirmation window —
+            # not each candle's own independently-drifting trailing
+            # average. This matters: if each of the 3 confirmation
+            # candles used its own rolling average, the 2nd and 3rd
+            # candles' averages would already include the 1st (and
+            # 2nd) spike candles, inflating the denominator and making
+            # a genuine 3-candle spree progressively HARDER to confirm
+            # the deeper into it you are — the opposite of what a
+            # "buying spree" detector should do. Caught by testing a
+            # real 3-candle spike pattern, not assumed.
+            baseline_window = df.iloc[-(self.LOOKBACK_CANDLES + self.CONFIRM_CANDLES):-self.CONFIRM_CANDLES]
+            if len(baseline_window) < self.LOOKBACK_CANDLES:
+                return SignalResult("HOLD", "WEAK", "Insufficient baseline window", strategy=self.name)
 
+            avg_volume = float(baseline_window["Volume"].mean())
             if avg_volume <= 0:
                 return SignalResult("HOLD", "WEAK", "Zero average volume", strategy=self.name)
 
-            volume_ratio = curr_volume / avg_volume  # e.g. 5.0 = 500%
-            volume_pct   = round(volume_ratio * 100, 0)  # e.g. 500%
+            confirm_window = df.iloc[-self.CONFIRM_CANDLES:]
+            ratios = (confirm_window["Volume"] / avg_volume).tolist()
+            closes = confirm_window["Close"].astype(float).tolist()
+
+            curr_volume  = float(df["Volume"].iloc[-1])
+            curr_close   = float(df["Close"].iloc[-1])
+            volume_ratio = ratios[-1]
+            volume_pct   = round(volume_ratio * 100, 0)
 
             indicators = {
-                "Volume":       int(curr_volume),
-                "Avg_Volume":   int(avg_volume),
-                "Volume_Ratio": round(volume_ratio, 2),
-                "Volume_Pct":   volume_pct,
-                "Close":        round(curr_close, 2),
+                "Volume":         int(curr_volume),
+                "Avg_Volume":     int(avg_volume) if avg_volume == avg_volume else 0,  # NaN-safe
+                "Volume_Ratio":   round(volume_ratio, 2),
+                "Volume_Pct":     volume_pct,
+                "Close":          round(curr_close, 2),
+                "Confirm_Ratios": [round(r, 2) for r in ratios],
+                "Confirm_Closes": [round(c, 2) for c in closes],
             }
 
-            if volume_ratio >= self.SPIKE_THRESHOLD:
+            all_above_threshold = all(r >= self.SPIKE_THRESHOLD for r in ratios)
+            price_rising = all(closes[i] < closes[i + 1] for i in range(len(closes) - 1))
+
+            if all_above_threshold and price_rising:
                 strength = "STRONG" if volume_ratio >= self.STRONG_THRESHOLD else "MODERATE"
                 reason = (
-                    f"VOLUME SPIKE: {volume_pct:.0f}% of 2-week average "
-                    f"({int(curr_volume):,} vs avg {int(avg_volume):,}). "
-                    f"Institutional buying detected."
+                    f"VOLUME SPIKE confirmed over {self.CONFIRM_CANDLES} candles: "
+                    f"volume {volume_pct:.0f}% of {self.LOOKBACK_CANDLES}-candle average, "
+                    f"each of the last {self.CONFIRM_CANDLES} candles above "
+                    f"{self.SPIKE_THRESHOLD*100:.0f}%, price rising throughout "
+                    f"(₹{closes[0]:.2f} → ₹{closes[-1]:.2f}). "
+                    f"Institutional buying spree detected, not a single spike."
                 )
                 return SignalResult("BUY", strength, reason, indicators, self.name)
 
+            if all_above_threshold and not price_rising:
+                return SignalResult(
+                    "HOLD", "WEAK",
+                    f"Volume above {self.SPIKE_THRESHOLD*100:.0f}% threshold on all "
+                    f"{self.CONFIRM_CANDLES} candles, but price did NOT rise "
+                    f"throughout (₹{closes[0]:.2f} → ₹{closes[-1]:.2f}) — likely a "
+                    f"spike into a falling price, not accumulation. Skipped "
+                    f"(Jul 11 fix for exactly this false-positive pattern).",
+                    indicators, self.name,
+                )
+
             return SignalResult(
                 "HOLD", "WEAK",
-                f"Volume {volume_pct:.0f}% of average (need 500%+). "
+                f"Volume {volume_pct:.0f}% of average (need "
+                f"{self.SPIKE_THRESHOLD*100:.0f}%+ on all of the last "
+                f"{self.CONFIRM_CANDLES} candles). "
                 f"Current: {int(curr_volume):,} | Avg: {int(avg_volume):,}",
                 indicators, self.name,
             )

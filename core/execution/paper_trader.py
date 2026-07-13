@@ -16,9 +16,34 @@
 # Stop/target math is mirrored for shorts (handled in rms.py, already
 # symmetric) and monitor_open() checks both directions.
 #
-# REALISTIC CONSTRAINT: cash-equity shorts can't carry overnight, so
-# any open SHORT is force-closed at SQUARE_OFF_TIME regardless of
-# stop/target (reason "square_off"). Longs are unaffected.
+# EOD SQUARE-OFF — applies to BOTH sides (Jwala Jul 11, revising the
+# Jul 8 short-only version): "let's also close the long ones also...
+# this algo system would be for a day trade only." Every open
+# position, long or short, is force-closed at SQUARE_OFF_TIME
+# regardless of stop/target (reason "square_off"). Moved earlier too
+# (15:15 -> 15:00) per the call: "we will try to start it off before
+# 3:15... because after 3:15 all brokerages... fire up." The smarter
+# "gradually close profitable trades in the last 15 min" version was
+# explicitly deferred — this is the simple blanket version Jwala
+# accepted for now.
+#
+# VOLUME SPIKE TRAILING STOP (Jwala Jul 11): Volume Spike positions
+# get a wider reward ratio (1:2, set in rms.py) BUT that target is
+# reference-only, not a hard close — the trailing stop is the real
+# exit (21:16-21:43: "stock can run up to 10%, 15%... we'll have to
+# go for trailing the stop loss... to capture big moves"). A hard 1:2
+# close would defeat that: the position would exit at 2x before the
+# trailing logic ever got a chance to ride further. So: once price
+# has moved favorably by at least the original stop distance, the
+# stop trails behind the peak instead of staying fixed, and that
+# trailing stop is the only thing that closes a Volume Spike position
+# early (plus the universal EOD square-off). RSI Reversal positions
+# are unaffected (fixed stop/target throughout, as before). The exact
+# trailing formula wasn't nailed down on the call ("we can design
+# that trailing stop loss kind of thing" — confirms the concept, not
+# a formula) — this is my own concrete choice, flagged for Jwala to
+# confirm/adjust: breakeven once price has moved 1× the initial risk,
+# then trail behind the peak by that same distance.
 #
 # Two entry points:
 #   on_signal(...)  — a BUY/SELL fired; open/close per the table above.
@@ -54,14 +79,18 @@ log = logging.getLogger("paper_trader")
 
 IST = pytz.timezone("Asia/Kolkata")
 
-# Max concurrent open paper positions (per earlier decision).
-MAX_OPEN_POSITIONS = 15
+# Max concurrent open paper positions — single source of truth is
+# RMSConfig.MAX_OPEN_POSITIONS (rms.py). Previously duplicated here as
+# its own literal 15; unified after Jwala's Jul 9 capital-sizing fix,
+# since these two numbers drifting apart is exactly the kind of thing
+# that caused the ₹29-30L-deployed-on-₹10L-capital bug.
+MAX_OPEN_POSITIONS = RMSConfig.MAX_OPEN_POSITIONS
 
 # Cash-equity shorts cannot carry overnight — force-close any open
 # SHORT once this IST time is reached, regardless of stop/target.
 # (Jwala confirmed "realistic expectations" — Jul 8.) Set a few
 # minutes ahead of the 15:30 close so it lands on a real scan cycle.
-SQUARE_OFF_TIME = dtime(15, 15)
+SQUARE_OFF_TIME = dtime(15, 0)
 
 
 def _past_square_off_time() -> bool:
@@ -138,8 +167,9 @@ class PaperTrader:
 
         # 1. RMS — evaluate() is already symmetric: for SELL it sizes
         # and mirrors stop/target for a short (stop above entry,
-        # target below). No change needed there.
-        decision = self.rms.evaluate(symbol, side, price)
+        # target below). strategy picks the reward ratio (Jwala Jul
+        # 11: Volume Spike gets 1:2, wider than RSI's 1.2×).
+        decision = self.rms.evaluate(symbol, side, price, strategy=strategy)
         if not decision.approved:
             return {"action": "reject", "reason": f"RMS: {decision.reason}"}
 
@@ -192,10 +222,15 @@ class PaperTrader:
     def monitor_open(self) -> list[dict]:
         """
         For each open position, fetch current price and close it if:
-          - a SHORT and we're past SQUARE_OFF_TIME (forced, realistic
-            constraint — checked FIRST, ahead of stop/target), or
+          - we're past SQUARE_OFF_TIME (forced, day-trade-only
+            constraint — checked FIRST, ahead of stop/target, applies
+            to BOTH longs and shorts per Jwala Jul 11), or
           - the stop-loss or target has been hit (direction-aware —
             a short's stop is above entry, target below).
+        Volume Spike positions get their trailing stop updated first
+        (may raise the stop before the hit-check below runs, so a
+        newly-trailed stop can close the SAME cycle if price has
+        already retraced through it).
         Returns list of close events.
         (Exit-on-opposite-signal is handled via on_signal + close_by_symbol.)
         """
@@ -211,18 +246,18 @@ class PaperTrader:
             side   = pos["side"]
             pid    = int(pos["id"])
 
-            # ── Forced square-off: cash-equity shorts can't carry
-            # overnight. Close any open SHORT once the square-off
-            # window starts, regardless of stop/target. Longs are
-            # unaffected — this check only applies to SELL positions.
-            if side == "SELL" and square_off_now:
+            # ── Forced square-off: day-trade-only system (Jwala Jul
+            # 11 revision — was SHORT-only from Jul 8, now applies to
+            # BOTH sides: "let's also close the long ones also...
+            # this algo system would be for a day trade only").
+            if square_off_now:
                 price = self._current_price(symbol)
                 if price is None:
                     continue
                 if db.close_paper_position(pid, price, exit_reason="square_off"):
                     qty   = int(pos["quantity"])
                     entry = float(pos["entry_price"])
-                    pnl   = (entry - price) * qty
+                    pnl   = (price - entry) * qty if side == "BUY" else (entry - price) * qty
                     self.rms.record_realized_pnl(pnl)
                     closed.append({
                         "symbol": symbol, "reason": "square_off",
@@ -237,13 +272,31 @@ class PaperTrader:
             stop   = float(pos["stop_loss"])
             target = float(pos["target"])
 
+            # ── Volume Spike: trailing stop is the REAL exit, not
+            # the fixed target (Jwala Jul 11, 21:16-21:43: "the stock
+            # can run up to 10%, 15%... we'll have to go for trailing
+            # the stop loss... so that we can capture big moves").
+            # A hard 1:2 target would close the position before the
+            # trailing stop ever gets a chance to ride a bigger move —
+            # defeats the purpose. So for Volume Spike, `target` is
+            # kept on the row for reference/display only; the actual
+            # hit-check below skips it and relies purely on the
+            # (possibly-trailed) stop plus the universal EOD square-off.
+            is_volume_spike = str(pos.get("strategy", "")) == "Volume Spike"
+            if is_volume_spike:
+                stop = self._apply_trailing_stop(pos, price, side, stop)
+
             hit = None
             if side == "BUY":
-                if price <= stop:   hit = "stop"
-                elif price >= target: hit = "target"
+                if price <= stop:
+                    hit = "stop"
+                elif not is_volume_spike and price >= target:
+                    hit = "target"
             else:  # SELL (short) — mirrored: stop above, target below
-                if price >= stop:   hit = "stop"
-                elif price <= target: hit = "target"
+                if price >= stop:
+                    hit = "stop"
+                elif not is_volume_spike and price <= target:
+                    hit = "target"
 
             if hit:
                 if db.close_paper_position(pid, price, exit_reason=hit):
@@ -257,6 +310,69 @@ class PaperTrader:
                         "exit": price, "pnl": round(pnl, 2),
                     })
         return closed
+
+    def _apply_trailing_stop(self, pos, current_price: float, side: str, current_stop: float) -> float:
+        """
+        Volume Spike trailing stop (Jwala Jul 11 — concept confirmed
+        on the call, exact formula is my own design choice, flagged
+        for confirmation):
+
+          1. Track peak_price — the best price seen since entry
+             (highest for LONG, lowest for SHORT).
+          2. Once price has moved favorably by at least
+             initial_stop_distance (the entry-to-stop gap at open
+             time — snapshotted once, never recomputed, so a moving
+             stop doesn't change what counts as "moved enough"),
+             move the stop to breakeven (entry price).
+          3. Beyond that, trail behind the peak by the same
+             initial_stop_distance.
+
+        Persists peak_price every call, and stop_loss only when it
+        actually changes. Returns the stop to use for THIS cycle's
+        hit-check (may be unchanged from current_stop).
+        """
+        pid = int(pos["id"])
+        entry = float(pos["entry_price"])
+        risk_dist = pos.get("initial_stop_distance")
+        peak = pos.get("peak_price")
+
+        # Defensive fallback for any row opened before this migration
+        # (peak_price/initial_stop_distance NULL) — skip trailing
+        # rather than guess, this cycle's ordinary stop/target still
+        # applies via current_stop.
+        if risk_dist is None or peak is None:
+            return current_stop
+
+        risk_dist = float(risk_dist)
+        peak      = float(peak)
+        new_stop  = current_stop
+        peak_changed = False
+
+        if side == "BUY":
+            if current_price > peak:
+                peak, peak_changed = current_price, True
+            moved_favorably = peak - entry
+            if moved_favorably >= risk_dist:
+                breakeven_or_better = max(entry, peak - risk_dist)
+                if breakeven_or_better > new_stop:
+                    new_stop = round(breakeven_or_better, 2)
+        else:  # SELL (short) — mirrored: peak is the LOWEST price seen
+            if current_price < peak:
+                peak, peak_changed = current_price, True
+            moved_favorably = entry - peak
+            if moved_favorably >= risk_dist:
+                breakeven_or_better = min(entry, peak + risk_dist)
+                if breakeven_or_better < new_stop:
+                    new_stop = round(breakeven_or_better, 2)
+
+        stop_changed = new_stop != current_stop
+        if peak_changed or stop_changed:
+            db.update_trailing_state(
+                pid, peak_price=peak,
+                new_stop=new_stop if stop_changed else None,
+            )
+
+        return new_stop
 
     # --------------------------------------------------------
     # MANUAL CONTROLS — dashboard buttons (Jwala Jul 8)

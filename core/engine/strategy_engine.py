@@ -58,8 +58,19 @@ def _get_paper_trader(provider):
     return _paper_trader or None
 
 def _run_paper_trading(provider, results):
-    """Open positions for newly-alerted BUY/SELL signals. Called once per
-    scan, single-threaded, after the scan's thread pool has joined."""
+    """
+    Open positions for newly-alerted BUY/SELL signals. Called once per
+    scan, single-threaded, after the scan's thread pool has joined.
+
+    Signal-grade gating (Jwala, Jul 11: "do we make it a condition to
+    open only the strong ones... we can enter for strong and moderate
+    ones, very strong, strong and moderate. We can skip the weak
+    ones."). `strength` is already computed and present on every
+    result dict (see scan_instrument/_scan_multi) — this just filters
+    on it before a signal ever reaches the paper trader. Anything
+    that isn't literally "WEAK" is eligible (MODERATE / STRONG / VERY
+    STRONG, regardless of how many grade levels exist upstream).
+    """
     pt = _get_paper_trader(provider)
     if pt is None:
         return
@@ -69,6 +80,9 @@ def _run_paper_trading(provider, results):
         if not r.get("alerted"):
             continue
         if r.get("signal") not in ("BUY", "SELL"):
+            continue
+        if r.get("strength") == "WEAK":
+            log.debug(f"PAPER SKIP  {r.get('symbol')}  WEAK signal — not eligible to open")
             continue
         try:
             outcome = pt.on_signal(
