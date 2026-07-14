@@ -1557,7 +1557,8 @@ def render_paper_trading():
             reason   = str(r.get("exit_reason", "")).upper()
             rc = {"STOP": "var(--red)", "TARGET": "var(--green)",
                   "REVERSAL": "var(--amber)", "MANUAL": "var(--blue)",
-                  "SQUARE_OFF": "var(--purple)", "KILL_SWITCH": "var(--red)"}.get(reason, "var(--t3)")
+                  "SQUARE_OFF": "var(--purple)", "KILL_SWITCH": "var(--red)",
+                  "STALE_CARRYOVER": "var(--purple)"}.get(reason, "var(--t3)")
 
             try:
                 opened = pd.to_datetime(r["opened_at"], utc=True).tz_convert(IST).strftime("%d-%b %H:%M")

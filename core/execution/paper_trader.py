@@ -96,6 +96,25 @@ SQUARE_OFF_TIME = dtime(15, 0)
 def _past_square_off_time() -> bool:
     return datetime.now(IST).time() >= SQUARE_OFF_TIME
 
+
+def _is_from_previous_day(opened_at) -> bool:
+    """
+    True if opened_at's IST calendar date is before today's IST
+    calendar date. Feeds the start-of-day catch-up sweep below —
+    distinct from same-day square-off, this catches anything that
+    somehow survived into a NEW day (Jwala/Om, Jul 14: positions
+    opened before last night's deploy were still sitting open the
+    next morning, since new code doesn't retroactively touch rows
+    already in the DB — this sweep is what actually clears them, the
+    first time it runs, rather than waiting on a fresh 3PM boundary).
+    """
+    try:
+        if opened_at.tzinfo is None:
+            opened_at = pytz.utc.localize(opened_at)
+        return opened_at.astimezone(IST).date() < datetime.now(IST).date()
+    except Exception:
+        return False
+
 # Only equities are paper-traded. Skip index/commodity symbols.
 def _is_equity(symbol: str) -> bool:
     if symbol.startswith("^"):        # ^NSEI, ^BSESN — indexes
@@ -245,6 +264,31 @@ class PaperTrader:
             symbol = pos["symbol"]
             side   = pos["side"]
             pid    = int(pos["id"])
+
+            # ── Start-of-day catch-up sweep (Jwala/Om, Jul 14): a
+            # position from a PREVIOUS calendar day gets force-closed
+            # immediately, on whatever scan cycle next runs — no
+            # waiting for today's 3PM. This scheduler already ticks
+            # from 9:01 IST (before the 9:15 market-open gate that
+            # only run_primary_scan checks), so this naturally clears
+            # any stale carryover before real trading starts each day.
+            # Distinct reason ("stale_carryover") from routine
+            # "square_off", so reporting can tell the two apart —
+            # this is a one-off cleanup path, not a normal daily exit.
+            if _is_from_previous_day(pos["opened_at"]):
+                price = self._current_price(symbol)
+                if price is None:
+                    continue
+                if db.close_paper_position(pid, price, exit_reason="stale_carryover"):
+                    qty   = int(pos["quantity"])
+                    entry = float(pos["entry_price"])
+                    pnl   = (price - entry) * qty if side == "BUY" else (entry - price) * qty
+                    self.rms.record_realized_pnl(pnl)
+                    closed.append({
+                        "symbol": symbol, "reason": "stale_carryover",
+                        "exit": price, "pnl": round(pnl, 2),
+                    })
+                continue  # already resolved — skip everything below for this position
 
             # ── Forced square-off: day-trade-only system (Jwala Jul
             # 11 revision — was SHORT-only from Jul 8, now applies to
