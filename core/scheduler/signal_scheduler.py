@@ -68,6 +68,20 @@ if _ACTIVE_STRATEGY not in ALL_STRATEGY_NAMES:
 # NSE HOLIDAYS 2025—2027
 # ============================================================
 
+# 2026 dates verified against the OFFICIAL NSE circular
+# (NSE/CMTR/71775, dated 12-Dec-2025, https://nsearchives.nseindia.com/
+# content/circulars/CMTR71775.pdf) on 17-Jul-2026 — Jul 17 itself was
+# the trigger: it was wrongly in this set (not an actual holiday),
+# which caused the scheduler to skip a real trading day. Checking
+# every other 2026 date against the same circular found the previous
+# list was wrong on 9 of its 17 entries (wrong dates, a missing
+# holiday — Bakri Id — and one date, Oct 21, that isn't a holiday at
+# all). Rebuilt from the source rather than patching the one date.
+#
+# 2025 (already past) and 2027 (no official NSE circular published
+# yet as of this fix — NSE typically issues it in December of the
+# prior year) are UNVERIFIED — left as they were. Re-check 2027
+# against NSE's circular once it's published, before relying on it.
 NSE_HOLIDAYS = {
     date(2025, 1, 26), date(2025, 2, 26), date(2025, 3, 14),
     date(2025, 3, 31), date(2025, 4, 14), date(2025, 4, 18),
@@ -75,12 +89,24 @@ NSE_HOLIDAYS = {
     date(2025, 10, 2), date(2025, 10, 20),date(2025, 10, 21),
     date(2025, 11, 5), date(2025, 12, 25),
 
-    date(2026, 1, 26), date(2026, 2, 26), date(2026, 3, 20),
-    date(2026, 3, 25), date(2026, 4, 2),  date(2026, 4, 3),
-    date(2026, 4, 14), date(2026, 4, 30), date(2026, 6, 27),
-    date(2026, 7, 17), date(2026, 8, 15), date(2026, 8, 27),
-    date(2026, 9, 25), date(2026, 10, 2), date(2026, 10, 20),
-    date(2026, 10, 21),date(2026, 11, 25),date(2026, 12, 25),
+    date(2026, 1, 26),  # Republic Day
+    date(2026, 3, 3),   # Holi
+    date(2026, 3, 26),  # Shri Ram Navami
+    date(2026, 3, 31),  # Shri Mahavir Jayanti
+    date(2026, 4, 3),   # Good Friday
+    date(2026, 4, 14),  # Dr. Baba Saheb Ambedkar Jayanti
+    date(2026, 5, 1),   # Maharashtra Day
+    date(2026, 5, 28),  # Bakri Id
+    date(2026, 6, 26),  # Muharram
+    date(2026, 9, 14),  # Ganesh Chaturthi
+    date(2026, 10, 2),  # Mahatma Gandhi Jayanti
+    date(2026, 10, 20), # Dussehra
+    date(2026, 11, 10), # Diwali-Balipratipada
+    date(2026, 11, 24), # Prakash Gurpurb Sri Guru Nanak Dev
+    date(2026, 12, 25), # Christmas
+    # Aug 15, 2026 (Independence Day) falls on a Saturday per the
+    # circular's own weekend list — already skipped by the weekday
+    # check, no separate entry needed.
 
     date(2027, 1, 26), date(2027, 2, 17), date(2027, 3, 10),
     date(2027, 3, 19), date(2027, 3, 26), date(2027, 4, 2),
