@@ -47,7 +47,7 @@ st.set_page_config(
 
 # ============================================================
 # LOGIN GATE (Jwala, Jul 11: "I think we need to put some login
-# credentials also")
+# credentials also"; redesign Jul 19 — "make it modern")
 #
 # Interim app-level auth via streamlit-authenticator — not Azure Easy
 # Auth (confirmed blocked: 401 on Entra ID App registration, Jul 13).
@@ -62,6 +62,111 @@ st.set_page_config(
 # To add/remove people or set real passwords: see the instructions at
 # the top of configs/auth_config.yaml and scripts/hash_password.py.
 # ============================================================
+
+IST = pytz.timezone("Asia/Kolkata")  # moved up from below set_page_config —
+                                      # needed here for the login screen's
+                                      # own live market-status readout
+
+# ── LOGIN SCREEN — styled unconditionally, before auth succeeds, so it
+# never renders as bare unstyled Streamlit. Dark terminal aesthetic
+# matching the rest of the app (same palette/type as the main theme
+# below), not a separate visual identity. Signature element: a live
+# IST clock + real MARKET OPEN/CLOSED badge at the top of the card —
+# reuses the same badge classes and market-hours logic as the live
+# dashboard, so the login screen reads as part of the terminal, not a
+# bolted-on auth wall, before a single credential is even typed.
+if not st.session_state.get("authentication_status"):
+    from datetime import time as _dtime
+    _login_now = datetime.now(IST)
+    _login_open = _login_now.weekday() < 5 and _dtime(9, 15) <= _login_now.time() <= _dtime(15, 30)
+    _badge_cls  = "mkt-open" if _login_open else "mkt-closed"
+    _badge_text = "MARKET OPEN" if _login_open else "MARKET CLOSED"
+
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap');
+
+    .stApp { background: #080c18 !important; }
+    #MainMenu, footer, header { visibility: hidden; }
+    section[data-testid="stSidebar"] { display: none !important; }
+    .block-container { padding-top: 6vh !important; max-width: 460px !important; }
+
+    .login-wrap { text-align: center; margin-bottom: 28px; }
+    .login-word {
+        font-family: 'IBM Plex Sans', sans-serif; font-size: 30px; font-weight: 700;
+        color: #f1f5fb; letter-spacing: 3px; margin-bottom: 6px;
+    }
+    .login-word span { color: #4a90e2; }
+    .login-tag {
+        font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #6b7fa0;
+        letter-spacing: 3px; text-transform: uppercase; margin-bottom: 18px;
+    }
+    .login-status {
+        display: inline-flex; align-items: center; gap: 10px;
+        font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #7a8cae;
+        border: 1px solid #1a2840; border-radius: 20px; padding: 6px 16px;
+        background: rgba(255,255,255,0.02);
+    }
+    .mkt-open { display:inline-flex; align-items:center; gap:6px; color:#1ec9a0; font-weight:700; letter-spacing:1px; }
+    .mkt-closed { display:inline-flex; align-items:center; gap:6px; color:#f05555; font-weight:700; letter-spacing:1px; }
+    .pulse-dot { width:6px; height:6px; border-radius:50%; background:currentColor; animation:loginpulse 2s infinite; }
+    @keyframes loginpulse { 0%,100%{opacity:1} 50%{opacity:0.35} }
+
+    /* The form itself becomes the "card" */
+    div[data-testid="stForm"] {
+        background: linear-gradient(180deg, #101828 0%, #0d1526 100%) !important;
+        border: 1px solid #1a2840 !important; border-radius: 14px !important;
+        padding: 32px 32px 26px !important;
+        box-shadow: 0 0 0 1px rgba(74,144,226,0.06), 0 20px 50px rgba(0,0,0,0.45);
+        position: relative; overflow: hidden;
+    }
+    div[data-testid="stForm"]::before {
+        content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+        background: linear-gradient(90deg, #4a90e2, #9b6dff);
+    }
+    div[data-testid="stForm"] h3 {
+        font-family: 'IBM Plex Sans', sans-serif !important; font-size: 17px !important;
+        font-weight: 600 !important; color: #f1f5fb !important; margin-bottom: 18px !important;
+    }
+    div[data-testid="stForm"] label p {
+        font-family: 'JetBrains Mono', monospace !important; font-size: 10px !important;
+        color: #6b7fa0 !important; text-transform: uppercase; letter-spacing: 1.5px;
+    }
+    div[data-testid="stForm"] input {
+        background: #080c18 !important; border: 1px solid #263d60 !important;
+        border-radius: 8px !important; color: #f1f5fb !important; font-size: 14px !important;
+        padding: 10px 12px !important; transition: border-color 0.15s ease;
+    }
+    div[data-testid="stForm"] input:focus {
+        border-color: #4a90e2 !important; box-shadow: 0 0 0 3px rgba(74,144,226,0.15) !important;
+    }
+    div[data-testid="stForm"] button {
+        width: 100% !important; margin-top: 8px !important; border-radius: 8px !important;
+        background: #4a90e2 !important; border: 1px solid #4a90e2 !important;
+        color: #fff !important; font-weight: 600 !important; padding: 10px !important;
+        transition: all 0.15s ease;
+    }
+    div[data-testid="stForm"] button:hover {
+        background: #3d7dc9 !important; border-color: #3d7dc9 !important;
+        box-shadow: 0 4px 14px rgba(74,144,226,0.35);
+    }
+    .login-footer {
+        text-align: center; margin-top: 22px; font-family: 'JetBrains Mono', monospace;
+        font-size: 10px; color: #3d5070; letter-spacing: 1px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown(f"""
+    <div class="login-wrap">
+        <div class="login-word">ALGO <span>SIGNALS</span></div>
+        <div class="login-tag">NSE &nbsp;·&nbsp; BSE &nbsp;·&nbsp; MCX</div>
+        <div class="login-status">
+            <span>{_login_now.strftime('%d %b %Y &nbsp; %H:%M:%S IST')}</span>
+            <span class="{_badge_cls}"><span class="pulse-dot"></span>{_badge_text}</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 import yaml
 import streamlit_authenticator as stauth
@@ -101,7 +206,15 @@ except Exception as e:
 # this is the only way LoginError fires given we don't use
 # single_session/max_concurrent_users/max_login_attempts.
 try:
-    authenticator.login(location="main")
+    authenticator.login(
+        location="main",
+        fields={
+            "Form name": "Sign in",
+            "Username":  "Username",
+            "Password":  "Password",
+            "Login":     "Sign in",
+        },
+    )
 except LoginError:
     st.error("Your access has been removed. Contact the admin if this is unexpected.")
     st.stop()
@@ -110,10 +223,10 @@ if st.session_state.get("authentication_status") is False:
     st.error("Username or password is incorrect.")
     st.stop()
 elif st.session_state.get("authentication_status") is not True:
+    st.markdown('<div class="login-footer">FOR RESEARCH & INFORMATIONAL PURPOSES ONLY &nbsp;·&nbsp; NOT FINANCIAL ADVICE</div>', unsafe_allow_html=True)
     st.stop()  # not yet submitted — login form is already showing, nothing else to render
 
 st_autorefresh(interval=300000, key="dashboard_refresh")  # 5 min — matches scheduler
-IST = pytz.timezone("Asia/Kolkata")
 
 # ============================================================
 # SESSION STATE
@@ -216,14 +329,43 @@ div[data-baseweb="select"] span { color: var(--t1) !important; }
 /* Checkbox */
 .stCheckbox label p, .stCheckbox label span { color: var(--t2) !important; font-size: 13px !important; }
 
-/* Button */
+/* Button — refined for a more polished, consistent look across the
+   Close/Stop/Chart action buttons (Jwala Jul 17: "make the buttons
+   more professional") — subtle shadow, smoother hover/press states,
+   slightly larger radius, consistent height so a row of 3 aligns
+   cleanly. This is my interpretation of "professional" — say the
+   word if you want a different direction (flatter, more colorful, etc). */
 .stButton > button {
     background: var(--card) !important; border: 1px solid var(--border2) !important;
-    color: var(--t2) !important; font-size: 12px !important;
+    color: var(--t2) !important; font-size: 12px !important; font-weight: 500 !important;
     font-family: 'IBM Plex Sans', sans-serif !important;
-    border-radius: 6px !important; transition: all 0.2s; width: 100%;
+    border-radius: 8px !important; min-height: 34px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.06); transition: all 0.15s ease; width: 100%;
 }
-.stButton > button:hover { border-color: var(--blue) !important; color: var(--blue) !important; background: var(--card2) !important; }
+.stButton > button:hover {
+    border-color: var(--blue) !important; color: var(--blue) !important;
+    background: var(--card2) !important; box-shadow: 0 2px 6px rgba(74,144,226,0.18);
+}
+.stButton > button:active { transform: translateY(1px); box-shadow: none; }
+
+/* Primary buttons (Streamlit's type="primary") — used for the
+   destructive "Close" action so it reads as intentional/distinct
+   from Chart and Stop. */
+.stButton > button[kind="primary"] {
+    background: var(--red) !important; border: 1px solid var(--red) !important;
+    color: #fff !important; font-weight: 600 !important;
+}
+.stButton > button[kind="primary"]:hover {
+    background: #d84343 !important; border-color: #d84343 !important;
+    color: #fff !important; box-shadow: 0 2px 6px rgba(240,85,85,0.35);
+}
+
+/* Popover trigger (the "Stop" button) — same treatment as a normal button */
+div[data-testid="stPopover"] > button {
+    border-radius: 8px !important; min-height: 34px; box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+    transition: all 0.15s ease;
+}
+div[data-testid="stPopover"] > button:hover { box-shadow: 0 2px 6px rgba(74,144,226,0.18); }
 
 /* KPI Metrics */
 div[data-testid="metric-container"] { background: var(--card) !important; border: 1px solid var(--border) !important; border-radius: 10px !important; padding: 16px 20px !important; }
@@ -1073,6 +1215,30 @@ show_chart_panel()
 
 
 # ============================================================
+# TABS — Live Trading / Paper Trading / Signals (Jwala, Jul 14:
+# "consider 3 pages... one goes for the live trading, one goes for
+# the paper trading, one goes for the live signals being generated" —
+# built as st.tabs() inside this one file, not separate Streamlit
+# pages/URLs, so the login gate and session state stay exactly as
+# they are — no risk of auth breaking across pages).
+#
+# KPI bar and chart panel stay page-level chrome (always visible,
+# above the tabs) — not moved into a specific tab, to keep this
+# restructure minimal and lower-risk. Say the word if you'd rather
+# have the KPI bar live inside the Signals tab specifically instead.
+# ============================================================
+
+tab_live, tab_paper, tab_signals = st.tabs(["🔴 Live Trading", "📊 Paper Trading", "📡 Signals"])
+
+with tab_live:
+    st.info(
+        "Live trading isn't implemented yet — this tab is reserved for "
+        "when real broker execution goes live (Phase 4). Until then, "
+        "use the Paper Trading tab to track simulated performance."
+    )
+
+
+# ============================================================
 # BACKTEST SUMMARY BAR
 # ============================================================
 
@@ -1272,6 +1438,245 @@ def _fmt_duration(opened_at, closed_at) -> str:
         return "—"
 
 
+# ── Per-strategy table split (Jwala Jul 14: "Can we have segregation
+# in terms of strategy? So RSI reversal, one strategy or block of
+# RSI, then volumes like another block... strategy wise, I have a
+# segregation just by looking at it") — separate tables, not a
+# dropdown filter. Canonical order first, then anything else found in
+# the data (e.g. if Arbitrage joins paper trading later) so nothing
+# silently disappears if a new strategy name shows up. ──
+_CANONICAL_STRATEGY_ORDER = ["RSI Reversal", "Volume Spike"]
+
+def _ordered_strategies_present(df) -> list:
+    if df is None or df.empty or "strategy" not in df.columns:
+        return []
+    present = set(df["strategy"].unique())
+    ordered = [s for s in _CANONICAL_STRATEGY_ORDER if s in present]
+    ordered += sorted(present - set(_CANONICAL_STRATEGY_ORDER))
+    return ordered
+
+
+def _render_open_positions_table(df, cmp_map, key_prefix: str):
+    """One Open Positions table for a (pre-filtered, single-strategy)
+    slice of open_df. key_prefix keeps widget keys unique across the
+    RSI/Volume Spike tables (position id alone is already globally
+    unique, so this is just cheap insurance)."""
+    if df is None or df.empty:
+        st.markdown('<div class="no-sig">No open positions</div>', unsafe_allow_html=True)
+        return
+
+    widths = [1.5, 0.55, 0.55, 0.85, 1.0, 1.0, 0.85, 0.85, 0.95, 0.8, 1.5]
+    h = st.columns(widths)
+    for col, lbl in zip(h, ["Stock", "Side", "Qty", "Entry", "CMP", "Unreal. P&L",
+                             "Stop", "Target", "Capital", "Opened", "Actions"]):
+        col.markdown(f'<div class="col-hdr">{lbl}</div>', unsafe_allow_html=True)
+
+    for _, r in df.iterrows():
+        pid    = int(r["id"])
+        sym    = r["symbol"]
+        side   = r["side"]
+        qty    = int(r["quantity"])
+        entry  = float(r["entry_price"])
+        stop   = float(r["stop_loss"])
+        target = float(r["target"])
+        side_c = "var(--green)" if side == "BUY" else "var(--red)"
+        side_lbl = "LONG" if side == "BUY" else "SHORT"
+        cmp    = cmp_map.get(sym)
+        capital_used = entry * qty
+
+        c = st.columns(widths)
+
+        with c[0]:
+            st.markdown(f"<div style='padding:9px 0;font-size:13px;color:var(--t1);font-weight:600;'>{stock_display(sym)}</div>", unsafe_allow_html=True)
+        with c[1]:
+            st.markdown(f"<div style='padding:9px 0;'><span style='color:{side_c};font-weight:700;font-family:JetBrains Mono,monospace;font-size:11px;'>{side_lbl}</span></div>", unsafe_allow_html=True)
+        with c[2]:
+            st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>{qty}</div>", unsafe_allow_html=True)
+        with c[3]:
+            st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>₹{entry:,.2f}</div>", unsafe_allow_html=True)
+
+        with c[4]:
+            if cmp is not None:
+                u_arrow = "▲" if cmp >= entry else "▼"
+                u_c     = "var(--green)" if cmp >= entry else "var(--red)"
+                st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;'>"
+                            f"<span style='color:var(--t1);font-weight:600;'>₹{cmp:,.2f}</span> "
+                            f"<span style='font-size:10px;color:{u_c};'>{u_arrow}{abs(cmp-entry):,.2f}</span></div>", unsafe_allow_html=True)
+            else:
+                st.markdown("<div style='padding:9px 0;'><span class='badge-pending'>fetching…</span></div>", unsafe_allow_html=True)
+
+        with c[5]:
+            if cmp is not None:
+                u   = (cmp - entry) * qty if side == "BUY" else (entry - cmp) * qty
+                u_c = "var(--green)" if u >= 0 else "var(--red)"
+                st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;'>"
+                            f"<span style='color:{u_c};font-weight:700;'>{'+' if u>=0 else '-'}₹{abs(u):,.0f}</span></div>", unsafe_allow_html=True)
+            else:
+                st.markdown("<div style='padding:9px 0;'><span class='badge-pending'>–</span></div>", unsafe_allow_html=True)
+
+        with c[6]:
+            st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--purple);'>₹{stop:,.2f}</div>", unsafe_allow_html=True)
+        with c[7]:
+            st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--amber);'>₹{target:,.2f}</div>", unsafe_allow_html=True)
+        with c[8]:
+            st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>₹{capital_used:,.0f}</div>", unsafe_allow_html=True)
+
+        with c[9]:
+            try:
+                opened = pd.to_datetime(r["opened_at"], utc=True).tz_convert(IST).strftime("%d-%b %H:%M")
+            except Exception:
+                opened = str(r.get("opened_at", ""))[:16]
+            st.markdown(f"<div style='padding:9px 0;font-size:11px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{opened}</div>", unsafe_allow_html=True)
+
+        with c[10]:
+            chcol, bcol, scol = st.columns(3)
+            with chcol:
+                if st.button("📈", key=f"{key_prefix}_chart_{pid}", help=f"View chart for {stock_display(sym)}"):
+                    if st.session_state.chart_symbol == sym:
+                        st.session_state.chart_symbol = None
+                        st.session_state.chart_name   = None
+                    else:
+                        st.session_state.chart_symbol = sym
+                        st.session_state.chart_name   = stock_display(sym)
+                    st.rerun()
+            with bcol:
+                if st.button("Close", key=f"{key_prefix}_close_{pid}", help=f"Book P&L now for {stock_display(sym)}", type="primary"):
+                    exit_px = cmp if cmp is not None else entry
+                    if close_paper_position(pid, exit_px, exit_reason="manual"):
+                        st.rerun()
+                    else:
+                        st.error("Close failed")
+            with scol:
+                with st.popover("Stop"):
+                    new_stop = st.number_input(
+                        "New stop", value=stop, step=0.05, format="%.2f",
+                        key=f"{key_prefix}_stop_input_{pid}",
+                    )
+                    if st.button("Update", key=f"{key_prefix}_stop_btn_{pid}"):
+                        if update_paper_position_stop(pid, new_stop):
+                            st.rerun()
+                        else:
+                            st.error("Update failed")
+
+        st.markdown("<div class='row-div'></div>", unsafe_allow_html=True)
+
+
+def _render_closed_trades_table(df, key_prefix: str):
+    """One paginated Closed Trades table for a (pre-filtered,
+    single-strategy) slice of closed_df. Each strategy's table gets
+    its OWN pagination state (key_prefix-scoped session_state key),
+    so paging through RSI trades doesn't affect Volume Spike's page."""
+    if df is None or df.empty:
+        st.markdown('<div class="no-sig">No closed trades yet</div>', unsafe_allow_html=True)
+        return
+
+    PAGE = 15
+    total = len(df)
+    pages = max(1, (total + PAGE - 1) // PAGE)
+    page_key = f"{key_prefix}_closed_page"
+    if page_key not in st.session_state:
+        st.session_state[page_key] = 0
+    st.session_state[page_key] = max(0, min(st.session_state[page_key], pages - 1))
+    pg = st.session_state[page_key]
+
+    page_df = df.iloc[pg*PAGE : (pg+1)*PAGE]
+
+    ct_widths = [1.2, 0.5, 0.5, 1.0, 1.0, 0.85, 0.85, 0.85, 0.7, 0.55]
+    ct_h = st.columns(ct_widths)
+    for col, lbl in zip(ct_h, ["Stock", "Side", "Qty", "Entry", "Exit", "Gross P&L", "Net P&L",
+                                 "Exit Reason", "Duration", "Chart"]):
+        col.markdown(f'<div class="col-hdr">{lbl}</div>', unsafe_allow_html=True)
+
+    for _, r in page_df.iterrows():
+        ct_sym   = r["symbol"]
+        side     = r["side"]
+        side_c   = "var(--green)" if side == "BUY" else "var(--red)"
+        side_lbl = "LONG" if side == "BUY" else "SHORT"
+        qty      = int(r["quantity"])
+        pnl      = float(r["pnl"])
+        pnl_c    = "var(--green)" if pnl >= 0 else "var(--red)"
+        net_pnl_val = r.get("net_pnl")
+        net_pnl_val = float(net_pnl_val) if net_pnl_val is not None and pd.notna(net_pnl_val) else None
+        reason   = str(r.get("exit_reason", "")).upper()
+        rc = {"STOP": "var(--red)", "TARGET": "var(--green)",
+              "REVERSAL": "var(--amber)", "MANUAL": "var(--blue)",
+              "SQUARE_OFF": "var(--purple)", "KILL_SWITCH": "var(--red)",
+              "STALE_CARRYOVER": "var(--purple)"}.get(reason, "var(--t3)")
+
+        try:
+            opened = pd.to_datetime(r["opened_at"], utc=True).tz_convert(IST).strftime("%d-%b %H:%M")
+        except Exception:
+            opened = str(r.get("opened_at", ""))[:16]
+        try:
+            closed = pd.to_datetime(r["closed_at"], utc=True).tz_convert(IST).strftime("%d-%b %H:%M")
+        except Exception:
+            closed = str(r.get("closed_at", ""))[:16]
+        duration = _fmt_duration(r.get("opened_at"), r.get("closed_at"))
+
+        cc = st.columns(ct_widths)
+
+        with cc[0]:
+            st.markdown(f"<div style='padding:9px 0;font-size:13px;color:var(--t1);font-weight:600;'>{stock_display(ct_sym)}</div>", unsafe_allow_html=True)
+        with cc[1]:
+            st.markdown(f"<div style='padding:9px 0;'><span style='color:{side_c};font-weight:700;font-family:JetBrains Mono,monospace;font-size:11px;'>{side_lbl}</span></div>", unsafe_allow_html=True)
+        with cc[2]:
+            st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>{qty}</div>", unsafe_allow_html=True)
+        with cc[3]:
+            st.markdown(
+                f"<div style='padding:9px 0;'>"
+                f"<div style='font-family:JetBrains Mono,monospace;font-size:13px;color:var(--t1);font-weight:700;'>₹{float(r['entry_price']):,.2f}</div>"
+                f"<div style='font-size:10px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{opened}</div>"
+                f"</div>", unsafe_allow_html=True)
+        with cc[4]:
+            st.markdown(
+                f"<div style='padding:9px 0;'>"
+                f"<div style='font-family:JetBrains Mono,monospace;font-size:13px;color:var(--t1);font-weight:700;'>₹{float(r['exit_price']):,.2f}</div>"
+                f"<div style='font-size:10px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{closed}</div>"
+                f"</div>", unsafe_allow_html=True)
+        with cc[5]:
+            st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:{pnl_c};font-weight:700;'>{'+' if pnl>=0 else '-'}₹{abs(pnl):,.0f}</div>", unsafe_allow_html=True)
+        with cc[6]:
+            if net_pnl_val is not None:
+                net_c = "var(--green)" if net_pnl_val >= 0 else "var(--red)"
+                st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:{net_c};font-weight:700;'>{'+' if net_pnl_val>=0 else '-'}₹{abs(net_pnl_val):,.0f}</div>", unsafe_allow_html=True)
+            else:
+                st.markdown("<div style='padding:9px 0;'><span class='badge-pending'>–</span></div>", unsafe_allow_html=True)
+        with cc[7]:
+            st.markdown(f"<div style='padding:9px 0;font-size:11px;color:{rc};font-family:JetBrains Mono,monospace;text-transform:uppercase;'>{reason}</div>", unsafe_allow_html=True)
+        with cc[8]:
+            st.markdown(f"<div style='padding:9px 0;font-size:11px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{duration}</div>", unsafe_allow_html=True)
+        with cc[9]:
+            _ct_key = f"{key_prefix}_closed_chart_{int(r['id'])}"
+            if st.button("📈", key=_ct_key, help=f"View chart for {stock_display(ct_sym)}"):
+                if st.session_state.chart_symbol == ct_sym:
+                    st.session_state.chart_symbol = None
+                    st.session_state.chart_name   = None
+                else:
+                    st.session_state.chart_symbol = ct_sym
+                    st.session_state.chart_name   = stock_display(ct_sym)
+                st.rerun()
+
+        st.markdown("<div class='row-div'></div>", unsafe_allow_html=True)
+
+    if pages > 1:
+        nav1, nav2, nav3 = st.columns([1, 2, 1])
+        with nav1:
+            if st.button("← Prev", key=f"{key_prefix}_prev", disabled=(pg <= 0)):
+                st.session_state[page_key] = max(0, pg - 1)
+                st.rerun()
+        with nav2:
+            st.markdown(
+                f"<div style='text-align:center;font-size:11px;color:var(--t3);"
+                f"font-family:JetBrains Mono,monospace;padding-top:8px;'>"
+                f"Page {pg + 1} of {pages} &nbsp;·&nbsp; {total} closed trades</div>",
+                unsafe_allow_html=True,
+            )
+        with nav3:
+            if st.button("Next →", key=f"{key_prefix}_next", disabled=(pg >= pages - 1)):
+                st.session_state[page_key] = min(pages - 1, pg + 1)
+                st.rerun()
+
+
 def render_paper_trading():
     from core.database.db import (
         get_open_paper_positions,
@@ -1371,24 +1776,23 @@ def render_paper_trading():
 
     st.markdown("<div style='margin:20px 0 8px;'></div>", unsafe_allow_html=True)
 
-    # ── OPEN POSITIONS ──
-    # Colours (per Jwala): STOP = purple, TARGET = amber, green/red
-    # reserved strictly for P&L. Rendered as real Streamlit rows (not
-    # a raw HTML table) so each row can carry a live "Close" button,
-    # an "Edit Stop" popover (Jwala Jul 8 — manual profit-booking and
-    # manual stop-shift, e.g. to breakeven), and a chart button.
+    # ── OPEN POSITIONS — split into one table per strategy (Jwala
+    # Jul 14: "Can we have segregation in terms of strategy?... RSI
+    # reversal, one strategy or block... volumes like another block")
+    # — separate tables, not a filter dropdown.
     oph_col, kill_col = st.columns([5, 1.3])
     with oph_col:
         st.markdown('<div style="font-size:12px;font-weight:700;color:var(--t2);text-transform:uppercase;letter-spacing:2px;margin:10px 0 8px;">Open Positions — Unrealized P&L</div>', unsafe_allow_html=True)
     with kill_col:
         # ── Kill Switch (Jwala Jul 11, reconfirmed 16:21/36:07):
-        # close EVERY open position immediately, not one at a time.
-        # Behind a popover confirm — this is destructive and portfolio-wide.
+        # close EVERY open position immediately, across ALL
+        # strategies, not one at a time. Behind a popover confirm —
+        # this is destructive and portfolio-wide.
         with st.popover("🔴 Kill Switch", use_container_width=True):
             n_open = 0 if open_df is None else len(open_df)
             st.markdown(f"**Close all {n_open} open position(s) now?**")
             st.caption("Each closes at its current market price (or entry price if a live quote isn't available). This can't be undone.")
-            if n_open > 0 and st.button("Yes, close everything", key="pt_kill_switch_confirm", use_container_width=True):
+            if n_open > 0 and st.button("Yes, close everything", key="pt_kill_switch_confirm", use_container_width=True, type="primary"):
                 _closed, _failed = 0, []
                 for _, _r in open_df.iterrows():
                     _pid = int(_r["id"])
@@ -1404,336 +1808,138 @@ def render_paper_trading():
                     st.success(f"Closed {_closed} position(s).")
                 st.rerun()
 
-    if open_df is None or open_df.empty:
+    _open_strategies = _ordered_strategies_present(open_df)
+    if not _open_strategies:
         st.markdown('<div class="no-sig">No open positions</div>', unsafe_allow_html=True)
     else:
-        # Actions widened (0.8 → 1.5) for the Chart button (Jwala Jul 11:
-        # "can I have the link here itself of the chart? Like previous.")
-        # alongside the existing Close / Edit-Stop; Strategy trimmed
-        # slightly (1.35 → 1.05) to make room.
-        widths = [1.5, 0.55, 0.55, 0.85, 1.0, 1.0, 0.85, 0.85, 0.95, 1.05, 0.8, 1.5]
-        h = st.columns(widths)
-        for col, lbl in zip(h, ["Stock", "Side", "Qty", "Entry", "CMP", "Unreal. P&L",
-                                 "Stop", "Target", "Capital", "Strategy", "Opened", "Actions"]):
-            col.markdown(f'<div class="col-hdr">{lbl}</div>', unsafe_allow_html=True)
-
-        for _, r in open_df.iterrows():
-            pid    = int(r["id"])
-            sym    = r["symbol"]
-            side   = r["side"]
-            qty    = int(r["quantity"])
-            entry  = float(r["entry_price"])
-            stop   = float(r["stop_loss"])
-            target = float(r["target"])
-            side_c = "var(--green)" if side == "BUY" else "var(--red)"
-            side_lbl = "LONG" if side == "BUY" else "SHORT"
-            cmp    = cmp_map.get(sym)
-            capital_used = entry * qty
-
-            c = st.columns(widths)
-
-            with c[0]:
-                st.markdown(f"<div style='padding:9px 0;font-size:13px;color:var(--t1);font-weight:600;'>{stock_display(sym)}</div>", unsafe_allow_html=True)
-            with c[1]:
-                st.markdown(f"<div style='padding:9px 0;'><span style='color:{side_c};font-weight:700;font-family:JetBrains Mono,monospace;font-size:11px;'>{side_lbl}</span></div>", unsafe_allow_html=True)
-            with c[2]:
-                st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>{qty}</div>", unsafe_allow_html=True)
-            with c[3]:
-                st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>₹{entry:,.2f}</div>", unsafe_allow_html=True)
-
-            with c[4]:
-                if cmp is not None:
-                    u_arrow = "▲" if cmp >= entry else "▼"
-                    u_c     = "var(--green)" if cmp >= entry else "var(--red)"
-                    st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;'>"
-                                f"<span style='color:var(--t1);font-weight:600;'>₹{cmp:,.2f}</span> "
-                                f"<span style='font-size:10px;color:{u_c};'>{u_arrow}{abs(cmp-entry):,.2f}</span></div>", unsafe_allow_html=True)
-                else:
-                    st.markdown("<div style='padding:9px 0;'><span class='badge-pending'>fetching…</span></div>", unsafe_allow_html=True)
-
-            with c[5]:
-                if cmp is not None:
-                    u   = (cmp - entry) * qty if side == "BUY" else (entry - cmp) * qty
-                    u_c = "var(--green)" if u >= 0 else "var(--red)"
-                    st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;'>"
-                                f"<span style='color:{u_c};font-weight:700;'>{'+' if u>=0 else '-'}₹{abs(u):,.0f}</span></div>", unsafe_allow_html=True)
-                else:
-                    st.markdown("<div style='padding:9px 0;'><span class='badge-pending'>–</span></div>", unsafe_allow_html=True)
-
-            with c[6]:
-                st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--purple);'>₹{stop:,.2f}</div>", unsafe_allow_html=True)
-            with c[7]:
-                st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--amber);'>₹{target:,.2f}</div>", unsafe_allow_html=True)
-            with c[8]:
-                st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>₹{capital_used:,.0f}</div>", unsafe_allow_html=True)
-            with c[9]:
-                st.markdown(f"<div style='padding:9px 0;'>{strategy_pill_html(r['strategy'], r['timeframe'])}</div>", unsafe_allow_html=True)
-
-            with c[10]:
-                try:
-                    opened = pd.to_datetime(r["opened_at"], utc=True).tz_convert(IST).strftime("%d-%b %H:%M")
-                except Exception:
-                    opened = str(r.get("opened_at", ""))[:16]
-                st.markdown(f"<div style='padding:9px 0;font-size:11px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{opened}</div>", unsafe_allow_html=True)
-
-            with c[11]:
-                chcol, bcol, scol = st.columns(3)
-                with chcol:
-                    # Same inline chart panel the signal feed uses — "like
-                    # previous" (Jwala Jul 11: "can I have the link here
-                    # itself of the chart? Like previous.")
-                    if st.button("📈", key=f"pt_chart_{pid}", help=f"View chart for {stock_display(sym)}"):
-                        if st.session_state.chart_symbol == sym:
-                            st.session_state.chart_symbol = None
-                            st.session_state.chart_name   = None
-                        else:
-                            st.session_state.chart_symbol = sym
-                            st.session_state.chart_name   = stock_display(sym)
-                        st.rerun()
-                with bcol:
-                    if st.button("Close", key=f"pt_close_{pid}", help=f"Book P&L now for {stock_display(sym)}"):
-                        exit_px = cmp if cmp is not None else entry
-                        if close_paper_position(pid, exit_px, exit_reason="manual"):
-                            st.rerun()
-                        else:
-                            st.error("Close failed")
-                with scol:
-                    with st.popover("Stop"):
-                        new_stop = st.number_input(
-                            "New stop", value=stop, step=0.05, format="%.2f",
-                            key=f"pt_stop_input_{pid}",
-                        )
-                        if st.button("Update", key=f"pt_stop_btn_{pid}"):
-                            if update_paper_position_stop(pid, new_stop):
-                                st.rerun()
-                            else:
-                                st.error("Update failed")
-
-            st.markdown("<div class='row-div'></div>", unsafe_allow_html=True)
+        for _strat in _open_strategies:
+            _strat_df = open_df[open_df["strategy"] == _strat]
+            st.markdown(
+                f'<div style="font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:1.5px;margin:14px 0 6px;">{_strat} &nbsp;·&nbsp; {len(_strat_df)} open</div>',
+                unsafe_allow_html=True,
+            )
+            _render_open_positions_table(_strat_df, cmp_map, key_prefix=f"pt_open_{_strat.replace(' ', '_').lower()}")
 
     st.markdown("<div style='margin-bottom:10px;'></div>", unsafe_allow_html=True)
 
-    # ── CLOSED TRADES — Realized P&L (paginated, 15 per page) ──
-    # Rebuilt as per-row Streamlit widgets (was a static HTML table) so
-    # a chart button can sit on each row — Jwala Jul 11: "can I have
-    # the link here itself of the chart? ... include the chart option
-    # in the closed trades also." Entry price+time and Exit price+time
-    # are merged into one cell each (Jwala Jul 9/11), and Qty is back
-    # (was missing — Om caught this himself on the Jul 11 call too).
+    # ── CLOSED TRADES — split into one table per strategy, same
+    # reasoning as Open Positions above (Jwala Jul 14). Each gets its
+    # OWN pagination (see _render_closed_trades_table's key_prefix).
     st.markdown('<div style="font-size:12px;font-weight:700;color:var(--t2);text-transform:uppercase;letter-spacing:2px;margin:22px 0 8px;">Closed Trades — Realized P&L (Today)</div>', unsafe_allow_html=True)
     closed_df = get_today_closed_paper_positions()  # today only — see summary fetch above
-    if closed_df is None or closed_df.empty:
+
+    _closed_strategies = _ordered_strategies_present(closed_df)
+    if not _closed_strategies:
         st.markdown('<div class="no-sig">No closed trades yet</div>', unsafe_allow_html=True)
     else:
-        PAGE = 15
-        total = len(closed_df)
-        pages = max(1, (total + PAGE - 1) // PAGE)
-        if "pt_closed_page" not in st.session_state:
-            st.session_state.pt_closed_page = 0
-        st.session_state.pt_closed_page = max(0, min(st.session_state.pt_closed_page, pages - 1))
-        pg = st.session_state.pt_closed_page
-
-        page_df = closed_df.iloc[pg*PAGE : (pg+1)*PAGE]
-
-        # Net P&L added alongside Gross (Jwala Jul 11: "we'll call
-        # this gross profit and loss. Net would be after minusing the
-        # brokerage and taxes."). Strategy trimmed slightly to fit.
-        ct_widths = [1.1, 0.5, 0.5, 0.95, 0.95, 0.8, 0.8, 0.75, 1.0, 0.65, 0.5]
-        ct_h = st.columns(ct_widths)
-        for col, lbl in zip(ct_h, ["Stock", "Side", "Qty", "Entry", "Exit", "Gross P&L", "Net P&L",
-                                     "Exit Reason", "Strategy", "Duration", "Chart"]):
-            col.markdown(f'<div class="col-hdr">{lbl}</div>', unsafe_allow_html=True)
-
-        for _, r in page_df.iterrows():
-            ct_sym   = r["symbol"]
-            side     = r["side"]
-            side_c   = "var(--green)" if side == "BUY" else "var(--red)"
-            side_lbl = "LONG" if side == "BUY" else "SHORT"
-            qty      = int(r["quantity"])
-            pnl      = float(r["pnl"])
-            pnl_c    = "var(--green)" if pnl >= 0 else "var(--red)"
-            net_pnl_val = r.get("net_pnl")
-            net_pnl_val = float(net_pnl_val) if net_pnl_val is not None and pd.notna(net_pnl_val) else None
-            reason   = str(r.get("exit_reason", "")).upper()
-            rc = {"STOP": "var(--red)", "TARGET": "var(--green)",
-                  "REVERSAL": "var(--amber)", "MANUAL": "var(--blue)",
-                  "SQUARE_OFF": "var(--purple)", "KILL_SWITCH": "var(--red)",
-                  "STALE_CARRYOVER": "var(--purple)"}.get(reason, "var(--t3)")
-
-            try:
-                opened = pd.to_datetime(r["opened_at"], utc=True).tz_convert(IST).strftime("%d-%b %H:%M")
-            except Exception:
-                opened = str(r.get("opened_at", ""))[:16]
-            try:
-                closed = pd.to_datetime(r["closed_at"], utc=True).tz_convert(IST).strftime("%d-%b %H:%M")
-            except Exception:
-                closed = str(r.get("closed_at", ""))[:16]
-            duration = _fmt_duration(r.get("opened_at"), r.get("closed_at"))
-
-            cc = st.columns(ct_widths)
-
-            with cc[0]:
-                st.markdown(f"<div style='padding:9px 0;font-size:13px;color:var(--t1);font-weight:600;'>{stock_display(ct_sym)}</div>", unsafe_allow_html=True)
-            with cc[1]:
-                st.markdown(f"<div style='padding:9px 0;'><span style='color:{side_c};font-weight:700;font-family:JetBrains Mono,monospace;font-size:11px;'>{side_lbl}</span></div>", unsafe_allow_html=True)
-            with cc[2]:
-                st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--t2);'>{qty}</div>", unsafe_allow_html=True)
-            with cc[3]:
-                st.markdown(
-                    f"<div style='padding:9px 0;'>"
-                    f"<div style='font-family:JetBrains Mono,monospace;font-size:13px;color:var(--t1);font-weight:700;'>₹{float(r['entry_price']):,.2f}</div>"
-                    f"<div style='font-size:10px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{opened}</div>"
-                    f"</div>", unsafe_allow_html=True)
-            with cc[4]:
-                st.markdown(
-                    f"<div style='padding:9px 0;'>"
-                    f"<div style='font-family:JetBrains Mono,monospace;font-size:13px;color:var(--t1);font-weight:700;'>₹{float(r['exit_price']):,.2f}</div>"
-                    f"<div style='font-size:10px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{closed}</div>"
-                    f"</div>", unsafe_allow_html=True)
-            with cc[5]:
-                st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:{pnl_c};font-weight:700;'>{'+' if pnl>=0 else '-'}₹{abs(pnl):,.0f}</div>", unsafe_allow_html=True)
-            with cc[6]:
-                if net_pnl_val is not None:
-                    net_c = "var(--green)" if net_pnl_val >= 0 else "var(--red)"
-                    st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:{net_c};font-weight:700;'>{'+' if net_pnl_val>=0 else '-'}₹{abs(net_pnl_val):,.0f}</div>", unsafe_allow_html=True)
-                else:
-                    st.markdown("<div style='padding:9px 0;'><span class='badge-pending'>–</span></div>", unsafe_allow_html=True)
-            with cc[7]:
-                st.markdown(f"<div style='padding:9px 0;font-size:11px;color:{rc};font-family:JetBrains Mono,monospace;text-transform:uppercase;'>{reason}</div>", unsafe_allow_html=True)
-            with cc[8]:
-                st.markdown(f"<div style='padding:9px 0;'>{strategy_pill_html(r.get('strategy',''), r.get('timeframe',''))}</div>", unsafe_allow_html=True)
-            with cc[9]:
-                st.markdown(f"<div style='padding:9px 0;font-size:11px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{duration}</div>", unsafe_allow_html=True)
-            with cc[10]:
-                _ct_key = f"pt_closed_chart_{int(r['id'])}"
-                if st.button("📈", key=_ct_key, help=f"View chart for {stock_display(ct_sym)}"):
-                    if st.session_state.chart_symbol == ct_sym:
-                        st.session_state.chart_symbol = None
-                        st.session_state.chart_name   = None
-                    else:
-                        st.session_state.chart_symbol = ct_sym
-                        st.session_state.chart_name   = stock_display(ct_sym)
-                    st.rerun()
-
-            st.markdown("<div class='row-div'></div>", unsafe_allow_html=True)
-
-        # Pagination controls (only if more than one page)
-        if pages > 1:
-            nav1, nav2, nav3 = st.columns([1, 2, 1])
-            with nav1:
-                if st.button("← Prev", key="pt_prev", disabled=(pg <= 0)):
-                    st.session_state.pt_closed_page = max(0, pg - 1)
-                    st.rerun()
-            with nav2:
-                st.markdown(
-                    f"<div style='text-align:center;font-size:11px;color:var(--t3);"
-                    f"font-family:JetBrains Mono,monospace;padding-top:8px;'>"
-                    f"Page {pg + 1} of {pages} &nbsp;·&nbsp; {total} closed trades</div>",
-                    unsafe_allow_html=True,
-                )
-            with nav3:
-                if st.button("Next →", key="pt_next", disabled=(pg >= pages - 1)):
-                    st.session_state.pt_closed_page = min(pages - 1, pg + 1)
-                    st.rerun()
+        for _strat in _closed_strategies:
+            _strat_cdf = closed_df[closed_df["strategy"] == _strat]
+            st.markdown(
+                f'<div style="font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:1.5px;margin:14px 0 6px;">{_strat} &nbsp;·&nbsp; {len(_strat_cdf)} closed today</div>',
+                unsafe_allow_html=True,
+            )
+            _render_closed_trades_table(_strat_cdf, key_prefix=f"pt_closed_{_strat.replace(' ', '_').lower()}")
 
 
-render_paper_trading()
+with tab_paper:
+    render_paper_trading()
 
 
-# ============================================================
-# RENDER ALL SECTIONS
-# ============================================================
+with tab_signals:
+    # ============================================================
+    # RENDER ALL SECTIONS
+    # ============================================================
 
-if show_idx: render_section(idx_rows, "INDEXES",                    "#9b6dff")
-if show_stk: render_section(stk_rows, "NSE STOCKS — F&O WATCHLIST", "#4a90e2", scroll_height=560)
-if show_com: render_section(com_rows, "COMMODITIES — MCX",          "#f7a800")
+    if show_idx: render_section(idx_rows, "INDEXES",                    "#9b6dff")
+    if show_stk: render_section(stk_rows, "NSE STOCKS — F&O WATCHLIST", "#4a90e2", scroll_height=560)
+    if show_com: render_section(com_rows, "COMMODITIES — MCX",          "#f7a800")
 
-# ============================================================
-# SIGNAL HISTORY
-# ============================================================
+    # ============================================================
+    # SIGNAL HISTORY
+    # ============================================================
 
-st.markdown("""
-<div class="sec-hdr" style='margin-top:10px;'>
-    <div style='width:7px;height:7px;border-radius:50%;background:var(--green);flex-shrink:0;'></div>
-    <span class="sec-title">Signal History — Last 7 Days</span>
-</div>
-""", unsafe_allow_html=True)
+    st.markdown("""
+    <div class="sec-hdr" style='margin-top:10px;'>
+        <div style='width:7px;height:7px;border-radius:50%;background:var(--green);flex-shrink:0;'></div>
+        <span class="sec-title">Signal History — Last 7 Days</span>
+    </div>
+    """, unsafe_allow_html=True)
 
-try:
-    if all_logs.empty:
-        st.markdown('<div class="no-sig">No signals yet. Scheduler runs at 9:15 AM IST.</div>', unsafe_allow_html=True)
-    else:
-        logs_tf = all_logs[all_logs["Timeframe"] == selected_tf].copy() if not all_logs.empty else pd.DataFrame()
-        if logs_tf.empty:
-            st.markdown(f'<div class="no-sig">No signals for <strong>{selected_tf}</strong> timeframe yet.</div>', unsafe_allow_html=True)
+    try:
+        if all_logs.empty:
+            st.markdown('<div class="no-sig">No signals yet. Scheduler runs at 9:15 AM IST.</div>', unsafe_allow_html=True)
         else:
-            display = logs_tf[["Timestamp", "Stock", "Signal", "RSI", "Price", "Strategy"]].copy()
-            try:
-                display["Timestamp"] = pd.to_datetime(display["Timestamp"], utc=True).dt.tz_convert(IST).dt.strftime("%Y-%m-%d %H:%M IST")
-            except Exception:
-                pass
+            logs_tf = all_logs[all_logs["Timeframe"] == selected_tf].copy() if not all_logs.empty else pd.DataFrame()
+            if logs_tf.empty:
+                st.markdown(f'<div class="no-sig">No signals for <strong>{selected_tf}</strong> timeframe yet.</div>', unsafe_allow_html=True)
+            else:
+                display = logs_tf[["Timestamp", "Stock", "Signal", "RSI", "Price", "Strategy"]].copy()
+                try:
+                    display["Timestamp"] = pd.to_datetime(display["Timestamp"], utc=True).dt.tz_convert(IST).dt.strftime("%Y-%m-%d %H:%M IST")
+                except Exception:
+                    pass
 
-            _name_map = {
-                **COMMODITIES_DISPLAY,
-                **{s: stock_display(s) for s in fno_stocks},
-                **INDEXES_DISPLAY,
-            }
-            display["Stock"] = display["Stock"].apply(lambda x: _name_map.get(x, x))
-            display["RSI"]   = display["RSI"].apply(lambda x: f"{float(x):.2f}" if str(x).replace('.','').replace('-','').isdigit() else x)
-            display["Price"] = display["Price"].apply(lambda x: f"₹{float(x):,.2f}" if str(x).replace('.','').replace('-','').isdigit() else x)
+                _name_map = {
+                    **COMMODITIES_DISPLAY,
+                    **{s: stock_display(s) for s in fno_stocks},
+                    **INDEXES_DISPLAY,
+                }
+                display["Stock"] = display["Stock"].apply(lambda x: _name_map.get(x, x))
+                display["RSI"]   = display["RSI"].apply(lambda x: f"{float(x):.2f}" if str(x).replace('.','').replace('-','').isdigit() else x)
+                display["Price"] = display["Price"].apply(lambda x: f"₹{float(x):,.2f}" if str(x).replace('.','').replace('-','').isdigit() else x)
 
-            is_dark  = st.session_state.dark_mode
-            buy_bg   = "#0d2e1c" if is_dark else "#d4f7ec"
-            sell_bg  = "#2e0d0d" if is_dark else "#fde8e8"
-            buy_fg   = "#1ec9a0" if is_dark else "#065f46"
-            sell_fg  = "#f05555" if is_dark else "#991b1b"
+                is_dark  = st.session_state.dark_mode
+                buy_bg   = "#0d2e1c" if is_dark else "#d4f7ec"
+                sell_bg  = "#2e0d0d" if is_dark else "#fde8e8"
+                buy_fg   = "#1ec9a0" if is_dark else "#065f46"
+                sell_fg  = "#f05555" if is_dark else "#991b1b"
 
-            def _col(v):
-                if v == "BUY":  return f"background:{buy_bg};color:{buy_fg};font-weight:700;font-family:JetBrains Mono,monospace;font-size:12px;"
-                if v == "SELL": return f"background:{sell_bg};color:{sell_fg};font-weight:700;font-family:JetBrains Mono,monospace;font-size:12px;"
-                return "font-family:JetBrains Mono,monospace;font-size:12px;"
+                def _col(v):
+                    if v == "BUY":  return f"background:{buy_bg};color:{buy_fg};font-weight:700;font-family:JetBrains Mono,monospace;font-size:12px;"
+                    if v == "SELL": return f"background:{sell_bg};color:{sell_fg};font-weight:700;font-family:JetBrains Mono,monospace;font-size:12px;"
+                    return "font-family:JetBrains Mono,monospace;font-size:12px;"
 
-            # Build custom HTML table — respects dark mode CSS variables
-            rows_html = ""
-            for _, row in display.iterrows():
-                sig = row["Signal"]
-                if sig == "BUY":
-                    sig_html = f"<span style='color:{buy_fg};font-weight:700;font-family:JetBrains Mono,monospace;'>{sig}</span>"
-                elif sig == "SELL":
-                    sig_html = f"<span style='color:{sell_fg};font-weight:700;font-family:JetBrains Mono,monospace;'>{sig}</span>"
-                else:
-                    sig_html = f"<span style='color:var(--t3);font-family:JetBrains Mono,monospace;'>{sig}</span>"
+                # Build custom HTML table — respects dark mode CSS variables
+                rows_html = ""
+                for _, row in display.iterrows():
+                    sig = row["Signal"]
+                    if sig == "BUY":
+                        sig_html = f"<span style='color:{buy_fg};font-weight:700;font-family:JetBrains Mono,monospace;'>{sig}</span>"
+                    elif sig == "SELL":
+                        sig_html = f"<span style='color:{sell_fg};font-weight:700;font-family:JetBrains Mono,monospace;'>{sig}</span>"
+                    else:
+                        sig_html = f"<span style='color:var(--t3);font-family:JetBrains Mono,monospace;'>{sig}</span>"
 
-                rows_html += f"""
-                <tr style='border-bottom:1px solid var(--border);'>
-                    <td style='padding:8px 12px;font-size:12px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{row['Timestamp']}</td>
-                    <td style='padding:8px 12px;font-size:13px;color:var(--t1);font-weight:500;'>{row['Stock']}</td>
-                    <td style='padding:8px 12px;'>{sig_html}</td>
-                    <td style='padding:8px 12px;font-size:12px;color:var(--t2);font-family:JetBrains Mono,monospace;'>{row['RSI']}</td>
-                    <td style='padding:8px 12px;font-size:12px;color:var(--t2);font-family:JetBrains Mono,monospace;'>{row['Price']}</td>
-                    <td style='padding:8px 12px;font-size:11px;color:var(--t3);'>{row['Strategy']}</td>
-                </tr>"""
+                    rows_html += f"""
+                    <tr style='border-bottom:1px solid var(--border);'>
+                        <td style='padding:8px 12px;font-size:12px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{row['Timestamp']}</td>
+                        <td style='padding:8px 12px;font-size:13px;color:var(--t1);font-weight:500;'>{row['Stock']}</td>
+                        <td style='padding:8px 12px;'>{sig_html}</td>
+                        <td style='padding:8px 12px;font-size:12px;color:var(--t2);font-family:JetBrains Mono,monospace;'>{row['RSI']}</td>
+                        <td style='padding:8px 12px;font-size:12px;color:var(--t2);font-family:JetBrains Mono,monospace;'>{row['Price']}</td>
+                        <td style='padding:8px 12px;font-size:11px;color:var(--t3);'>{row['Strategy']}</td>
+                    </tr>"""
 
-            max_h = min(len(display) * 41 + 50, 450)
-            st.markdown(f"""
-<div style='overflow-y:auto;max-height:{max_h}px;border:1px solid var(--border);border-radius:8px;background:var(--card);'>
-<table style='width:100%;border-collapse:collapse;'>
-    <thead>
-        <tr style='border-bottom:2px solid var(--border2);background:var(--card2);position:sticky;top:0;'>
-            <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:1px;white-space:nowrap;'>Timestamp</th>
-            <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:1px;'>Stock</th>
-            <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:1px;'>Signal</th>
-            <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:1px;'>RSI</th>
-            <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:1px;'>Price</th>
-            <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:1px;'>Strategy</th>
-        </tr>
-    </thead>
-    <tbody>{rows_html}</tbody>
-</table>
-</div>
-""", unsafe_allow_html=True)
-except Exception as e:
-    st.warning(f"Signal history unavailable: {e}")
+                max_h = min(len(display) * 41 + 50, 450)
+                st.markdown(f"""
+    <div style='overflow-y:auto;max-height:{max_h}px;border:1px solid var(--border);border-radius:8px;background:var(--card);'>
+    <table style='width:100%;border-collapse:collapse;'>
+        <thead>
+            <tr style='border-bottom:2px solid var(--border2);background:var(--card2);position:sticky;top:0;'>
+                <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:1px;white-space:nowrap;'>Timestamp</th>
+                <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:1px;'>Stock</th>
+                <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:1px;'>Signal</th>
+                <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:1px;'>RSI</th>
+                <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:1px;'>Price</th>
+                <th style='padding:10px 12px;text-align:left;font-size:11px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:1px;'>Strategy</th>
+            </tr>
+        </thead>
+        <tbody>{rows_html}</tbody>
+    </table>
+    </div>
+    """, unsafe_allow_html=True)
+    except Exception as e:
+        st.warning(f"Signal history unavailable: {e}")
 
 
 # ============================================================

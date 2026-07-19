@@ -28,9 +28,18 @@ from typing import Optional
 # (Defaults are industry-standard; adjust per Jwala's inputs.)
 # ============================================================
 class RMSConfig:
-    CAPITAL              = 1_000_000.0   # ₹10L simulated capital
-    STOP_LOSS_PCT        = 0.015         # 1.5% stop from entry
-    RISK_REWARD          = 1.2           # default target multiple — RSI Reversal (per Jwala, reduced from 2.0)
+    CAPITAL              = 5_000_000.0   # ₹50L simulated capital (Jwala,
+                                          # Jul 17: "increasing to, let's
+                                          # say, let's keep it 50 lakhs" —
+                                          # was ₹10L)
+    STOP_LOSS_PCT        = 0.01          # 1% stop from entry (Jwala, Jul 17:
+                                          # "reducing the stop so that when we
+                                          # are wrong, we would exit quickly" —
+                                          # was 1.5%)
+    RISK_REWARD          = 1.5           # default target multiple — RSI Reversal
+                                          # (Jwala, Jul 17: "when we are right,
+                                          # we would be taking a bigger profit" —
+                                          # was 1.2)
     DAILY_MAX_LOSS_PCT   = 0.03          # stop trading after -3% in a day
     MAX_OPEN_POSITIONS   = 15            # single source of truth — paper_trader.py
                                           # imports this instead of its own copy, so
@@ -44,6 +53,21 @@ class RMSConfig:
     # listed here falls back to RISK_REWARD above.
     RISK_REWARD_BY_STRATEGY = {
         "Volume Spike": 2.0,
+    }
+
+    # Grade-based position sizing (Jwala, Jul 14, 4:19-5:22): "If the
+    # signal is very strong, we'll allocate 3 units. If the signal is
+    # strong, we'll allocate 2 units. If the signal is moderate, then
+    # one unit of capital... The risk is still 1.5%[now 1%] only" — so
+    # the STOP-LOSS % never changes, only how many "units" (each unit
+    # = CAPITAL/MAX_OPEN_POSITIONS) get allocated. Anything not listed
+    # (or ungraded) defaults to 1 unit. WEAK never reaches here at all
+    # — filtered out upstream in strategy_engine.py before on_signal()
+    # is ever called.
+    UNITS_BY_STRENGTH = {
+        "VERY STRONG": 3,
+        "STRONG":      2,
+        "MODERATE":    1,
     }
 
     # ── RETIRED (Jwala, Jul 9 call) — kept only so nothing importing
@@ -117,10 +141,15 @@ class RMS:
     # --------------------------------------------------------
     def evaluate(
         self,
-        symbol:      str,
-        side:        str,          # "BUY" or "SELL"
-        entry_price: float,
-        strategy:    str = None,   # picks the reward ratio — see RISK_REWARD_BY_STRATEGY
+        symbol:           str,
+        side:             str,          # "BUY" or "SELL"
+        entry_price:      float,
+        strategy:         str   = None, # picks the reward ratio — see RISK_REWARD_BY_STRATEGY
+        strength:         str   = None, # picks unit count — see UNITS_BY_STRENGTH
+        capital_deployed: float = 0.0,  # currently deployed, across ALL open positions —
+                                         # caller (paper_trader.py) fetches this from the DB.
+                                         # Needed so a 2x/3x-unit allocation can't push total
+                                         # deployed capital past CAPITAL — see step 4 below.
     ) -> RMSDecision:
 
         self._roll_day_if_needed()
@@ -157,27 +186,41 @@ class RMS:
             stop_loss = round(entry_price + stop_dist, 2)
             target    = round(entry_price - stop_dist * reward_ratio, 2)
 
-        # 4. Position size — CAPITAL-BASED, not risk-based (Jwala,
-        # Jul 9 call, worked out explicitly on the call): every
-        # concurrent slot gets an equal, fixed share of total capital.
-        #   capital_per_trade = CAPITAL / MAX_OPEN_POSITIONS
-        #   quantity          = floor(capital_per_trade / entry_price)
-        # This structurally caps total deployed capital at
-        # MAX_OPEN_POSITIONS × capital_per_trade == CAPITAL, regardless
-        # of entry price or stop distance — no separate "don't
-        # over-concentrate" cap is needed, this IS that cap.
-        capital_per_trade = self.cfg.CAPITAL / self.cfg.MAX_OPEN_POSITIONS
+        # 4. Position size — CAPITAL-BASED (Jwala, Jul 9), now scaled by
+        # signal grade (Jwala, Jul 14): base unit = CAPITAL /
+        # MAX_OPEN_POSITIONS; a STRONG/VERY STRONG signal gets 2x/3x
+        # that unit, per UNITS_BY_STRENGTH.
+        #
+        # A 3-unit allocation across many concurrent VERY STRONG
+        # signals could, in the worst case, push total deployed
+        # capital well past CAPITAL if sized blindly (15 slots × 3
+        # units would be 3x over) — Jwala's spec covers the per-trade
+        # risk % staying fixed, but doesn't address this aggregate
+        # case, so this is my own addition: cap the capital actually
+        # used at whatever's genuinely still AVAILABLE (CAPITAL minus
+        # capital_deployed), sizing DOWN gracefully rather than
+        # blindly honoring the full 2x/3x request once capacity is
+        # tight. This preserves the "total deployed never exceeds
+        # CAPITAL" guarantee from the Jul 9 fix even with grade-based
+        # sizing layered on top.
+        base_unit  = self.cfg.CAPITAL / self.cfg.MAX_OPEN_POSITIONS
+        units      = self.cfg.UNITS_BY_STRENGTH.get(strength, 1)
+        desired_capital = base_unit * units
+
+        available = max(0.0, self.cfg.CAPITAL - capital_deployed)
+        capital_to_use = min(desired_capital, available)
 
         if entry_price <= 0:
             return reject(f"Invalid entry price for sizing: {entry_price}")
 
-        quantity = int(capital_per_trade // entry_price)
+        quantity = int(capital_to_use // entry_price)
 
         if quantity < self.cfg.MIN_QUANTITY:
             return reject(
                 f"Position size < 1 share "
-                f"(price ₹{entry_price:,.0f} too high for per-trade capital "
-                f"₹{capital_per_trade:,.0f})"
+                f"(price ₹{entry_price:,.0f} too high for available capital "
+                f"₹{capital_to_use:,.0f} — wanted {units} unit(s) = "
+                f"₹{desired_capital:,.0f}, but only ₹{available:,.0f} available)"
             )
 
         actual_risk = round(quantity * stop_dist, 2)
@@ -193,7 +236,10 @@ class RMS:
             risk_amount=actual_risk,
             reason="approved",
             details={
-                "capital_per_trade": round(capital_per_trade, 2),
+                "base_unit":         round(base_unit, 2),
+                "units":             units,
+                "desired_capital":   round(desired_capital, 2),
+                "capital_used":      round(quantity * entry_price, 2),
                 "per_share_risk":    round(stop_dist, 2),
                 "position_value":    round(quantity * entry_price, 2),
                 "reward_if_target":  round(quantity * stop_dist * reward_ratio, 2),

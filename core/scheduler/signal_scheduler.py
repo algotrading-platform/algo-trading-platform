@@ -125,12 +125,26 @@ def is_market_day() -> bool:
 
 
 def is_market_hours() -> bool:
-    """Single window: 9:15 AM — 3:30 PM IST"""
+    """
+    Algo trading window: 9:45 AM - 3:15 PM IST (Jwala, Jul 17 —
+    was 9:15-15:30, the full exchange session). Narrower than the
+    real exchange hours: skips the first 30 min ("these signals
+    should work after market has stabilised a little... probably
+    after half an hour") and ends 15 min before exchange close,
+    matching the new square-off time so nothing opened in the last
+    minute of the window is left without a same-day exit chance.
+
+    This governs SCANNING and NEW ENTRIES only. It does not change
+    the real exchange session — dashboard.py's own market_open()
+    (the "MARKET OPEN/CLOSED" badge) intentionally still reflects the
+    true 9:15-15:30 exchange hours, since that's general market
+    awareness, not "is the algo currently trading."
+    """
     if not is_market_day():
         return False
     from datetime import time as dtime
     t = datetime.now(IST).time()
-    return dtime(9, 15) <= t <= dtime(15, 30)
+    return dtime(9, 45) <= t <= dtime(15, 15)
 
 
 def is_equity_hours() -> bool:

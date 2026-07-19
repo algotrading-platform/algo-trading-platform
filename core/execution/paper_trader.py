@@ -90,7 +90,9 @@ MAX_OPEN_POSITIONS = RMSConfig.MAX_OPEN_POSITIONS
 # SHORT once this IST time is reached, regardless of stop/target.
 # (Jwala confirmed "realistic expectations" — Jul 8.) Set a few
 # minutes ahead of the 15:30 close so it lands on a real scan cycle.
-SQUARE_OFF_TIME = dtime(15, 0)
+SQUARE_OFF_TIME = dtime(15, 15)  # was 15:00 — moved to match the new
+                                 # trading window's end (Jwala, Jul 17:
+                                 # "start at 9:45... at 3:15 PM")
 
 
 def _past_square_off_time() -> bool:
@@ -145,6 +147,9 @@ class PaperTrader:
         price:      float,
         strategy:   str,
         timeframe:  str,
+        strength:   str = None,  # signal grade — picks unit count in RMS
+                                 # (Jwala, Jul 14: MODERATE=1, STRONG=2,
+                                 # VERY STRONG=3 units)
     ) -> dict:
         """
         Full pipeline for one signal. Returns a result dict describing
@@ -187,8 +192,16 @@ class PaperTrader:
         # 1. RMS — evaluate() is already symmetric: for SELL it sizes
         # and mirrors stop/target for a short (stop above entry,
         # target below). strategy picks the reward ratio (Jwala Jul
-        # 11: Volume Spike gets 1:2, wider than RSI's 1.2×).
-        decision = self.rms.evaluate(symbol, side, price, strategy=strategy)
+        # 11: Volume Spike gets 1:2, wider than RSI's 1.2×). strength
+        # picks the unit count (Jwala Jul 14); capital_deployed is
+        # fetched fresh here so RMS can cap grade-based sizing against
+        # what's actually still available, not just the raw request.
+        capital_deployed = db.get_capital_deployed()
+        decision = self.rms.evaluate(
+            symbol, side, price,
+            strategy=strategy, strength=strength,
+            capital_deployed=capital_deployed,
+        )
         if not decision.approved:
             return {"action": "reject", "reason": f"RMS: {decision.reason}"}
 

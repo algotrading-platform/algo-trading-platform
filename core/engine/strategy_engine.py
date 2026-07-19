@@ -91,6 +91,7 @@ def _run_paper_trading(provider, results):
                 price=r["price"],
                 strategy=r["strategy"],
                 timeframe=r.get("timeframe", ""),
+                strength=r.get("strength"),  # drives unit-based sizing in RMS
             )
             if outcome.get("action") == "opened":
                 log.info(f"PAPER OPEN  {r['symbol']}  {r['signal']}  "
