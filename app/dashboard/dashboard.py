@@ -360,12 +360,26 @@ div[data-baseweb="select"] span { color: var(--t1) !important; }
     color: #fff !important; box-shadow: 0 2px 6px rgba(240,85,85,0.35);
 }
 
-/* Popover trigger (the "Stop" button) — same treatment as a normal button */
+/* Popover trigger ("Kill Switch" and per-row "Stop") — this rule was
+   missing background/border/text-color entirely, so it fell back to
+   Streamlit's own default (light) button styling regardless of theme.
+   Harmless-looking in Light Mode (blends in with the light background
+   by coincidence) but a jarring white box in Dark Mode — exactly the
+   "buttons not aligned with dark mode" bug. Now explicitly themed with
+   the same CSS variables as .stButton > button, so it follows
+   whichever mode is active instead of Streamlit's hardcoded default. */
 div[data-testid="stPopover"] > button {
-    border-radius: 8px !important; min-height: 34px; box-shadow: 0 1px 2px rgba(0,0,0,0.06);
-    transition: all 0.15s ease;
+    background: var(--card) !important; border: 1px solid var(--border2) !important;
+    color: var(--t2) !important; font-size: 12px !important; font-weight: 500 !important;
+    font-family: 'IBM Plex Sans', sans-serif !important;
+    border-radius: 8px !important; min-height: 34px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.06); transition: all 0.15s ease;
 }
-div[data-testid="stPopover"] > button:hover { box-shadow: 0 2px 6px rgba(74,144,226,0.18); }
+div[data-testid="stPopover"] > button:hover {
+    border-color: var(--blue) !important; color: var(--blue) !important;
+    background: var(--card2) !important; box-shadow: 0 2px 6px rgba(74,144,226,0.18);
+}
+div[data-testid="stPopover"] > button p { color: inherit !important; }
 
 /* KPI Metrics */
 div[data-testid="metric-container"] { background: var(--card) !important; border: 1px solid var(--border) !important; border-radius: 10px !important; padding: 16px 20px !important; }
