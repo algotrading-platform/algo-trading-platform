@@ -33,126 +33,144 @@ from core.indicators.indicators import (
 
 class RSIReversalStrategy(BaseStrategy):
     """
-    Buy when RSI bounces back above 20 after being oversold AND price
-    is above its 50-period Simple Moving Average (trend filter).
-    Sell when RSI drops back below 80 after being overbought AND
-    price is below its 50-period SMA. Requires 2 consecutive
-    confirmation candles (unchanged from before this revision).
+    REPLACES the fixed 2-candle confirmation (Jwala, Jul 23, in direct
+    reply to the finding that RSI was reaching 20/80 regularly but the
+    2-candle window almost never caught it): "If rsi falls below 20 we
+    start tracking the stock, Now if Price crosses 50 MA then buy. It
+    can [take] multiple candles so that rsi starts to rise and also
+    the price."
 
-    MA TREND FILTER — Jwala, Jul 22 call: "the other part for RSI
-    that you have already done... we just need to add this
-    particular [the MA]. So this is like a filter for if market is
-    rising, then we will try to catch at low price or at low RSI."
-    Rationale, same-day WhatsApp message: "RSI alone fires 'buy'
-    signals even in downtrends (oversold can stay oversold). Adding
-    an MA filters those out — you only take the RSI signal when it
-    agrees with the broader trend." His own description of the
-    average ("look at one candle... average price for the candle...
-    sum up for last 50 candles and divide by 50") is the Simple
-    Moving Average of Close price — implemented that way, computed
-    directly here rather than via a shared indicators helper (no
-    add_sma() existed to reuse).
+    NEW logic:
+      1. TRACK — the moment RSI dips below 20 (or above 80 for sell),
+         that starts an open-ended "watch", not a fixed 2-candle rule.
+      2. TRIGGER — while that watch holds and RSI is rising (BUY) /
+         falling (SELL), the signal fires the moment price actually
+         CROSSES its 50-MA (prev candle at/below it, current candle
+         above it — not merely "is currently above/below", the real
+         crossing candle). This is what makes it fire only ONCE per
+         setup without needing extra "already fired" bookkeeping —
+         candles after the cross are no longer a fresh crossover.
+      3. Deliberately unbounded in candle count, per Jwala's own
+         "it can be multiple candles" — TRACKING_WINDOW below is an
+         engineering cap on how far back a dip still counts as "the
+         same setup", not a rule Jwala specified a number for.
 
-    RSI TRIGGER LEVELS — widened from 35/75 to 20/80 (Jwala, follow-up
-    message: "rsi should be 80 and 20") — fewer, higher-conviction
-    signals. (35/75 was itself already a widened version of an
-    original, simpler 30/70 — this is the second widening.)
+    Implemented WITHOUT new persistent state — generate_signal()
+    already gets the full historical dataframe each call, so "was
+    there an unresolved dip recently" is answered by looking back
+    through THIS SAME dataframe, not by remembering anything between
+    scan cycles.
+
+    [JUDGMENT CALL — NEEDS CONFIRMATION] TRACKING_WINDOW = 10 candles:
+    Jwala said "multiple candles" with no exact upper bound. 10 is an
+    engineering default — a dip further back than this is treated as
+    stale / a different setup. Flag if a different number is intended.
     """
     name        = "RSI Reversal"
     description = (
-        "Identifies momentum reversals using RSI 14, filtered by a "
-        "50-period SMA trend filter. BUY when RSI recovers from "
-        "oversold (<20) with price above its 50-SMA. SELL when RSI "
-        "drops from overbought (>80) with price below its 50-SMA."
+        "Tracks a stock once RSI dips below 20 (or rises above 80), "
+        "then fires BUY/SELL the moment price crosses its 50-period "
+        "SMA while RSI is recovering in that direction. Can take "
+        "several candles — not a fixed 2-candle window."
     )
 
-    RSI_OVERSOLD   = 20   # was 35 — Jwala: "rsi should be 80 and 20"
-    RSI_OVERBOUGHT = 80   # was 75
-    # [JUDGMENT CALL — NEEDS CONFIRMATION] STRONG-grade cutoff: Jwala
-    # gave the 20/80 trigger levels but not a separate STRONG cutoff.
-    # Kept a clean symmetric 5-point gap from the new trigger.
+    RSI_OVERSOLD   = 20
+    RSI_OVERBOUGHT = 80
+    # [JUDGMENT CALL — NEEDS CONFIRMATION] unchanged from the previous
+    # revision — Jwala hasn't specified a separate STRONG cutoff.
     RSI_STRONG_OVERSOLD   = 15
     RSI_STRONG_OVERBOUGHT = 85
     MA_PERIOD = 50
+    TRACKING_WINDOW = 10   # [JUDGMENT CALL] see docstring above
 
     def generate_signal(self, df: pd.DataFrame) -> SignalResult:
-        if len(df) < max(20, self.MA_PERIOD):
+        need = self.MA_PERIOD + self.TRACKING_WINDOW
+        if len(df) < need:
             return SignalResult("HOLD", "WEAK", "Insufficient data", strategy=self.name)
 
-        # 50-period Simple Moving Average — computed on the FULL
-        # dataframe BEFORE the RSI dropna below truncates it. Getting
-        # this order backwards (MA after the RSI dropna) means
-        # rolling(50) never has 50 real rows to work with regardless
-        # of how much data was actually passed in — caught by testing
-        # with a dataframe that had plenty of history and still got
-        # "insufficient data" every time.
+        # MA50 computed on the FULL frame before the RSI dropna
+        # truncates it (see earlier fix note — getting this order
+        # backwards means rolling(50) never finds 50 real rows).
         df["MA50"] = df["Close"].rolling(self.MA_PERIOD).mean()
 
         df = add_rsi(df)
         df.dropna(subset=["RSI"], inplace=True)
 
-        if len(df) < 3:
+        if len(df) < self.TRACKING_WINDOW + 2:
             return SignalResult("HOLD", "WEAK", "Insufficient RSI data", strategy=self.name)
 
         if pd.isna(df["MA50"].iloc[-1]):
             return SignalResult("HOLD", "WEAK", "Insufficient data for 50-MA", strategy=self.name)
 
-        current  = float(df["RSI"].iloc[-1])
-        prev     = float(df["RSI"].iloc[-2])
-        prev2    = float(df["RSI"].iloc[-3])
-        price    = float(df["Close"].iloc[-1])
-        ma50     = float(df["MA50"].iloc[-1])
-        above_ma = price > ma50
-        below_ma = price < ma50
+        window = self.TRACKING_WINDOW + 1
+        rsi_series   = df["RSI"].tail(window).reset_index(drop=True)
+        price_series = df["Close"].tail(window).reset_index(drop=True)
+        ma_series    = df["MA50"].tail(window).reset_index(drop=True)
+
+        current    = float(rsi_series.iloc[-1])
+        prev_rsi   = float(rsi_series.iloc[-2])
+        price      = float(price_series.iloc[-1])
+        prev_price = float(price_series.iloc[-2])
+        ma50       = float(ma_series.iloc[-1])
+        prev_ma50  = float(ma_series.iloc[-2])
 
         indicators = {
             "RSI": round(current, 2),
-            "RSI_prev": round(prev, 2),
+            "RSI_prev": round(prev_rsi, 2),
             "Price": round(price, 2),
             "MA50": round(ma50, 2),
-            "Above_MA50": above_ma,
+            "Above_MA50": price > ma50,
         }
 
-        rsi_buy_pattern  = prev2 < self.RSI_OVERSOLD and prev > prev2 and current > prev and current > self.RSI_OVERSOLD
-        rsi_sell_pattern = prev2 > self.RSI_OVERBOUGHT and prev < prev2 and current < prev and current < self.RSI_OVERBOUGHT
+        # Was there a qualifying dip/rise anywhere in the tracking
+        # window BEFORE the current candle?
+        prior_rsi = rsi_series.iloc[:-1]
+        recent_oversold_dip    = (prior_rsi < self.RSI_OVERSOLD).any()
+        recent_overbought_rise = (prior_rsi > self.RSI_OVERBOUGHT).any()
+        deepest_dip  = float(prior_rsi.min()) if recent_oversold_dip else None
+        highest_rise = float(prior_rsi.max()) if recent_overbought_rise else None
 
-        # BUY: RSI bounced from oversold AND price above trend filter
-        if rsi_buy_pattern and above_ma:
-            strength = "STRONG" if prev2 < self.RSI_STRONG_OVERSOLD else "MODERATE"
+        rsi_rising  = current > prev_rsi
+        rsi_falling = current < prev_rsi
+
+        crossed_above_ma = prev_price <= prev_ma50 and price > ma50
+        crossed_below_ma = prev_price >= prev_ma50 and price < ma50
+
+        # BUY: was tracking an oversold dip, RSI now rising, price just crossed above the 50-MA
+        if recent_oversold_dip and rsi_rising and crossed_above_ma:
+            strength = "STRONG" if deepest_dip < self.RSI_STRONG_OVERSOLD else "MODERATE"
             reason = (
-                f"RSI recovered from oversold zone ({round(prev2,1)} -> {round(current,1)}), "
-                f"price ₹{round(price,2)} above 50-MA ₹{round(ma50,2)} (uptrend confirmed). "
-                f"Two consecutive up candles confirm reversal."
+                f"Tracked oversold dip (RSI reached {round(deepest_dip,1)}), RSI now rising "
+                f"({round(prev_rsi,1)} -> {round(current,1)}), price just crossed above its "
+                f"50-MA (₹{round(prev_price,2)} -> ₹{round(price,2)}, MA ₹{round(ma50,2)})."
             )
             return SignalResult("BUY", strength, reason, indicators, self.name)
 
-        # SELL: RSI reversed from overbought AND price below trend filter
-        if rsi_sell_pattern and below_ma:
-            strength = "STRONG" if prev2 > self.RSI_STRONG_OVERBOUGHT else "MODERATE"
+        # SELL: was tracking an overbought rise, RSI now falling, price just crossed below the 50-MA
+        if recent_overbought_rise and rsi_falling and crossed_below_ma:
+            strength = "STRONG" if highest_rise > self.RSI_STRONG_OVERBOUGHT else "MODERATE"
             reason = (
-                f"RSI reversed from overbought zone ({round(prev2,1)} -> {round(current,1)}), "
-                f"price ₹{round(price,2)} below 50-MA ₹{round(ma50,2)} (downtrend confirmed). "
-                f"Two consecutive down candles confirm reversal."
+                f"Tracked overbought rise (RSI reached {round(highest_rise,1)}), RSI now falling "
+                f"({round(prev_rsi,1)} -> {round(current,1)}), price just crossed below its "
+                f"50-MA (₹{round(prev_price,2)} -> ₹{round(price,2)}, MA ₹{round(ma50,2)})."
             )
             return SignalResult("SELL", strength, reason, indicators, self.name)
 
-        # Near-misses where RSI reversed but the MA filter blocked it —
-        # visible in the HOLD reason so the filter's effect can be
-        # validated (Jwala, Jul 22: "the overall quality that we are
-        # generating sell signals while the stock is rising, that
-        # probably we can check").
-        if rsi_buy_pattern and not above_ma:
+        # Informative near-miss reasons — same purpose the old "blocked
+        # by trend filter" message served: makes it possible to verify
+        # the tracking logic is doing real work, not just returning HOLD.
+        if recent_oversold_dip and rsi_rising and not crossed_above_ma:
             return SignalResult("HOLD", "WEAK",
-                f"RSI reversal from oversold confirmed but price ₹{round(price,2)} "
-                f"is below 50-MA ₹{round(ma50,2)} — blocked by trend filter",
+                f"Tracking oversold dip (RSI reached {round(deepest_dip,1)}), RSI rising, "
+                f"price ₹{round(price,2)} hasn't crossed its 50-MA (₹{round(ma50,2)}) yet",
                 indicators, self.name)
-        if rsi_sell_pattern and not below_ma:
+        if recent_overbought_rise and rsi_falling and not crossed_below_ma:
             return SignalResult("HOLD", "WEAK",
-                f"RSI reversal from overbought confirmed but price ₹{round(price,2)} "
-                f"is above 50-MA ₹{round(ma50,2)} — blocked by trend filter",
+                f"Tracking overbought rise (RSI reached {round(highest_rise,1)}), RSI falling, "
+                f"price ₹{round(price,2)} hasn't crossed its 50-MA (₹{round(ma50,2)}) yet",
                 indicators, self.name)
 
-        return SignalResult("HOLD", "WEAK", f"RSI at {round(current,1)} — no reversal pattern", indicators, self.name)
+        return SignalResult("HOLD", "WEAK", f"RSI at {round(current,1)} — no active tracking setup", indicators, self.name)
 
 
 # ============================================================
