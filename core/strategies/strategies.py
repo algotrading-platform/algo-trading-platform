@@ -33,21 +33,60 @@ from core.indicators.indicators import (
 
 class RSIReversalStrategy(BaseStrategy):
     """
-    Buy when RSI bounces back above 30 after being oversold.
-    Sell when RSI drops back below 70 after being overbought.
-    Requires 2 consecutive confirmation candles.
+    Buy when RSI bounces back above 20 after being oversold AND price
+    is above its 50-period Simple Moving Average (trend filter).
+    Sell when RSI drops back below 80 after being overbought AND
+    price is below its 50-period SMA. Requires 2 consecutive
+    confirmation candles (unchanged from before this revision).
+
+    MA TREND FILTER — Jwala, Jul 22 call: "the other part for RSI
+    that you have already done... we just need to add this
+    particular [the MA]. So this is like a filter for if market is
+    rising, then we will try to catch at low price or at low RSI."
+    Rationale, same-day WhatsApp message: "RSI alone fires 'buy'
+    signals even in downtrends (oversold can stay oversold). Adding
+    an MA filters those out — you only take the RSI signal when it
+    agrees with the broader trend." His own description of the
+    average ("look at one candle... average price for the candle...
+    sum up for last 50 candles and divide by 50") is the Simple
+    Moving Average of Close price — implemented that way, computed
+    directly here rather than via a shared indicators helper (no
+    add_sma() existed to reuse).
+
+    RSI TRIGGER LEVELS — widened from 35/75 to 20/80 (Jwala, follow-up
+    message: "rsi should be 80 and 20") — fewer, higher-conviction
+    signals. (35/75 was itself already a widened version of an
+    original, simpler 30/70 — this is the second widening.)
     """
     name        = "RSI Reversal"
     description = (
-        "Identifies momentum reversals using RSI 14. "
-        "BUY when RSI recovers from oversold (<30) zone with "
-        "2 confirmation candles. SELL when RSI drops from "
-        "overbought (>70) zone with 2 confirmation candles."
+        "Identifies momentum reversals using RSI 14, filtered by a "
+        "50-period SMA trend filter. BUY when RSI recovers from "
+        "oversold (<20) with price above its 50-SMA. SELL when RSI "
+        "drops from overbought (>80) with price below its 50-SMA."
     )
 
+    RSI_OVERSOLD   = 20   # was 35 — Jwala: "rsi should be 80 and 20"
+    RSI_OVERBOUGHT = 80   # was 75
+    # [JUDGMENT CALL — NEEDS CONFIRMATION] STRONG-grade cutoff: Jwala
+    # gave the 20/80 trigger levels but not a separate STRONG cutoff.
+    # Kept a clean symmetric 5-point gap from the new trigger.
+    RSI_STRONG_OVERSOLD   = 15
+    RSI_STRONG_OVERBOUGHT = 85
+    MA_PERIOD = 50
+
     def generate_signal(self, df: pd.DataFrame) -> SignalResult:
-        if len(df) < 20:
+        if len(df) < max(20, self.MA_PERIOD):
             return SignalResult("HOLD", "WEAK", "Insufficient data", strategy=self.name)
+
+        # 50-period Simple Moving Average — computed on the FULL
+        # dataframe BEFORE the RSI dropna below truncates it. Getting
+        # this order backwards (MA after the RSI dropna) means
+        # rolling(50) never has 50 real rows to work with regardless
+        # of how much data was actually passed in — caught by testing
+        # with a dataframe that had plenty of history and still got
+        # "insufficient data" every time.
+        df["MA50"] = df["Close"].rolling(self.MA_PERIOD).mean()
 
         df = add_rsi(df)
         df.dropna(subset=["RSI"], inplace=True)
@@ -55,36 +94,63 @@ class RSIReversalStrategy(BaseStrategy):
         if len(df) < 3:
             return SignalResult("HOLD", "WEAK", "Insufficient RSI data", strategy=self.name)
 
-        current = float(df["RSI"].iloc[-1])
-        prev    = float(df["RSI"].iloc[-2])
-        prev2   = float(df["RSI"].iloc[-3])
-        price   = float(df["Close"].iloc[-1])
+        if pd.isna(df["MA50"].iloc[-1]):
+            return SignalResult("HOLD", "WEAK", "Insufficient data for 50-MA", strategy=self.name)
+
+        current  = float(df["RSI"].iloc[-1])
+        prev     = float(df["RSI"].iloc[-2])
+        prev2    = float(df["RSI"].iloc[-3])
+        price    = float(df["Close"].iloc[-1])
+        ma50     = float(df["MA50"].iloc[-1])
+        above_ma = price > ma50
+        below_ma = price < ma50
 
         indicators = {
             "RSI": round(current, 2),
             "RSI_prev": round(prev, 2),
             "Price": round(price, 2),
+            "MA50": round(ma50, 2),
+            "Above_MA50": above_ma,
         }
 
-        # BUY: RSI bounced from oversold
-        if prev2 < 35 and prev > prev2 and current > prev and current > 35:
-            strength = "STRONG" if prev2 < 28 else "MODERATE"
+        rsi_buy_pattern  = prev2 < self.RSI_OVERSOLD and prev > prev2 and current > prev and current > self.RSI_OVERSOLD
+        rsi_sell_pattern = prev2 > self.RSI_OVERBOUGHT and prev < prev2 and current < prev and current < self.RSI_OVERBOUGHT
+
+        # BUY: RSI bounced from oversold AND price above trend filter
+        if rsi_buy_pattern and above_ma:
+            strength = "STRONG" if prev2 < self.RSI_STRONG_OVERSOLD else "MODERATE"
             reason = (
-                f"RSI recovered from oversold zone. "
-                f"RSI was {round(prev2,1)} (below 30), now rising to {round(current,1)}. "
+                f"RSI recovered from oversold zone ({round(prev2,1)} -> {round(current,1)}), "
+                f"price ₹{round(price,2)} above 50-MA ₹{round(ma50,2)} (uptrend confirmed). "
                 f"Two consecutive up candles confirm reversal."
             )
             return SignalResult("BUY", strength, reason, indicators, self.name)
 
-        # SELL: RSI reversed from overbought
-        if prev2 > 75 and prev < prev2 and current < prev and current < 75:
-            strength = "STRONG" if prev2 > 80 else "MODERATE"
+        # SELL: RSI reversed from overbought AND price below trend filter
+        if rsi_sell_pattern and below_ma:
+            strength = "STRONG" if prev2 > self.RSI_STRONG_OVERBOUGHT else "MODERATE"
             reason = (
-                f"RSI reversed from overbought zone. "
-                f"RSI was {round(prev2,1)} (above 70), now falling to {round(current,1)}. "
+                f"RSI reversed from overbought zone ({round(prev2,1)} -> {round(current,1)}), "
+                f"price ₹{round(price,2)} below 50-MA ₹{round(ma50,2)} (downtrend confirmed). "
                 f"Two consecutive down candles confirm reversal."
             )
             return SignalResult("SELL", strength, reason, indicators, self.name)
+
+        # Near-misses where RSI reversed but the MA filter blocked it —
+        # visible in the HOLD reason so the filter's effect can be
+        # validated (Jwala, Jul 22: "the overall quality that we are
+        # generating sell signals while the stock is rising, that
+        # probably we can check").
+        if rsi_buy_pattern and not above_ma:
+            return SignalResult("HOLD", "WEAK",
+                f"RSI reversal from oversold confirmed but price ₹{round(price,2)} "
+                f"is below 50-MA ₹{round(ma50,2)} — blocked by trend filter",
+                indicators, self.name)
+        if rsi_sell_pattern and not below_ma:
+            return SignalResult("HOLD", "WEAK",
+                f"RSI reversal from overbought confirmed but price ₹{round(price,2)} "
+                f"is above 50-MA ₹{round(ma50,2)} — blocked by trend filter",
+                indicators, self.name)
 
         return SignalResult("HOLD", "WEAK", f"RSI at {round(current,1)} — no reversal pattern", indicators, self.name)
 

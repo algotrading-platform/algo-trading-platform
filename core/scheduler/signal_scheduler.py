@@ -194,15 +194,29 @@ _multi_engine = StrategyEngine("RSI Reversal")
 _paper_monitor = None
 
 def _get_paper_monitor():
+    """
+    Was: a failed construction cached itself as `False` PERMANENTLY —
+    since this is a module-level global in a long-running container,
+    one transient failure (a momentary DB hiccup, a slow-to-appear
+    env var at startup, anything) would silently disable square-off
+    and stop/target monitoring for the REST OF THE DAY, with a single
+    easy-to-miss warning log line as the only trace. Found while
+    diagnosing positions that never got square-off'd or closed at all
+    — this is a real reliability gap regardless of whether it's the
+    confirmed cause here. Fixed: only cache SUCCESS, retry construction
+    every call if it previously failed, and warn every time (not once)
+    so a real, ongoing failure is impossible to miss in the logs.
+    """
     global _paper_monitor
     if _paper_monitor is None:
         try:
             from core.execution.paper_trader import PaperTrader
             _paper_monitor = PaperTrader(provider=provider)
         except Exception as e:
-            log.warning(f"PaperTrader monitor unavailable — disabled: {e}")
-            _paper_monitor = False
-    return _paper_monitor or None
+            log.warning(f"PaperTrader monitor construction failed this cycle "
+                        f"(will retry next cycle, not permanently disabled): {e}")
+            return None
+    return _paper_monitor
 
 # Primary strategy engine — recreated when strategy changes
 # (kept for backward compatibility / single-strategy callers)
@@ -339,6 +353,13 @@ def run_scan(tf_name: str, mode: str = "all") -> None:
             for c in (closed or []):
                 log.info(f"PAPER CLOSE  {c['symbol']}  {c['reason']}  "
                          f"exit={c['exit']}  pnl={c['pnl']}")
+        else:
+            # Previously silent — this exact silence is what made the
+            # "positions never square off" bug invisible: nothing in
+            # the logs distinguished "monitor ran, found nothing to
+            # close" from "monitor didn't run at all this cycle".
+            log.warning("Paper monitor unavailable this cycle — "
+                        "square-off/stop-target checks were SKIPPED.")
     except Exception as e:
         log.warning(f"paper monitor error (non-fatal): {e}")
 

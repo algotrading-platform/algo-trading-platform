@@ -493,6 +493,43 @@ div[data-testid="stDataFrame"] { background:var(--card) !important; }
     div[data-testid="metric-container"] [data-testid="stMetricValue"] { font-size:18px !important; }
     div[data-testid="metric-container"] { padding:10px 12px !important; }
 }
+
+/* Small-screen table layout fix (Om, Jul 22: "if it gets into the
+   small screen, the buttons are being disrupted and not being on the
+   layout"). Root cause: st.columns() is Streamlit's own layout
+   primitive — below Streamlit's internal breakpoint it stacks
+   columns VERTICALLY instead of horizontally, which for an
+   11-column Open Positions row (with a further nested 3-column
+   Chart/Close/Stop group) turns each table row into a jumbled
+   vertical stack rather than reflowing text sizes gracefully like
+   the KPI cards above do. There's no CSS-only way to make Streamlit's
+   own column primitive reflow more gracefully — the buttons/columns
+   live inside Streamlit's own generated containers, not something
+   this app's markup wraps directly. So instead of letting it break,
+   this forces every column row to stay in a single line and lets the
+   PAGE scroll horizontally on narrow screens, which is standard
+   practice for dense trading tables on mobile (most real trading
+   platforms do the same rather than reflowing a data-dense table).
+   Scoped to <=900px so normal desktop layouts are completely
+   unaffected. */
+@media (max-width: 900px) {
+    div[data-testid="stHorizontalBlock"] {
+        flex-wrap: nowrap !important;
+        min-width: max-content;
+    }
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+        min-width: fit-content;
+        flex-shrink: 0;
+    }
+    .stButton > button, div[data-testid="stPopover"] > button {
+        min-width: 54px; white-space: nowrap;
+    }
+    .main .block-container {
+        overflow-x: auto;
+        padding-left: 1rem !important;
+        padding-right: 1rem !important;
+    }
+}
 """
 
 theme = DARK if st.session_state.dark_mode else LIGHT

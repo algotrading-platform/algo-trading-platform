@@ -36,10 +36,13 @@ class RMSConfig:
                                           # "reducing the stop so that when we
                                           # are wrong, we would exit quickly" —
                                           # was 1.5%)
-    RISK_REWARD          = 1.5           # default target multiple — RSI Reversal
-                                          # (Jwala, Jul 17: "when we are right,
-                                          # we would be taking a bigger profit" —
-                                          # was 1.2)
+    RISK_REWARD          = 1.2           # default target multiple — RSI Reversal.
+                                          # Was 1.2, briefly raised to 1.5 on Jul 17
+                                          # ("when we are right, we would be taking
+                                          # a bigger profit"), then reverted back to
+                                          # 1.2 shortly after (Jwala's own follow-up
+                                          # correction) — net effect across both
+                                          # calls is no change from the original 1.2.
     DAILY_MAX_LOSS_PCT   = 0.03          # stop trading after -3% in a day
     MAX_OPEN_POSITIONS   = 15            # single source of truth — paper_trader.py
                                           # imports this instead of its own copy, so

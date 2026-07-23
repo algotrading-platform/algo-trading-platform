@@ -62,14 +62,17 @@ def _run_paper_trading(provider, results):
     Open positions for newly-alerted BUY/SELL signals. Called once per
     scan, single-threaded, after the scan's thread pool has joined.
 
-    Signal-grade gating (Jwala, Jul 11: "do we make it a condition to
-    open only the strong ones... we can enter for strong and moderate
-    ones, very strong, strong and moderate. We can skip the weak
-    ones."). `strength` is already computed and present on every
-    result dict (see scan_instrument/_scan_multi) — this just filters
-    on it before a signal ever reaches the paper trader. Anything
-    that isn't literally "WEAK" is eligible (MODERATE / STRONG / VERY
-    STRONG, regardless of how many grade levels exist upstream).
+    Signal-grade gating REMOVED (Jwala, Jul 23: "Now let's include all
+    signals no filtering we'll take weak signals to."). Was added Jul
+    11 ("we can skip the weak ones"), then explicitly put under
+    reconsideration Jul 17 after a win-rate drop ("let's run it for a
+    day. And if this doesn't work, then we'll try to incorporate even
+    the weak one") — this is that reconsideration resolving to "yes,
+    include WEAK." Every BUY/SELL signal is now eligible regardless of
+    grade; `strength` is still passed through to on_signal() since it
+    drives unit-based position sizing in RMS (MODERATE=1/STRONG=2/VERY
+    STRONG=3 units) — that sizing logic is unrelated to and unaffected
+    by removing this gate.
     """
     pt = _get_paper_trader(provider)
     if pt is None:
@@ -80,9 +83,6 @@ def _run_paper_trading(provider, results):
         if not r.get("alerted"):
             continue
         if r.get("signal") not in ("BUY", "SELL"):
-            continue
-        if r.get("strength") == "WEAK":
-            log.debug(f"PAPER SKIP  {r.get('symbol')}  WEAK signal — not eligible to open")
             continue
         try:
             outcome = pt.on_signal(
