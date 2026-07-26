@@ -66,7 +66,9 @@ class RSIReversalStrategy(BaseStrategy):
     engineering default — a dip further back than this is treated as
     stale / a different setup. Flag if a different number is intended.
     """
-    name        = "RSI Reversal"
+    name        = "RSI + MA"  # was "RSI Reversal" (Jwala, Jul 24: "old ones say
+                               # rsi new ones say rsi+ma" — forward-only rename,
+                               # historical trades keep the old label, no backfill)
     description = (
         "Tracks a stock once RSI dips below 20 (or rises above 80), "
         "then fires BUY/SELL the moment price crosses its 50-period "
@@ -629,7 +631,7 @@ class VolumeBreakoutStrategy(BaseStrategy):
 # ============================================================
 
 STRATEGIES = {
-    "RSI Reversal":          RSIReversalStrategy(),
+    "RSI + MA":              RSIReversalStrategy(),  # registry key renamed to match
     "RSI + Pivot Confluence": RSIPivotStrategy(),
     "Bollinger Bands":       BollingerStrategy(),
     "EMA Crossover":         EMACrossoverStrategy(),
@@ -806,4 +808,167 @@ class VolumeSpikeStrategy(BaseStrategy):
 # ============================================================
 
 STRATEGIES["Volume Spike"] = VolumeSpikeStrategy()
+STRATEGY_NAMES = list(STRATEGIES.keys())
+
+# ============================================================
+# 3 BAR PLAY — Jwala, Jul 24 email
+#
+# Reference: https://www.youtube.com/watch?v=xEjUd82NVVg
+# Pattern (Jwala's own written spec):
+#   Bar 1 (igniting)  — wide-range candle, strong volume, clear
+#     directional move.
+#   Bar 2 (pullback, sometimes + Bar 3) — small/narrow range, must
+#     NOT retrace more than 50% of bar 1's range. Highs roughly
+#     equal for longs / lows roughly equal for shorts.
+#   Final bar (trigger) — breaks above the pullback high (long) or
+#     below the pullback low (short) = entry.
+#
+# Pattern-detection logic below follows Jwala's own attached
+# reference Python almost exactly (detect_3_bar_play /
+# apply_risk_reward). One real discrepancy between his written spec
+# and his own code, resolved in favor of the SPEC: his bullet list
+# explicitly calls for a volume filter ("only take signals where bar
+# 1 volume is above average, e.g. 20-period avg") but his reference
+# code doesn't implement it at all. Added here to match what he
+# actually asked for, not just what the code happened to do.
+# ============================================================
+
+class ThreeBarPlayStrategy(BaseStrategy):
+    """
+    Detects an "igniting" bar + shallow pullback + breakout trigger —
+    a 3-bar continuation pattern — filtered by above-average volume
+    on the igniting bar (Jwala's spec; not in his reference code, see
+    module note above).
+
+    [JUDGMENT CALL — NEEDS CONFIRMATION] Two things Jwala's spec left
+    open, defaulted here rather than guessed silently:
+      - REWARD_MULTIPLE: spec says "2x-3x the risk, configurable" —
+        no single number given. Defaulted to 2.0 (the conservative
+        end), matching his own reference code's example usage
+        (`apply_risk_reward(signals, reward_multiple=2)`).
+      - Strength grading: no spec given at all for STRONG vs
+        MODERATE. Defaulted: STRONG if bar 1's volume is >= 2x its
+        20-period average, else MODERATE.
+
+    RESOLVED (Jul 24): this pattern uses its OWN natural stop-loss —
+    the pullback bar's opposite extreme ("Pattern_Stop" below, exposed
+    via `indicators`) — rather than RMS's generic 1%-of-entry stop.
+    strategy_engine.py's _run_paper_trading() extracts "Pattern_Stop"
+    from indicators and passes it into RMS.evaluate() as custom_stop,
+    which uses it directly as the real stop-loss and recomputes target
+    from the ACTUAL fill price (see rms.py's evaluate() docstring).
+    "Pattern_Target" and "Pattern_Entry" below stay reference/
+    informational only — they reflect the pattern's own theoretical
+    numbers (computed against bar2's high/low), not the real fill
+    price, which is why RMS recalculates the real target itself rather
+    than trusting these directly.
+    """
+    name = "3 Bar Play"
+    description = (
+        "Detects an igniting bar + shallow pullback + breakout "
+        "trigger, filtered by above-average volume on the igniting "
+        "bar. Intended mainly for 1-10 min charts near market open."
+    )
+
+    RETRACE_LIMIT        = 0.5   # pullback can't retrace >50% of bar1's range
+    VOLUME_LOOKBACK      = 20    # 20-period average, per spec
+    REWARD_MULTIPLE      = 2.0   # [JUDGMENT CALL] see docstring
+    STRONG_VOLUME_MULTIPLE = 2.0 # [JUDGMENT CALL] see docstring
+
+    def generate_signal(self, df: pd.DataFrame) -> SignalResult:
+        need = self.VOLUME_LOOKBACK + 3
+        if df is None or df.empty or len(df) < need:
+            return SignalResult("HOLD", "WEAK", f"Insufficient data (need {need}+ candles)", strategy=self.name)
+
+        if "Volume" not in df.columns:
+            return SignalResult("HOLD", "WEAK", "Volume data not available", strategy=self.name)
+
+        try:
+            df = df.copy()
+            df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce")
+            df.dropna(subset=["Volume"], inplace=True)
+            if len(df) < need:
+                return SignalResult("HOLD", "WEAK", "Insufficient volume data", strategy=self.name)
+
+            bar1 = df.iloc[-3]   # igniting bar
+            bar2 = df.iloc[-2]   # pullback bar
+            bar3 = df.iloc[-1]   # trigger bar
+
+            bar1_range = float(bar1["High"] - bar1["Low"])
+            if bar1_range <= 0:
+                return SignalResult("HOLD", "WEAK", "Zero-range igniting bar", strategy=self.name)
+
+            # Volume filter (Jwala's spec, not his reference code) —
+            # bar1's volume vs the 20-period average from the candles
+            # strictly BEFORE bar1 (excludes bar1 itself).
+            baseline_window = df["Volume"].iloc[-(self.VOLUME_LOOKBACK + 3):-3]
+            if len(baseline_window) < self.VOLUME_LOOKBACK:
+                return SignalResult("HOLD", "WEAK", "Insufficient volume baseline", strategy=self.name)
+
+            avg_volume   = float(baseline_window.mean())
+            bar1_volume  = float(bar1["Volume"])
+            volume_ratio = bar1_volume / avg_volume if avg_volume > 0 else 0.0
+
+            indicators = {
+                "Bar1_Range":    round(bar1_range, 2),
+                "Bar1_Volume":   int(bar1_volume),
+                "Avg_Volume_20": int(avg_volume),
+                "Volume_Ratio":  round(volume_ratio, 2),
+            }
+
+            if volume_ratio <= 1.0:
+                return SignalResult(
+                    "HOLD", "WEAK",
+                    f"Igniting bar volume ({int(bar1_volume):,}) not above its 20-period "
+                    f"average ({int(avg_volume):,}) — volume filter not met",
+                    indicators, self.name,
+                )
+
+            is_bullish_ignite = bar1["Close"] > bar1["Open"]
+            is_bearish_ignite = bar1["Close"] < bar1["Open"]
+
+            # LONG: pullback low didn't retrace >50% of bar1's range, trigger breaks pullback high
+            pullback_ok_long = (bar1["High"] - bar2["Low"]) <= self.RETRACE_LIMIT * bar1_range
+            trigger_long = bar3["High"] > bar2["High"]
+
+            if is_bullish_ignite and pullback_ok_long and trigger_long:
+                entry, stop = float(bar2["High"]), float(bar2["Low"])
+                risk = abs(entry - stop)
+                target = entry + self.REWARD_MULTIPLE * risk
+                strength = "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE"
+                indicators.update({"Pattern_Entry": round(entry, 2), "Pattern_Stop": round(stop, 2),
+                                    "Pattern_Target": round(target, 2)})
+                reason = (
+                    f"3-Bar Play LONG: igniting bar at {volume_ratio:.1f}x avg volume, "
+                    f"pullback held within {self.RETRACE_LIMIT*100:.0f}% of bar1's range, "
+                    f"trigger broke above pullback high (₹{bar2['High']:.2f})."
+                )
+                return SignalResult("BUY", strength, reason, indicators, self.name)
+
+            # SHORT: mirror
+            pullback_ok_short = (bar2["High"] - bar1["Low"]) <= self.RETRACE_LIMIT * bar1_range
+            trigger_short = bar3["Low"] < bar2["Low"]
+
+            if is_bearish_ignite and pullback_ok_short and trigger_short:
+                entry, stop = float(bar2["Low"]), float(bar2["High"])
+                risk = abs(entry - stop)
+                target = entry - self.REWARD_MULTIPLE * risk
+                strength = "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE"
+                indicators.update({"Pattern_Entry": round(entry, 2), "Pattern_Stop": round(stop, 2),
+                                    "Pattern_Target": round(target, 2)})
+                reason = (
+                    f"3-Bar Play SHORT: igniting bar at {volume_ratio:.1f}x avg volume, "
+                    f"pullback held within {self.RETRACE_LIMIT*100:.0f}% of bar1's range, "
+                    f"trigger broke below pullback low (₹{bar2['Low']:.2f})."
+                )
+                return SignalResult("SELL", strength, reason, indicators, self.name)
+
+            return SignalResult("HOLD", "WEAK", "No qualifying 3-bar pattern on the latest bars",
+                                 indicators, self.name)
+
+        except Exception as e:
+            return SignalResult("HOLD", "WEAK", f"3-Bar Play calculation error: {e}", strategy=self.name)
+
+
+STRATEGIES["3 Bar Play"] = ThreeBarPlayStrategy()
 STRATEGY_NAMES = list(STRATEGIES.keys())

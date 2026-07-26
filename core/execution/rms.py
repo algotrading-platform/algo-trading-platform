@@ -56,6 +56,10 @@ class RMSConfig:
     # listed here falls back to RISK_REWARD above.
     RISK_REWARD_BY_STRATEGY = {
         "Volume Spike": 2.0,
+        "3 Bar Play":   2.0,  # matches Jwala's own reference code example
+                              # (reward_multiple=2); spec said "2x-3x,
+                              # configurable" with no single number chosen —
+                              # this is the conservative end, easy to bump.
     }
 
     # Grade-based position sizing (Jwala, Jul 14, 4:19-5:22): "If the
@@ -153,6 +157,22 @@ class RMS:
                                          # caller (paper_trader.py) fetches this from the DB.
                                          # Needed so a 2x/3x-unit allocation can't push total
                                          # deployed capital past CAPITAL — see step 4 below.
+        custom_stop:      float = None, # strategy-supplied stop level (Jwala, Jul 24: 3 Bar
+                                         # Play should use its OWN natural stop — pullback bar's
+                                         # opposite extreme — rather than RMS's generic %-based
+                                         # one). When provided, this OVERRIDES the % calculation
+                                         # below entirely; target is still recomputed from
+                                         # reward_ratio × the ACTUAL distance between entry_price
+                                         # and custom_stop, so risk:reward stays correct relative
+                                         # to whatever price the trade actually fills at — not
+                                         # the strategy's own theoretical entry (which may differ
+                                         # slightly, since e.g. 3 Bar Play's "entry" is a breakout
+                                         # LEVEL, but by the time the signal fires and this runs,
+                                         # price has typically already moved past that level).
+                                         # Generic (not strategy-name-gated): ANY strategy that
+                                         # supplies a custom_stop gets this treatment, not just
+                                         # "3 Bar Play" specifically — keeps this reusable for
+                                         # whatever pattern-based strategy comes next.
     ) -> RMSDecision:
 
         self._roll_day_if_needed()
@@ -181,13 +201,28 @@ class RMS:
         # 3. Stop-loss & target — reward ratio is strategy-specific
         # (Jwala Jul 11: Volume Spike gets 1:2, wider than RSI's 1.2×).
         reward_ratio = self.cfg.RISK_REWARD_BY_STRATEGY.get(strategy, self.cfg.RISK_REWARD)
-        stop_dist = entry_price * self.cfg.STOP_LOSS_PCT
-        if side == "BUY":
-            stop_loss = round(entry_price - stop_dist, 2)
-            target    = round(entry_price + stop_dist * reward_ratio, 2)
-        else:  # SELL (short)
-            stop_loss = round(entry_price + stop_dist, 2)
-            target    = round(entry_price - stop_dist * reward_ratio, 2)
+
+        if custom_stop is not None:
+            # Strategy-native stop (e.g. 3 Bar Play's pullback-bar
+            # extreme) — use it directly instead of the %-based calc,
+            # but still recompute target from the ACTUAL entry price
+            # so the reward ratio stays meaningful (see param note above).
+            stop_loss = round(float(custom_stop), 2)
+            stop_dist = abs(entry_price - stop_loss)
+            if stop_dist <= 0:
+                return reject(f"Invalid custom stop (no distance from entry): {custom_stop}")
+            if side == "BUY":
+                target = round(entry_price + stop_dist * reward_ratio, 2)
+            else:  # SELL (short)
+                target = round(entry_price - stop_dist * reward_ratio, 2)
+        else:
+            stop_dist = entry_price * self.cfg.STOP_LOSS_PCT
+            if side == "BUY":
+                stop_loss = round(entry_price - stop_dist, 2)
+                target    = round(entry_price + stop_dist * reward_ratio, 2)
+            else:  # SELL (short)
+                stop_loss = round(entry_price + stop_dist, 2)
+                target    = round(entry_price - stop_dist * reward_ratio, 2)
 
         # 4. Position size — CAPITAL-BASED (Jwala, Jul 9), now scaled by
         # signal grade (Jwala, Jul 14): base unit = CAPITAL /

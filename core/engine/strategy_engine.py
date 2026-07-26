@@ -85,6 +85,13 @@ def _run_paper_trading(provider, results):
         if r.get("signal") not in ("BUY", "SELL"):
             continue
         try:
+            # Pattern-based strategies (3 Bar Play, Jul 24) can supply
+            # their own natural stop level via "Pattern_Stop" in their
+            # indicators — generic extraction, not gated on strategy
+            # name, so any future pattern strategy gets the same
+            # treatment automatically just by including this key.
+            custom_stop = (r.get("indicators") or {}).get("Pattern_Stop")
+
             outcome = pt.on_signal(
                 symbol=r["symbol"],
                 side=r["signal"],
@@ -92,6 +99,7 @@ def _run_paper_trading(provider, results):
                 strategy=r["strategy"],
                 timeframe=r.get("timeframe", ""),
                 strength=r.get("strength"),  # drives unit-based sizing in RMS
+                custom_stop=custom_stop,
             )
             if outcome.get("action") == "opened":
                 log.info(f"PAPER OPEN  {r['symbol']}  {r['signal']}  "

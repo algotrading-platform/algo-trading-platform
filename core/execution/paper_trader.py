@@ -16,16 +16,18 @@
 # Stop/target math is mirrored for shorts (handled in rms.py, already
 # symmetric) and monitor_open() checks both directions.
 #
-# EOD SQUARE-OFF — applies to BOTH sides (Jwala Jul 11, revising the
-# Jul 8 short-only version): "let's also close the long ones also...
-# this algo system would be for a day trade only." Every open
-# position, long or short, is force-closed at SQUARE_OFF_TIME
-# regardless of stop/target (reason "square_off"). Moved earlier too
-# (15:15 -> 15:00) per the call: "we will try to start it off before
-# 3:15... because after 3:15 all brokerages... fire up." The smarter
-# "gradually close profitable trades in the last 15 min" version was
-# explicitly deferred — this is the simple blanket version Jwala
-# accepted for now.
+# EOD SQUARE-OFF — SHORT ONLY (reverted Jul 24: "short should be
+# closed once market closes, long can be carried forward"). History:
+# started SHORT-only (Jul 8, regulatory — NSE cash-equity shorts can't
+# carry overnight), was widened to BOTH sides on Jul 11 ("this algo
+# system would be for a day trade only"), and is reverted back to
+# SHORT-only here. Longs now exit only via stop/target/manual/kill-
+# switch, with no forced same-day or same-week close at all — an
+# open-ended hold, by design, not yet subject to any maximum holding
+# period (worth confirming there isn't meant to be one). The
+# start-of-day catch-up sweep below follows the same SHORT-only rule,
+# for the same reason — a carried-forward long is now correct
+# behavior, not stale state to clean up.
 #
 # VOLUME SPIKE TRAILING STOP (Jwala Jul 11): Volume Spike positions
 # get a wider reward ratio (1:2, set in rms.py) BUT that target is
@@ -142,14 +144,20 @@ class PaperTrader:
     # --------------------------------------------------------
     def on_signal(
         self,
-        symbol:     str,
-        side:       str,        # "BUY" / "SELL"
-        price:      float,
-        strategy:   str,
-        timeframe:  str,
-        strength:   str = None,  # signal grade — picks unit count in RMS
-                                 # (Jwala, Jul 14: MODERATE=1, STRONG=2,
-                                 # VERY STRONG=3 units)
+        symbol:      str,
+        side:        str,        # "BUY" / "SELL"
+        price:       float,
+        strategy:    str,
+        timeframe:   str,
+        strength:    str   = None,  # signal grade — picks unit count in RMS
+                                    # (Jwala, Jul 14: MODERATE=1, STRONG=2,
+                                    # VERY STRONG=3 units)
+        custom_stop: float = None,  # strategy-native stop level (Jwala, Jul
+                                    # 24: 3 Bar Play uses its own pullback-bar
+                                    # stop, not RMS's generic % stop) — passed
+                                    # straight through to RMS.evaluate(); see
+                                    # that function's docstring for how target
+                                    # gets recomputed around it.
     ) -> dict:
         """
         Full pipeline for one signal. Returns a result dict describing
@@ -201,6 +209,7 @@ class PaperTrader:
             symbol, side, price,
             strategy=strategy, strength=strength,
             capital_deployed=capital_deployed,
+            custom_stop=custom_stop,
         )
         if not decision.approved:
             return {"action": "reject", "reason": f"RMS: {decision.reason}"}
@@ -254,9 +263,10 @@ class PaperTrader:
     def monitor_open(self) -> list[dict]:
         """
         For each open position, fetch current price and close it if:
-          - we're past SQUARE_OFF_TIME (forced, day-trade-only
-            constraint — checked FIRST, ahead of stop/target, applies
-            to BOTH longs and shorts per Jwala Jul 11), or
+          - it's a SHORT and we're past SQUARE_OFF_TIME (regulatory —
+            NSE cash-equity shorts can't carry overnight — checked
+            FIRST, ahead of stop/target; longs are exempt as of Jul 24
+            and can carry forward indefinitely), or
           - the stop-loss or target has been hit (direction-aware —
             a short's stop is above entry, target below).
         Volume Spike positions get their trailing stop updated first
@@ -278,24 +288,23 @@ class PaperTrader:
             side   = pos["side"]
             pid    = int(pos["id"])
 
-            # ── Start-of-day catch-up sweep (Jwala/Om, Jul 14): a
-            # position from a PREVIOUS calendar day gets force-closed
-            # immediately, on whatever scan cycle next runs — no
-            # waiting for today's 3PM. This scheduler already ticks
-            # from 9:01 IST (before the 9:15 market-open gate that
-            # only run_primary_scan checks), so this naturally clears
-            # any stale carryover before real trading starts each day.
-            # Distinct reason ("stale_carryover") from routine
-            # "square_off", so reporting can tell the two apart —
-            # this is a one-off cleanup path, not a normal daily exit.
-            if _is_from_previous_day(pos["opened_at"]):
+            # ── Start-of-day catch-up sweep — SHORT ONLY (reverted
+            # Jul 24: "short should be closed once market closes, long
+            # can be carried forward"). This REVERSES the Jul 11/14
+            # decision that made this apply to both sides — longs are
+            # now explicitly allowed to persist across days, so the
+            # sweep must no longer force-close a carried-forward long
+            # just for being from an earlier calendar day; only a
+            # SHORT surviving past its mandatory same-day close is a
+            # genuine stale-carryover case anymore.
+            if side == "SELL" and _is_from_previous_day(pos["opened_at"]):
                 price = self._current_price(symbol)
                 if price is None:
                     continue
                 if db.close_paper_position(pid, price, exit_reason="stale_carryover"):
                     qty   = int(pos["quantity"])
                     entry = float(pos["entry_price"])
-                    pnl   = (price - entry) * qty if side == "BUY" else (entry - price) * qty
+                    pnl   = (entry - price) * qty  # SELL/short only, mirrored math
                     self.rms.record_realized_pnl(pnl)
                     closed.append({
                         "symbol": symbol, "reason": "stale_carryover",
@@ -303,18 +312,23 @@ class PaperTrader:
                     })
                 continue  # already resolved — skip everything below for this position
 
-            # ── Forced square-off: day-trade-only system (Jwala Jul
-            # 11 revision — was SHORT-only from Jul 8, now applies to
-            # BOTH sides: "let's also close the long ones also...
-            # this algo system would be for a day trade only").
-            if square_off_now:
+            # ── Forced square-off — SHORT ONLY (reverted Jul 24: "short
+            # should be closed once market closes, long can be carried
+            # forward"). This REVERSES the Jul 11 "day-trade-only, both
+            # sides" decision — back to the original regulatory-driven
+            # rule: NSE cash-equity shorts cannot legally carry
+            # overnight and must close same-day regardless of anything
+            # else; longs have no such requirement and are now allowed
+            # to run past today, exiting only via stop/target/manual/
+            # kill-switch.
+            if side == "SELL" and square_off_now:
                 price = self._current_price(symbol)
                 if price is None:
                     continue
                 if db.close_paper_position(pid, price, exit_reason="square_off"):
                     qty   = int(pos["quantity"])
                     entry = float(pos["entry_price"])
-                    pnl   = (price - entry) * qty if side == "BUY" else (entry - price) * qty
+                    pnl   = (entry - price) * qty  # SELL/short only, mirrored math
                     self.rms.record_realized_pnl(pnl)
                     closed.append({
                         "symbol": symbol, "reason": "square_off",

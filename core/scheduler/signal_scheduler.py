@@ -180,7 +180,9 @@ _arb_engine = StrategyEngine("Cash-Futures Arbitrage")
 # RSI Reversal + Volume Spike both run on the same single fetch
 # per instrument (Volume Spike is stock-only, enforced in engine).
 # Add more names here to run them in parallel too.
-PARALLEL_STRATEGIES = ["RSI Reversal", "Volume Spike"]
+PARALLEL_STRATEGIES = ["RSI + MA", "Volume Spike", "3 Bar Play"]  # renamed
+                                                                     # "RSI Reversal" -> "RSI + MA"
+                                                                     # (Jul 24) and added "3 Bar Play"
 
 # A single engine drives the multi-strategy scan. The label passed
 # here is cosmetic — run_multi_scan() takes the real strategy list.
@@ -457,7 +459,8 @@ def start() -> None:
     log.info(f"Arbitrage   : Every 30 mins (F&O stocks only)")
     log.info(f"Dashboard   : strategy dropdown filters the VIEW only")
     log.info("Data source : Upstox API (primary) + yfinance (fallback)")
-    log.info("Market hours: 9:15 AM — 3:30 PM IST")
+    log.info("Algo window   : 9:45 AM — 3:15 PM IST (scanning/entries) | "
+             "exchange session 9:15 AM - 3:30 PM IST")
     log.info("=" * 60)
     scheduler = build_scheduler()
     try:

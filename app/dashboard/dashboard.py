@@ -234,7 +234,7 @@ st_autorefresh(interval=300000, key="dashboard_refresh")  # 5 min — matches sc
 
 if "dark_mode"        not in st.session_state: st.session_state.dark_mode        = True
 if "selected_tf"      not in st.session_state: st.session_state.selected_tf      = "1 Hour"
-if "selected_strategy"not in st.session_state: st.session_state.selected_strategy= "RSI Reversal"
+if "selected_strategy"not in st.session_state: st.session_state.selected_strategy= "RSI + MA"  # was "RSI Reversal"
 if "chart_symbol"     not in st.session_state: st.session_state.chart_symbol      = None
 if "chart_name"       not in st.session_state: st.session_state.chart_name        = None
 
@@ -266,6 +266,10 @@ DARK = """
     --red:        #f05555;
     --amber:      #f7a800;
     --purple:     #9b6dff;
+    --teal:       #14b8a6;  /* 3 Bar Play strategy color — distinct from
+                               --green, which already means profit/BUY
+                               elsewhere; reusing it for a strategy pill
+                               would be confusing */
     --buy-bg:     rgba(30,201,160,0.12);
     --buy-br:     rgba(30,201,160,0.40);
     --sell-bg:    rgba(240,85,85,0.12);
@@ -297,6 +301,7 @@ LIGHT = """
     --red:        #cc2020;
     --amber:      #c47e00;
     --purple:     #6040cc;
+    --teal:       #0d9488;
     --buy-bg:     rgba(10,158,116,0.08);
     --buy-br:     rgba(10,158,116,0.35);
     --sell-bg:    rgba(204,32,32,0.08);
@@ -623,8 +628,15 @@ def stock_display(sym: str) -> str:
 # every strategy; this makes RSI Reversal / Volume Spike / arbitrage
 # visually distinct at a glance in the paper trading tables. ──
 _STRATEGY_STYLE = {
+    # "RSI Reversal" kept for old trades from before the Jul 24 rename
+    # (forward-only — historical rows still say "RSI Reversal", see
+    # _CANONICAL_STRATEGY_ORDER below for the same reasoning). Same
+    # blue as its successor, since it's literally the same strategy
+    # under a new name, not a different one.
     "RSI Reversal":           ("rgba(74,144,226,0.12)",  "rgba(74,144,226,0.35)",  "var(--blue)"),
+    "RSI + MA":               ("rgba(74,144,226,0.12)",  "rgba(74,144,226,0.35)",  "var(--blue)"),
     "Volume Spike":           ("rgba(247,168,0,0.12)",   "rgba(247,168,0,0.35)",   "var(--amber)"),
+    "3 Bar Play":             ("rgba(20,184,166,0.12)",  "rgba(20,184,166,0.35)", "var(--teal)"),
     "Cash-Futures Arbitrage": ("rgba(155,109,255,0.12)", "rgba(155,109,255,0.35)","var(--purple)"),
 }
 _DEFAULT_STRATEGY_STYLE = ("rgba(74,144,226,0.12)", "rgba(74,144,226,0.35)", "var(--blue)")
@@ -1496,7 +1508,10 @@ def _fmt_duration(opened_at, closed_at) -> str:
 # dropdown filter. Canonical order first, then anything else found in
 # the data (e.g. if Arbitrage joins paper trading later) so nothing
 # silently disappears if a new strategy name shows up. ──
-_CANONICAL_STRATEGY_ORDER = ["RSI Reversal", "Volume Spike"]
+# "RSI Reversal" kept alongside "RSI + MA" (Jul 24 rename was forward-
+# only — old closed trades still say "RSI Reversal" and need their own
+# ordered table section, not to fall into the dynamic catch-all).
+_CANONICAL_STRATEGY_ORDER = ["RSI Reversal", "RSI + MA", "Volume Spike", "3 Bar Play"]
 
 def _ordered_strategies_present(df) -> list:
     if df is None or df.empty or "strategy" not in df.columns:
@@ -1745,7 +1760,7 @@ def render_paper_trading():
     <div class="sec-hdr" style='margin-top:6px;'>
         <div style='width:7px;height:7px;border-radius:50%;background:var(--purple);flex-shrink:0;'></div>
         <span class="sec-title">Paper Trading — Simulated Portfolio (Today)</span>
-        <span class="sec-meta">Upstox Sandbox &nbsp;·&nbsp; RSI Reversal + Volume Spike &nbsp;·&nbsp; Long + Short</span>
+        <span class="sec-meta">Upstox Sandbox &nbsp;·&nbsp; RSI + MA + Volume Spike + 3 Bar Play &nbsp;·&nbsp; Long + Short</span>
     </div>
     """, unsafe_allow_html=True)
 
