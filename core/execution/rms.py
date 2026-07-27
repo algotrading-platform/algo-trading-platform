@@ -28,10 +28,24 @@ from typing import Optional
 # (Defaults are industry-standard; adjust per Jwala's inputs.)
 # ============================================================
 class RMSConfig:
-    CAPITAL              = 5_000_000.0   # ₹50L simulated capital (Jwala,
-                                          # Jul 17: "increasing to, let's
-                                          # say, let's keep it 50 lakhs" —
-                                          # was ₹10L)
+    # Per-strategy pools (Om, Jul 27: "let each strategy have only 5
+    # positions opened out of 15... let's allot 20 lakhs for each
+    # strategy") — each of the 3 parallel strategies (RSI + MA, Volume
+    # Spike, 3 Bar Play) gets its OWN ₹20L capital pool and its own
+    # 5-position concurrency cap, tracked independently per strategy
+    # rather than pooled. paper_trader.py passes strategy-scoped
+    # counts/deployed-capital into evaluate() below so sizing and the
+    # concurrency check are both per-strategy.
+    CAPITAL_PER_STRATEGY            = 2_000_000.0  # ₹20L per strategy
+    MAX_OPEN_POSITIONS_PER_STRATEGY = 5            # per strategy
+
+    # Aggregate figures — derived from the per-strategy numbers above,
+    # not independent settings. Kept for anything that still wants a
+    # single portfolio-wide total (e.g. the dashboard's "Total Capital"
+    # card): 3 strategies x ₹20L = ₹60L, 3 x 5 = 15 total slots.
+    CAPITAL            = CAPITAL_PER_STRATEGY * 3
+    MAX_OPEN_POSITIONS = MAX_OPEN_POSITIONS_PER_STRATEGY * 3
+
     STOP_LOSS_PCT        = 0.01          # 1% stop from entry (Jwala, Jul 17:
                                           # "reducing the stop so that when we
                                           # are wrong, we would exit quickly" —
@@ -44,10 +58,6 @@ class RMSConfig:
                                           # correction) — net effect across both
                                           # calls is no change from the original 1.2.
     DAILY_MAX_LOSS_PCT   = 0.03          # stop trading after -3% in a day
-    MAX_OPEN_POSITIONS   = 15            # single source of truth — paper_trader.py
-                                          # imports this instead of its own copy, so
-                                          # the concurrency cap and the capital-per-
-                                          # trade divisor can never drift apart again.
     MIN_QUANTITY         = 1             # need at least 1 share to trade
 
     # Strategy-specific reward ratio (Jwala, Jul 11: "once we enter we
@@ -153,10 +163,12 @@ class RMS:
         entry_price:      float,
         strategy:         str   = None, # picks the reward ratio — see RISK_REWARD_BY_STRATEGY
         strength:         str   = None, # picks unit count — see UNITS_BY_STRENGTH
-        capital_deployed: float = 0.0,  # currently deployed, across ALL open positions —
-                                         # caller (paper_trader.py) fetches this from the DB.
-                                         # Needed so a 2x/3x-unit allocation can't push total
-                                         # deployed capital past CAPITAL — see step 4 below.
+        capital_deployed: float = 0.0,  # currently deployed for THIS strategy only (Jul 27:
+                                         # pools are per-strategy now) — caller (paper_trader.py)
+                                         # fetches this from the DB scoped to `strategy`. Needed
+                                         # so a 2x/3x-unit allocation can't push this strategy's
+                                         # deployed capital past its own CAPITAL_PER_STRATEGY —
+                                         # see step 4 below.
         custom_stop:      float = None, # strategy-supplied stop level (Jwala, Jul 24: 3 Bar
                                          # Play should use its OWN natural stop — pullback bar's
                                          # opposite extreme — rather than RMS's generic %-based
@@ -225,27 +237,30 @@ class RMS:
                 target    = round(entry_price - stop_dist * reward_ratio, 2)
 
         # 4. Position size — CAPITAL-BASED (Jwala, Jul 9), now scaled by
-        # signal grade (Jwala, Jul 14): base unit = CAPITAL /
-        # MAX_OPEN_POSITIONS; a STRONG/VERY STRONG signal gets 2x/3x
-        # that unit, per UNITS_BY_STRENGTH.
+        # signal grade (Jwala, Jul 14): base unit = this strategy's own
+        # CAPITAL_PER_STRATEGY / MAX_OPEN_POSITIONS_PER_STRATEGY; a
+        # STRONG/VERY STRONG signal gets 2x/3x that unit, per
+        # UNITS_BY_STRENGTH.
         #
         # A 3-unit allocation across many concurrent VERY STRONG
-        # signals could, in the worst case, push total deployed
-        # capital well past CAPITAL if sized blindly (15 slots × 3
-        # units would be 3x over) — Jwala's spec covers the per-trade
-        # risk % staying fixed, but doesn't address this aggregate
-        # case, so this is my own addition: cap the capital actually
-        # used at whatever's genuinely still AVAILABLE (CAPITAL minus
+        # signals could, in the worst case, push this strategy's
+        # deployed capital well past its own pool if sized blindly (5
+        # slots × 3 units would be 3x over) — Jwala's spec covers the
+        # per-trade risk % staying fixed, but doesn't address this
+        # aggregate case, so this is my own addition: cap the capital
+        # actually used at whatever's genuinely still AVAILABLE in
+        # THIS strategy's pool (CAPITAL_PER_STRATEGY minus
         # capital_deployed), sizing DOWN gracefully rather than
         # blindly honoring the full 2x/3x request once capacity is
-        # tight. This preserves the "total deployed never exceeds
-        # CAPITAL" guarantee from the Jul 9 fix even with grade-based
-        # sizing layered on top.
-        base_unit  = self.cfg.CAPITAL / self.cfg.MAX_OPEN_POSITIONS
+        # tight. This preserves the "deployed never exceeds the pool"
+        # guarantee from the Jul 9 fix even with grade-based sizing
+        # layered on top — now enforced per-strategy instead of
+        # portfolio-wide.
+        base_unit  = self.cfg.CAPITAL_PER_STRATEGY / self.cfg.MAX_OPEN_POSITIONS_PER_STRATEGY
         units      = self.cfg.UNITS_BY_STRENGTH.get(strength, 1)
         desired_capital = base_unit * units
 
-        available = max(0.0, self.cfg.CAPITAL - capital_deployed)
+        available = max(0.0, self.cfg.CAPITAL_PER_STRATEGY - capital_deployed)
         capital_to_use = min(desired_capital, available)
 
         if entry_price <= 0:

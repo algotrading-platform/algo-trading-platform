@@ -143,12 +143,12 @@ def _load_instruments() -> None:
                 elif key == "NSE_INDEX|Nifty 100":
                     _symbol_key_cache["^NSEI100"] = key
 
-        print(f"[Upstox] ✅ Loaded {count} NSE instruments into cache", flush=True)
-        print(f"[Upstox] Sample: HDFCBANK.NS → {_symbol_key_cache.get('HDFCBANK.NS', 'NOT FOUND')}", flush=True)
+        print(f"[Upstox] Loaded {count} NSE instruments into cache", flush=True)
+        print(f"[Upstox] Sample: HDFCBANK.NS -> {_symbol_key_cache.get('HDFCBANK.NS', 'NOT FOUND')}", flush=True)
         _instruments_loaded = True
 
     except Exception as e:
-        print(f"[Upstox] ❌ Load instruments error: {type(e).__name__}: {e}", flush=True)
+        print(f"[Upstox] Load instruments error: {type(e).__name__}: {e}", flush=True)
         import traceback
         traceback.print_exc()
         _instruments_loaded = True

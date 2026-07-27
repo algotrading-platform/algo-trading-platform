@@ -81,12 +81,13 @@ log = logging.getLogger("paper_trader")
 
 IST = pytz.timezone("Asia/Kolkata")
 
-# Max concurrent open paper positions — single source of truth is
-# RMSConfig.MAX_OPEN_POSITIONS (rms.py). Previously duplicated here as
-# its own literal 15; unified after Jwala's Jul 9 capital-sizing fix,
-# since these two numbers drifting apart is exactly the kind of thing
-# that caused the ₹29-30L-deployed-on-₹10L-capital bug.
-MAX_OPEN_POSITIONS = RMSConfig.MAX_OPEN_POSITIONS
+# Max concurrent open paper positions PER STRATEGY — single source of
+# truth is RMSConfig.MAX_OPEN_POSITIONS_PER_STRATEGY (rms.py). Each of
+# the 3 parallel strategies gets its own 5-slot cap (Om, Jul 27), not a
+# shared 15-slot pool — unified with RMS's own sizing divisor so the
+# concurrency cap and the capital-per-trade divisor can never drift
+# apart, same reasoning as the original Jul 9 unification.
+MAX_OPEN_POSITIONS_PER_STRATEGY = RMSConfig.MAX_OPEN_POSITIONS_PER_STRATEGY
 
 # Cash-equity shorts cannot carry overnight — force-close any open
 # SHORT once this IST time is reached, regardless of stop/target.
@@ -193,18 +194,22 @@ class PaperTrader:
 
         # ── Flat: BUY opens a LONG, SELL opens a SHORT ─────────────
 
-        # Concurrency cap (applies across longs + shorts combined).
-        if db.count_open_paper_positions() >= MAX_OPEN_POSITIONS:
-            return {"action": "reject", "reason": f"max {MAX_OPEN_POSITIONS} open positions"}
+        # Concurrency cap — per-strategy (applies across longs + shorts
+        # combined WITHIN this strategy; each strategy has its own
+        # 5-slot pool, Om Jul 27).
+        if db.count_open_paper_positions(strategy=strategy) >= MAX_OPEN_POSITIONS_PER_STRATEGY:
+            return {"action": "reject",
+                    "reason": f"max {MAX_OPEN_POSITIONS_PER_STRATEGY} open positions for {strategy}"}
 
         # 1. RMS — evaluate() is already symmetric: for SELL it sizes
         # and mirrors stop/target for a short (stop above entry,
         # target below). strategy picks the reward ratio (Jwala Jul
         # 11: Volume Spike gets 1:2, wider than RSI's 1.2×). strength
         # picks the unit count (Jwala Jul 14); capital_deployed is
-        # fetched fresh here so RMS can cap grade-based sizing against
-        # what's actually still available, not just the raw request.
-        capital_deployed = db.get_capital_deployed()
+        # fetched fresh here, SCOPED TO THIS STRATEGY (Jul 27: pools
+        # are per-strategy), so RMS can cap grade-based sizing against
+        # what's actually still available in this strategy's own pool.
+        capital_deployed = db.get_capital_deployed(strategy=strategy)
         decision = self.rms.evaluate(
             symbol, side, price,
             strategy=strategy, strength=strength,

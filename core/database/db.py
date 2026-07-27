@@ -745,11 +745,21 @@ def get_today_closed_paper_positions() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def count_open_paper_positions() -> int:
-    """How many positions are currently OPEN (for the max-concurrent cap)."""
+def count_open_paper_positions(strategy: str = None) -> int:
+    """
+    How many positions are currently OPEN (for the max-concurrent cap).
+    Pass `strategy` to scope the count to that strategy's own pool
+    (Jul 27: concurrency caps are now per-strategy, not portfolio-wide).
+    """
     try:
         with _get_cursor() as cur:
-            cur.execute("SELECT COUNT(*) AS n FROM paper_positions WHERE status = 'OPEN'")
+            if strategy:
+                cur.execute("""
+                    SELECT COUNT(*) AS n FROM paper_positions
+                    WHERE status = 'OPEN' AND strategy = %s
+                """, (strategy,))
+            else:
+                cur.execute("SELECT COUNT(*) AS n FROM paper_positions WHERE status = 'OPEN'")
             row = cur.fetchone()
         return int(row["n"]) if row else 0
     except Exception as e:
@@ -959,19 +969,27 @@ def update_paper_position_stop(position_id: int, new_stop: float) -> bool:
         return False
 
 
-def get_capital_deployed() -> float:
+def get_capital_deployed(strategy: str = None) -> float:
     """
-    Sum of (entry_price * quantity) across all OPEN positions — how
-    much of total capital is currently tied up. Computed live from
-    existing columns; no new column or migration needed.
+    Sum of (entry_price * quantity) across OPEN positions — how much
+    capital is currently tied up. Computed live from existing columns;
+    no new column or migration needed. Pass `strategy` to scope this to
+    one strategy's own pool (Jul 27: capital pools are per-strategy).
     """
     try:
         with _get_cursor() as cur:
-            cur.execute("""
-                SELECT COALESCE(SUM(entry_price * quantity), 0) AS deployed
-                FROM paper_positions
-                WHERE status = 'OPEN'
-            """)
+            if strategy:
+                cur.execute("""
+                    SELECT COALESCE(SUM(entry_price * quantity), 0) AS deployed
+                    FROM paper_positions
+                    WHERE status = 'OPEN' AND strategy = %s
+                """, (strategy,))
+            else:
+                cur.execute("""
+                    SELECT COALESCE(SUM(entry_price * quantity), 0) AS deployed
+                    FROM paper_positions
+                    WHERE status = 'OPEN'
+                """)
             row = cur.fetchone()
         return round(float(row["deployed"]), 2) if row else 0.0
     except Exception as e:

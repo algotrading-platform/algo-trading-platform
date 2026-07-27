@@ -1879,9 +1879,12 @@ def render_paper_trading():
         st.markdown('<div class="no-sig">No open positions</div>', unsafe_allow_html=True)
     else:
         for _strat in _open_strategies:
-            _strat_df = open_df[open_df["strategy"] == _strat]
+            _strat_df       = open_df[open_df["strategy"] == _strat]
+            _strat_deployed = get_capital_deployed(strategy=_strat)
             st.markdown(
-                f'<div style="font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:1.5px;margin:14px 0 6px;">{_strat} &nbsp;·&nbsp; {len(_strat_df)} open</div>',
+                f'<div style="font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:1.5px;margin:14px 0 6px;">'
+                f'{_strat} &nbsp;·&nbsp; {len(_strat_df)}/{RMSConfig.MAX_OPEN_POSITIONS_PER_STRATEGY} open'
+                f' &nbsp;·&nbsp; ₹{_strat_deployed:,.0f} / ₹{RMSConfig.CAPITAL_PER_STRATEGY:,.0f} deployed</div>',
                 unsafe_allow_html=True,
             )
             _render_open_positions_table(_strat_df, cmp_map, key_prefix=f"pt_open_{_strat.replace(' ', '_').lower()}")
