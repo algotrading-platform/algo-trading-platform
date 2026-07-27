@@ -6,7 +6,7 @@
 #
 # Strategy selection:
 #   Set SIGNAL_STRATEGY env variable to choose strategy.
-#   Default: "RSI Reversal"
+#   Default: "RSI + MA"
 #
 # FIXES (2026-06-19):
 #   - Arbitrage now runs HOURLY only (not every 5 mins)
@@ -52,7 +52,7 @@ IST = pytz.timezone("Asia/Kolkata")
 # STRATEGY SELECTION
 # ============================================================
 
-_DEFAULT_STRATEGY = "RSI Reversal"
+_DEFAULT_STRATEGY = "RSI + MA"  # was "RSI Reversal"
 _ACTIVE_STRATEGY  = os.getenv("SIGNAL_STRATEGY", _DEFAULT_STRATEGY)
 
 ALL_STRATEGY_NAMES = STRATEGY_NAMES + ["Cash-Futures Arbitrage"]
@@ -186,7 +186,7 @@ PARALLEL_STRATEGIES = ["RSI + MA", "Volume Spike", "3 Bar Play"]  # renamed
 
 # A single engine drives the multi-strategy scan. The label passed
 # here is cosmetic — run_multi_scan() takes the real strategy list.
-_multi_engine = StrategyEngine("RSI Reversal")
+_multi_engine = StrategyEngine("RSI + MA")  # was "RSI Reversal" — this WAS crashing the whole process at import time, since StrategyEngine.__init__ validates the name against the registry, which only has "RSI + MA" now. Found by Claude Code static analysis, Jul 25 — the label is cosmetic to behavior (run_multi_scan uses PARALLEL_STRATEGIES for the real list) but NOT cosmetic to construction.
 
 # ── Paper trading: one shared monitor instance ───────────────
 # Opening positions is handled inside the engine (run_multi_scan);
@@ -240,12 +240,12 @@ def get_primary_engine() -> StrategyEngine:
 
     try:
         from core.database.db import get_config
-        strategy = get_config("SIGNAL_STRATEGY") or os.getenv("SIGNAL_STRATEGY", "RSI Reversal")
+        strategy = get_config("SIGNAL_STRATEGY") or os.getenv("SIGNAL_STRATEGY", "RSI + MA")
     except Exception:
-        strategy = os.getenv("SIGNAL_STRATEGY", "RSI Reversal")
+        strategy = os.getenv("SIGNAL_STRATEGY", "RSI + MA")
 
     if strategy == "All Strategies":
-        strategy = "RSI Reversal"
+        strategy = "RSI + MA"
 
     if strategy != _current_strategy:
         log.info(f"Strategy: {_current_strategy} → {strategy}")
@@ -447,9 +447,9 @@ def build_scheduler() -> BlockingScheduler:
 def start() -> None:
     try:
         from core.database.db import get_config
-        active_strat = get_config("SIGNAL_STRATEGY") or os.getenv("SIGNAL_STRATEGY", "RSI Reversal")
+        active_strat = get_config("SIGNAL_STRATEGY") or os.getenv("SIGNAL_STRATEGY", "RSI + MA")
     except Exception:
-        active_strat = os.getenv("SIGNAL_STRATEGY", "RSI Reversal")
+        active_strat = os.getenv("SIGNAL_STRATEGY", "RSI + MA")
 
     log.info("=" * 60)
     log.info("Algo Trading Signal Scheduler")
