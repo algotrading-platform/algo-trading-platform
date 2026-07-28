@@ -12,10 +12,11 @@
 # Fallback (if DATABASE_URL not set):
 #   AZURE_DB_HOST     : ariqt-algo-trading-db-001.postgres.database.azure.com
 #   AZURE_DB_USER     : algoadmin
-#   AZURE_DB_PASSWORD : Trading@2024!
+#   AZURE_DB_PASSWORD : (see .env / secrets manager)
 #   AZURE_DB_NAME     : postgres
 # ============================================================
 
+import logging
 import os
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -26,6 +27,7 @@ import psycopg2.extras
 import pytz
 from dotenv import load_dotenv
 
+log = logging.getLogger("db")
 IST = pytz.timezone("Asia/Kolkata")
 
 load_dotenv()
@@ -685,7 +687,7 @@ def get_open_paper_positions(symbol: str = None) -> pd.DataFrame:
             return pd.DataFrame()
         return pd.DataFrame([dict(r) for r in rows])
     except Exception as e:
-        print(f"[DB] get_open_paper_positions error: {e}")
+        log.error(f"get_open_paper_positions error: {e}")
         return pd.DataFrame()
 
 

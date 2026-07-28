@@ -180,9 +180,30 @@ _arb_engine = StrategyEngine("Cash-Futures Arbitrage")
 # RSI Reversal + Volume Spike both run on the same single fetch
 # per instrument (Volume Spike is stock-only, enforced in engine).
 # Add more names here to run them in parallel too.
-PARALLEL_STRATEGIES = ["RSI + MA", "Volume Spike", "3 Bar Play"]  # renamed
-                                                                     # "RSI Reversal" -> "RSI + MA"
-                                                                     # (Jul 24) and added "3 Bar Play"
+# ALWAYS_ON_STRATEGIES run on every timeframe, unchanged from before.
+# 3 Bar Play is restricted to the higher timeframes only (Om, Jul 28:
+# "run 3barplay only on 1 hour/1day/1week/1month and rest volume and
+# RSI + MA remain same") — the pattern needs a wide-range igniting
+# candle + a real pullback, which is a lot less meaningful to detect
+# on 5m/15m noise than on slower charts. RSI + MA and Volume Spike are
+# untouched, still scan every timeframe exactly as before.
+ALWAYS_ON_STRATEGIES     = ["RSI + MA", "Volume Spike"]
+THREE_BAR_PLAY_TIMEFRAMES = ["1 Hour", "1 Day", "1 Week", "1 Month"]
+
+# Kept for anything else that still reads PARALLEL_STRATEGIES directly
+# (e.g. the startup banner log below) — represents the FULL possible
+# set, not what runs on every single timeframe. Use
+# _strategies_for_timeframe(tf_name) wherever the actual per-scan
+# strategy list is needed.
+PARALLEL_STRATEGIES = ALWAYS_ON_STRATEGIES + ["3 Bar Play"]
+
+
+def _strategies_for_timeframe(tf_name: str) -> list:
+    """Which strategies actually run on a given timeframe's scan."""
+    strategies = list(ALWAYS_ON_STRATEGIES)
+    if tf_name in THREE_BAR_PLAY_TIMEFRAMES:
+        strategies.append("3 Bar Play")
+    return strategies
 
 # A single engine drives the multi-strategy scan. The label passed
 # here is cosmetic — run_multi_scan() takes the real strategy list.
@@ -263,10 +284,11 @@ def run_primary_scan(tf_name: str) -> None:
     """
     Parallel multi-strategy scan on all instruments.
 
-    Runs every strategy in PARALLEL_STRATEGIES (RSI Reversal +
-    Volume Spike) on a SINGLE data fetch per instrument. Each signal
-    is logged and alerted tagged with its own strategy name, so the
-    dashboard 'All Strategies' view and per-strategy filter both work.
+    Runs RSI + MA and Volume Spike on every timeframe; 3 Bar Play only
+    on 1 Hour/1 Day/1 Week/1 Month (see THREE_BAR_PLAY_TIMEFRAMES) —
+    on a SINGLE data fetch per instrument. Each signal is logged and
+    alerted tagged with its own strategy name, so the dashboard 'All
+    Strategies' view and per-strategy filter both work.
 
     The dashboard strategy dropdown now only changes the VIEW (filter)
     — it no longer switches which strategies are scanned. All parallel
@@ -284,7 +306,7 @@ def run_primary_scan(tf_name: str) -> None:
 
     _multi_engine.run_multi_scan(
         provider=provider,
-        strategy_names=PARALLEL_STRATEGIES,
+        strategy_names=_strategies_for_timeframe(tf_name),
         tf_name=tf_name,
         interval=interval,
         period=period,

@@ -530,6 +530,7 @@ class PaperTrader:
             df = self.provider.fetch_data(symbol=symbol, interval="5m", period="1d")
             if df is not None and not df.empty:
                 return round(float(df["Close"].iloc[-1]), 2)
+            log.warning(f"Price fetch returned nothing for {symbol} after Upstox+yfinance fallback")
         except Exception as e:
             log.warning(f"_current_price failed for {symbol}: {e}")
         return None

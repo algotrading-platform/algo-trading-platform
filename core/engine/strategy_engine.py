@@ -328,6 +328,7 @@ class StrategyEngine:
                 )
 
                 if df is None or df.empty or len(df) < 20:
+                    log.warning(f"No data for {symbol} {tf_name} (interval={interval}) after fetch — got None/empty/insufficient rows (attempt {attempt}/{retries})")
                     return None
 
                 # NOTE: a data-freshness guard was tried here but over-fired
@@ -536,6 +537,7 @@ class StrategyEngine:
                 df = provider.fetch_data(symbol=symbol, interval=interval, period=period)
 
                 if df is None or df.empty or len(df) < 20:
+                    log.warning(f"No data for {symbol} {tf_name} (interval={interval}) after fetch — got None/empty/insufficient rows (attempt {attempt}/{retries})")
                     return []
 
                 # NOTE: freshness guard removed here too (see multi-scan note).
@@ -688,6 +690,7 @@ class StrategyEngine:
                 )
 
                 if df is None or df.empty:
+                    log.warning(f"No data for {symbol} {tf_name} (interval={interval}) after fetch — got None/empty (attempt {attempt}/{retries})")
                     return None
 
                 spot_price = round(float(df["Close"].iloc[-1]), 2)
