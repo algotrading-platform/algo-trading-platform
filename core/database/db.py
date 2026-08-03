@@ -996,4 +996,87 @@ def get_capital_deployed(strategy: str = None) -> float:
         return round(float(row["deployed"]), 2) if row else 0.0
     except Exception as e:
         print(f"[DB] get_capital_deployed error: {e}")
+
+
+# ============================================================
+# LIVE CANDLES (Upstox WebSocket listener — core/marketdata/ws_listener.py)
+# ============================================================
+
+def upsert_live_candles(rows: list[dict]) -> bool:
+    """
+    Batched upsert of 1-minute candles from the WS listener. One
+    query for the whole batch (psycopg2.extras.execute_values), not
+    one query per instrument -- the listener flushes every few
+    seconds, not on every tick.
+
+    Each row: {instrument_key, symbol, ts, open, high, low, close, volume}
+    """
+    if not rows:
+        return True
+    try:
+        values = [
+            (r["instrument_key"], r["symbol"], r["ts"],
+             round(float(r["open"]), 2), round(float(r["high"]), 2),
+             round(float(r["low"]), 2), round(float(r["close"]), 2),
+             int(r.get("volume", 0)))
+            for r in rows
+        ]
+        with _get_cursor() as cur:
+            psycopg2.extras.execute_values(cur, """
+                INSERT INTO live_candles_1min
+                    (instrument_key, symbol, ts, open, high, low, close, volume)
+                VALUES %s
+                ON CONFLICT (instrument_key, ts) DO UPDATE SET
+                    high       = EXCLUDED.high,
+                    low        = EXCLUDED.low,
+                    close      = EXCLUDED.close,
+                    volume     = EXCLUDED.volume,
+                    updated_at = NOW()
+            """, values)
+        return True
+    except Exception as e:
+        print(f"[DB] upsert_live_candles error ({len(rows)} rows): {e}")
+        return False
+
+
+def get_live_candles_today(symbol: str) -> pd.DataFrame:
+    """Today's 1-minute candles for a symbol, oldest first (for resampling)."""
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                SELECT ts AS "Datetime", open AS "Open", high AS "High",
+                       low AS "Low", close AS "Close", volume AS "Volume"
+                FROM live_candles_1min
+                WHERE symbol = %s AND ts >= date_trunc('day', NOW())
+                ORDER BY ts ASC
+            """, (symbol,))
+            rows = cur.fetchall()
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame([dict(r) for r in rows])
+    except Exception as e:
+        print(f"[DB] get_live_candles_today error for {symbol}: {e}")
+        return pd.DataFrame()
+
+
+def get_latest_live_price(symbol: str, max_age_minutes: int = 2) -> float | None:
+    """
+    Latest close for a symbol from the live feed. Returns None (not
+    a stale value) if the WS listener hasn't updated this symbol
+    within max_age_minutes -- callers should fall back to REST/
+    yfinance in that case, same as if the row didn't exist at all.
+    """
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                SELECT close FROM live_candles_1min
+                WHERE symbol = %s
+                  AND updated_at >= NOW() - INTERVAL '1 minute' * %s
+                ORDER BY ts DESC LIMIT 1
+            """, (symbol, max_age_minutes))
+            row = cur.fetchone()
+        return round(float(row["close"]), 2) if row else None
+    except Exception as e:
+        print(f"[DB] get_latest_live_price error for {symbol}: {e}")
+        return None
         return 0.0

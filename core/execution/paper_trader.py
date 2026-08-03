@@ -305,12 +305,14 @@ class PaperTrader:
             if side == "SELL" and _is_from_previous_day(pos["opened_at"]):
                 price = self._current_price(symbol)
                 if price is None:
+                    log.warning(f"stale_carryover check: no price for {symbol}, skipped this cycle")
                     continue
                 if db.close_paper_position(pid, price, exit_reason="stale_carryover"):
                     qty   = int(pos["quantity"])
                     entry = float(pos["entry_price"])
                     pnl   = (entry - price) * qty  # SELL/short only, mirrored math
                     self.rms.record_realized_pnl(pnl)
+                    self.om.clear_key(symbol, side, f"{pos['timeframe']}|{pos['strategy']}")
                     closed.append({
                         "symbol": symbol, "reason": "stale_carryover",
                         "exit": price, "pnl": round(pnl, 2),
@@ -329,12 +331,14 @@ class PaperTrader:
             if side == "SELL" and square_off_now:
                 price = self._current_price(symbol)
                 if price is None:
+                    log.warning(f"square_off check: no price for {symbol}, skipped this cycle — still open past cutoff")
                     continue
                 if db.close_paper_position(pid, price, exit_reason="square_off"):
                     qty   = int(pos["quantity"])
                     entry = float(pos["entry_price"])
                     pnl   = (entry - price) * qty  # SELL/short only, mirrored math
                     self.rms.record_realized_pnl(pnl)
+                    self.om.clear_key(symbol, side, f"{pos['timeframe']}|{pos['strategy']}")
                     closed.append({
                         "symbol": symbol, "reason": "square_off",
                         "exit": price, "pnl": round(pnl, 2),
@@ -343,6 +347,7 @@ class PaperTrader:
 
             price = self._current_price(symbol)
             if price is None:
+                log.warning(f"stop/target check: no price for {symbol}, skipped this cycle")
                 continue
 
             stop   = float(pos["stop_loss"])
@@ -381,6 +386,7 @@ class PaperTrader:
                     entry = float(pos["entry_price"])
                     pnl   = (price - entry) * qty if side == "BUY" else (entry - price) * qty
                     self.rms.record_realized_pnl(pnl)
+                    self.om.clear_key(symbol, side, f"{pos['timeframe']}|{pos['strategy']}")
                     closed.append({
                         "symbol": symbol, "reason": hit,
                         "exit": price, "pnl": round(pnl, 2),
@@ -478,6 +484,7 @@ class PaperTrader:
         side  = pos["side"]
         pnl   = (price - entry) * qty if side == "BUY" else (entry - price) * qty
         self.rms.record_realized_pnl(pnl)
+        self.om.clear_key(pos["symbol"], side, f"{pos['timeframe']}|{pos['strategy']}")
 
         return {"action": "closed", "symbol": pos["symbol"], "reason": "manual",
                 "exit": price, "pnl": round(pnl, 2)}
@@ -507,6 +514,7 @@ class PaperTrader:
             qty   = int(pos["quantity"]); entry = float(pos["entry_price"])
             pnl = (price - entry) * qty if pos["side"] == "BUY" else (entry - price) * qty
             self.rms.record_realized_pnl(pnl)
+            self.om.clear_key(symbol, pos["side"], f"{pos['timeframe']}|{pos['strategy']}")
         return ok
 
     # --------------------------------------------------------
@@ -524,6 +532,17 @@ class PaperTrader:
             return None
 
     def _current_price(self, symbol: str):
+        # Fast path: latest price from the WS listener's live table
+        # (core/marketdata/ws_listener.py), a few seconds stale at
+        # most. Falls through to the REST/yfinance path below if the
+        # listener is down or hasn't seen this symbol recently.
+        try:
+            live_price = db.get_latest_live_price(symbol)
+            if live_price is not None:
+                return live_price
+        except Exception as e:
+            log.warning(f"live price lookup failed for {symbol}: {e}")
+
         if self.provider is None:
             return None
         try:

@@ -277,6 +277,48 @@ def save_token(access_token: str) -> bool:
         return False
 
 # ============================================================
+# RESAMPLING (module-level so other providers, e.g. UpstoxWSProvider,
+# can reuse the exact same candle-boundary logic)
+# ============================================================
+
+def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """
+    Resample 1-minute (or 30-minute) candles into larger timeframes.
+    rule: "5min", "15min", "1h"
+
+    This gives true 5m/15m/1h candles — same candle boundaries as
+    TradingView and Zerodha.
+    """
+    try:
+        if "Datetime" not in df.columns:
+            return df
+
+        df = df.copy()
+        df["Datetime"] = pd.to_datetime(df["Datetime"])
+        df = df.set_index("Datetime")
+
+        # Resample OHLCV
+        resampled = df.resample(rule, label="left", closed="left").agg({
+            "Open":   "first",
+            "High":   "max",
+            "Low":    "min",
+            "Close":  "last",
+            "Volume": "sum",
+        }).dropna(subset=["Close"])
+
+        # Keep only market hours candles (9:15 AM to 3:30 PM IST)
+        resampled = resampled.between_time("09:15", "15:30")
+        resampled = resampled.reset_index()
+        resampled = resampled.sort_values("Datetime").reset_index(drop=True)
+
+        return resampled
+
+    except Exception as e:
+        print(f"[Upstox] Resample error: {e}")
+        return df.reset_index() if df.index.name == "Datetime" else df
+
+
+# ============================================================
 # UPSTOX PROVIDER
 # ============================================================
 
@@ -399,33 +441,7 @@ class UpstoxProvider(BaseDataProvider):
         This gives us true 5m, 15m, 1h candles from Upstox data —
         same candle boundaries as TradingView and Zerodha.
         """
-        try:
-            if "Datetime" not in df.columns:
-                return df
-
-            df = df.copy()
-            df["Datetime"] = pd.to_datetime(df["Datetime"])
-            df = df.set_index("Datetime")
-
-            # Resample OHLCV
-            resampled = df.resample(rule, label="left", closed="left").agg({
-                "Open":   "first",
-                "High":   "max",
-                "Low":    "min",
-                "Close":  "last",
-                "Volume": "sum",
-            }).dropna(subset=["Close"])
-
-            # Keep only market hours candles (9:15 AM to 3:30 PM IST)
-            resampled = resampled.between_time("09:15", "15:30")
-            resampled = resampled.reset_index()
-            resampled = resampled.sort_values("Datetime").reset_index(drop=True)
-
-            return resampled
-
-        except Exception as e:
-            print(f"[Upstox] Resample error: {e}")
-            return df.reset_index() if df.index.name == "Datetime" else df
+        return resample_ohlc(df, rule)
 
     def _resolve_symbol(self, symbol: str, token: str) -> str | None:
         """

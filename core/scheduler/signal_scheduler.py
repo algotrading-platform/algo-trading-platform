@@ -34,6 +34,7 @@ sys.path.append(
 )
 
 from data.providers.upstox_provider import UpstoxProvider
+from data.providers.upstox_ws_provider import UpstoxWSProvider
 from core.engine.strategy_engine import StrategyEngine
 from core.strategies.strategies import STRATEGY_NAMES
 from configs.universe import get_all_instruments_extended
@@ -169,7 +170,10 @@ def is_last_trading_day_of_month() -> bool:
 # ENGINES & INSTRUMENTS
 # ============================================================
 
-provider         = UpstoxProvider()
+provider         = UpstoxWSProvider()  # same fetch_data() contract as UpstoxProvider —
+                                        # reads today's candles from the WS listener's
+                                        # live table when fresh, falls back to the
+                                        # unchanged REST/yfinance path otherwise
 instruments      = get_all_instruments_extended()
 fno_instruments  = [i for i in instruments if i["category"] == "STOCK"]
 
@@ -365,8 +369,15 @@ def run_scan(tf_name: str, mode: str = "all") -> None:
     Runs primary strategy then Arbitrage (hourly only).
     Updates LAST_SCAN_TIME after every scan.
     """
-    run_primary_scan(tf_name)
-    run_arbitrage_scan(tf_name)  # Only runs on 15 Minutes — no-op for other timeframes
+    try:
+        run_primary_scan(tf_name)
+    except Exception as e:
+        log.warning(f"primary scan failed for {tf_name} (non-fatal): {e}")
+
+    try:
+        run_arbitrage_scan(tf_name)  # Only runs on 15 Minutes — no-op for other timeframes
+    except Exception as e:
+        log.warning(f"arbitrage scan failed for {tf_name} (non-fatal): {e}")
 
     # Paper trading: close any open positions that hit stop/target.
     # Once per scan cycle, single-threaded, fully guarded.

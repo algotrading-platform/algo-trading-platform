@@ -70,7 +70,7 @@ class SandboxClient:
         try:
             body = self._upstox.PlaceOrderV3Request(
                 quantity=int(order.quantity),
-                product="D",
+                product=order.product,
                 validity="DAY",
                 price=float(order.price),
                 tag="paper",

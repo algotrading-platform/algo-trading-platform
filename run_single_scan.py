@@ -51,7 +51,7 @@ def main():
         sys.exit(0)
 
     if not is_market_hours():
-        log.info("Outside market hours (9:15–3:30 IST). Skipping scan.")
+        log.info("Outside algo trading window (9:45–15:15 IST). Skipping scan.")
         sys.exit(0)
 
     now = datetime.now(IST).strftime("%H:%M IST")
