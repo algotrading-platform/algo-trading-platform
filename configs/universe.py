@@ -17,6 +17,10 @@
 
 import requests
 import logging
+import gzip
+import json
+import csv
+from io import BytesIO
 from datetime import datetime, date
 from typing import Optional
 
@@ -109,9 +113,12 @@ FALLBACK_FNO_SYMBOLS = [
 ]
 
 # Lot sizes for F&O stocks (shares per lot) — used in Arbitrage strategy
+# NOTE: these are static fallback defaults only. get_fno_universe() overwrites
+# this dict in-place with live lot sizes from Upstox's instrument master
+# whenever that fetch succeeds, since NSE revises lot sizes periodically.
 LOT_SIZES = {
     "HDFCBANK.NS": 550, "ICICIBANK.NS": 1375, "RELIANCE.NS": 250,
-    "TCS.NS": 150, "INFY.NS": 300, "NIFTY": 25, "BANKNIFTY": 15,
+    "TCS.NS": 150, "INFY.NS": 300, "NIFTY": 65, "BANKNIFTY": 30,
     "SBIN.NS": 1500, "BAJFINANCE.NS": 125, "KOTAKBANK.NS": 400,
     "AXISBANK.NS": 1200, "WIPRO.NS": 1500, "HCLTECH.NS": 350,
     "MARUTI.NS": 100, "SUNPHARMA.NS": 350,
@@ -130,8 +137,66 @@ def get_lot_size(symbol: str) -> int:
 
 
 # ============================================================
-# DYNAMIC FETCH FROM NSE API
+# DYNAMIC FETCH FROM UPSTOX INSTRUMENT MASTER (primary source)
+#
+# NSE's own website blocks datacenter/cloud IPs at the Akamai layer
+# (homepage itself returns 403; the API endpoint serves a fake 404
+# "Resource not found" page as an anti-bot response) — no request
+# header tweaking fixes that from a hosted environment. Upstox
+# publishes a public instrument dump (same file used by
+# data/providers/upstox_provider.py for market data) that lists every
+# F&O futures contract with its underlying stock symbol and current
+# lot size, so we derive the F&O universe + live lot sizes from that
+# instead of scraping NSE.
 # ============================================================
+
+_UPSTOX_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+
+
+def _fetch_fno_from_upstox() -> tuple[list[str], dict[str, int]]:
+    """
+    Derive F&O-eligible stock symbols + their current lot sizes from
+    Upstox's public instrument master. Returns ([], {}) on any failure
+    so callers can fall through to the next source.
+    """
+    try:
+        response = requests.get(_UPSTOX_INSTRUMENTS_URL, timeout=30)
+        if response.status_code != 200:
+            log.warning(f"Upstox instruments file returned {response.status_code}")
+            return [], {}
+
+        with gzip.GzipFile(fileobj=BytesIO(response.content)) as gz:
+            instruments = json.load(gz)
+
+        symbols: list[str] = []
+        lots: dict[str, int] = {}
+        seen: set[str] = set()
+
+        for inst in instruments:
+            if (inst.get("segment") == "NSE_FO"
+                    and inst.get("instrument_type") == "FUT"
+                    and inst.get("underlying_type") == "EQUITY"):
+                sym = inst.get("underlying_symbol", "")
+                if sym and sym not in seen:
+                    seen.add(sym)
+                    yf_sym = f"{sym}.NS"
+                    symbols.append(yf_sym)
+                    lots[yf_sym] = inst.get("lot_size", DEFAULT_LOT_SIZE)
+
+            elif (inst.get("segment") == "NSE_FO"
+                    and inst.get("instrument_type") == "FUT"
+                    and inst.get("underlying_type") == "INDEX"
+                    and inst.get("underlying_symbol") in ("NIFTY", "BANKNIFTY")):
+                lots[inst["underlying_symbol"]] = inst.get("lot_size", DEFAULT_LOT_SIZE)
+
+        if symbols:
+            log.info(f"Upstox instruments: derived {len(symbols)} F&O stock symbols")
+        return symbols, lots
+
+    except Exception as e:
+        log.warning(f"Upstox F&O universe fetch failed: {e}")
+        return [], {}
+
 
 def _fetch_from_nse() -> list[str]:
     """
@@ -206,6 +271,14 @@ def get_fno_universe(force_refresh: bool = False) -> list[str]:
     if not force_refresh and _cache["date"] == today and _cache["symbols"]:
         return _cache["symbols"]
 
+    symbols, lots = _fetch_fno_from_upstox()
+
+    if symbols:
+        if lots:
+            LOT_SIZES.update(lots)
+        _cache = {"symbols": symbols, "date": today}
+        return symbols
+
     symbols = _fetch_from_nse()
 
     if symbols:
@@ -217,10 +290,84 @@ def get_fno_universe(force_refresh: bool = False) -> list[str]:
     return FALLBACK_FNO_SYMBOLS
 
 
+# ============================================================
+# NIFTY 500 UNIVERSE — dynamic fetch from NSE's static archive
+#
+# The interactive nseindia.com API is blocked at the Akamai layer for
+# datacenter IPs (see the comment above _fetch_fno_from_upstox), but
+# NSE also publishes index constituent lists as plain CSVs on its
+# static archive subdomain, which is NOT behind the same bot check.
+# Unlike the F&O list, membership here changes too often (index
+# rebalances) to keep a safe hardcoded fallback — on fetch failure we
+# just return [] and the scan universe temporarily shrinks back to
+# the F&O list until the next successful refresh.
+# ============================================================
+
+_NIFTY500_CSV_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
+
+_nifty500_cache: dict = {"symbols": [], "date": None}
+
+
+def _fetch_nifty500_from_nse() -> list[str]:
+    """Fetch Nifty 500 constituent symbols from NSE's static archive CSV."""
+    try:
+        response = requests.get(
+            _NIFTY500_CSV_URL,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0.0.0 Safari/537.36",
+            },
+            timeout=15,
+        )
+        if response.status_code != 200:
+            log.warning(f"NSE Nifty 500 archive CSV returned {response.status_code}")
+            return []
+
+        reader = csv.DictReader(response.text.splitlines())
+        symbols = [
+            f"{row['Symbol'].strip()}.NS"
+            for row in reader
+            if row.get("Symbol", "").strip()
+        ]
+
+        if symbols:
+            log.info(f"NSE archive: fetched {len(symbols)} Nifty 500 symbols")
+        return symbols
+
+    except Exception as e:
+        log.warning(f"Nifty 500 archive fetch failed: {e}")
+        return []
+
+
+def get_nifty500_universe(force_refresh: bool = False) -> list[str]:
+    """Returns Nifty 500 constituent symbols (yfinance format), cached once per day."""
+    global _nifty500_cache
+
+    today = date.today()
+
+    if not force_refresh and _nifty500_cache["date"] == today and _nifty500_cache["symbols"]:
+        return _nifty500_cache["symbols"]
+
+    symbols = _fetch_nifty500_from_nse()
+    if symbols:
+        _nifty500_cache = {"symbols": symbols, "date": today}
+
+    return symbols
+
+
 def get_all_instruments_extended() -> list[dict]:
     """
-    Returns full instrument list including Indexes + all F&O stocks + Commodities.
-    Used by the scheduler when running expanded universe.
+    Returns full instrument list: Indexes + F&O stocks + Nifty 500
+    (non-F&O) stocks + Commodities. Used by the scheduler when running
+    expanded universe.
+
+    Nifty 500 stocks that AREN'T also F&O-eligible are tagged the same
+    "STOCK" category as F&O stocks, since RSI+MA / Volume Spike / 3 Bar
+    Play all apply generically to any stock. Arbitrage needs a real
+    futures contract to exist, so its instrument list is filtered
+    separately by get_fno_universe() membership, not by this category
+    (see fno_instruments in core/scheduler/signal_scheduler.py).
     """
     from configs.instruments import (
         INDEXES, INDEXES_DISPLAY, INDEXES_TV,
@@ -239,7 +386,19 @@ def get_all_instruments_extended() -> list[dict]:
         })
 
     fno = get_fno_universe()
+    fno_set = set(fno)
     for sym in fno:
+        instruments.append({
+            "symbol":   sym,
+            "name":     stock_display(sym),
+            "tv":       f"NSE:{stock_display(sym)}",
+            "category": "STOCK",
+        })
+
+    nifty500 = get_nifty500_universe()
+    for sym in nifty500:
+        if sym in fno_set:
+            continue
         instruments.append({
             "symbol":   sym,
             "name":     stock_display(sym),

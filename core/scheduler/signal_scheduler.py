@@ -37,7 +37,7 @@ from data.providers.upstox_provider import UpstoxProvider
 from data.providers.upstox_ws_provider import UpstoxWSProvider
 from core.engine.strategy_engine import StrategyEngine
 from core.strategies.strategies import STRATEGY_NAMES
-from configs.universe import get_all_instruments_extended
+from configs.universe import get_all_instruments_extended, get_fno_universe
 from configs.timeframes import TIMEFRAMES, PERIOD_MAP
 
 logging.basicConfig(
@@ -175,7 +175,12 @@ provider         = UpstoxWSProvider()  # same fetch_data() contract as UpstoxPro
                                         # live table when fresh, falls back to the
                                         # unchanged REST/yfinance path otherwise
 instruments      = get_all_instruments_extended()
-fno_instruments  = [i for i in instruments if i["category"] == "STOCK"]
+# "STOCK" category now also includes non-F&O Nifty 500 stocks (added for
+# broader RSI+MA/Volume Spike/3 Bar Play coverage), so Arbitrage — which
+# requires a real futures contract — filters on actual F&O membership
+# rather than the category label.
+_fno_symbols     = set(get_fno_universe())
+fno_instruments  = [i for i in instruments if i["symbol"] in _fno_symbols]
 
 # Arbitrage engine — always fixed
 _arb_engine = StrategyEngine("Cash-Futures Arbitrage")
