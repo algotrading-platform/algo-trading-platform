@@ -18,12 +18,14 @@
 
 import logging
 import os
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 import pytz
 from dotenv import load_dotenv
 
@@ -35,6 +37,19 @@ load_dotenv()
 # ============================================================
 # CONNECTION
 # ============================================================
+#
+# A pooled connection is reused across calls instead of opening a new
+# TCP+TLS connection to Azure PostgreSQL on every single query. Under
+# a full scan cycle (500+ instruments x multiple strategies/timeframes,
+# each hitting insert_signal/get_alert_state/etc.), the old connect-
+# per-call pattern could open hundreds of short-lived connections per
+# cycle -- enough to intermittently exceed the server's max_connections
+# limit under Azure's Burstable/GP-small tiers, surfacing as sporadic
+# "database not reachable" errors with no other explanation.
+
+_pool      = None
+_pool_lock = threading.Lock()
+
 
 def _get_conn_params() -> dict:
     """
@@ -56,31 +71,54 @@ def _get_conn_params() -> dict:
     }
 
 
+def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    """
+    Lazily creates the process-wide connection pool on first use.
+    Each process (dashboard, scheduler, ws listener) gets its own pool.
+    Sized above the scan engine's max_workers=10 thread pool so a full
+    scan cycle never blocks waiting for a free connection.
+    """
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                params  = _get_conn_params()
+                maxconn = int(os.getenv("DB_POOL_MAX", "20"))
+                if "dsn" in params:
+                    _pool = psycopg2.pool.ThreadedConnectionPool(
+                        1, maxconn, dsn=params["dsn"], connect_timeout=15,
+                    )
+                else:
+                    _pool = psycopg2.pool.ThreadedConnectionPool(
+                        1, maxconn, connect_timeout=15, **params,
+                    )
+    return _pool
+
+
 @contextmanager
 def _get_cursor():
     """
-    Context manager that yields a psycopg2 cursor.
-    Commits on success, rolls back on error, always closes.
+    Context manager that yields a psycopg2 cursor from the pool.
+    Commits on success, rolls back on error, always returns the
+    connection to the pool (discarding it instead of returning it if
+    the connection itself is bad, so the pool self-heals).
     """
-    params = _get_conn_params()
-    conn   = None
+    pool = _get_pool()
+    conn = pool.getconn()
+    bad_conn = False
     try:
-        if "dsn" in params:
-            conn = psycopg2.connect(params["dsn"], connect_timeout=15)
-        else:
-            conn = psycopg2.connect(**params, connect_timeout=15)
-
         conn.autocommit = False
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         yield cur
         conn.commit()
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        bad_conn = True
+        raise
     except Exception:
-        if conn:
-            conn.rollback()
+        conn.rollback()
         raise
     finally:
-        if conn:
-            conn.close()
+        pool.putconn(conn, close=bad_conn)
 
 
 # ============================================================
@@ -557,6 +595,68 @@ def set_config(key: str, value: str) -> bool:
 #
 # Requires the paper_positions table — see migration_paper_trading.sql
 # ============================================================
+
+
+def open_paper_position_if_capacity(
+    symbol:        str,
+    side:          str,
+    quantity:      int,
+    entry_price:   float,
+    stop_loss:     float,
+    target:        float,
+    strategy:      str,
+    timeframe:     str,
+    max_positions: int,
+    risk_amount:   float = 0.0,
+    order_id:      str   = "",
+) -> dict:
+    """
+    Atomically re-check the per-strategy open-position cap and insert
+    in the same transaction, so concurrent scan jobs (5min/15min/1h/1d/
+    1w/1m all racing on the same strategy's pool) can't each read a
+    stale count and jointly overshoot the cap. pg_advisory_xact_lock
+    serializes same-strategy callers for the rest of this transaction
+    and auto-releases on commit/rollback — no explicit unlock needed.
+
+    Returns {"opened": True} on success, or {"opened": False, "reason": ...}
+    if the cap was already full (checked fresh, under the lock).
+    """
+    try:
+        initial_stop_distance = round(abs(float(entry_price) - float(stop_loss)), 2)
+        with _get_cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                        (f"paper_pos_cap:{strategy}",))
+            cur.execute("""
+                SELECT COUNT(*) AS n FROM paper_positions
+                WHERE status = 'OPEN' AND strategy = %s
+            """, (strategy,))
+            if int(cur.fetchone()["n"]) >= max_positions:
+                return {"opened": False, "cause": "cap",
+                        "reason": f"max {max_positions} open positions for {strategy}"}
+
+            cur.execute("""
+                INSERT INTO paper_positions
+                    (symbol, side, quantity, entry_price, stop_loss, target,
+                     strategy, timeframe, risk_amount, order_id,
+                     peak_price, initial_stop_distance,
+                     status, opened_at)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN', NOW())
+            """, (
+                symbol, side, int(quantity),
+                round(float(entry_price), 2),
+                round(float(stop_loss),   2),
+                round(float(target),      2),
+                strategy, timeframe,
+                round(float(risk_amount), 2),
+                order_id,
+                round(float(entry_price), 2),  # peak_price starts at entry
+                initial_stop_distance,
+            ))
+        return {"opened": True}
+    except Exception as e:
+        print(f"[DB] open_paper_position_if_capacity error: {e}")
+        return {"opened": False, "cause": "error", "reason": f"db error: {e}"}
 
 
 def open_paper_position(

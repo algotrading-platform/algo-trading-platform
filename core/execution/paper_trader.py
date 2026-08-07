@@ -196,7 +196,10 @@ class PaperTrader:
 
         # Concurrency cap — per-strategy (applies across longs + shorts
         # combined WITHIN this strategy; each strategy has its own
-        # 5-slot pool, Om Jul 27).
+        # 5-slot pool, Om Jul 27). Cheap non-atomic pre-check to skip
+        # RMS/sandbox work when obviously full; the authoritative check
+        # is the atomic one at insert time below (this one alone raced
+        # across concurrent scan jobs and let the cap overshoot to 14).
         if db.count_open_paper_positions(strategy=strategy) >= MAX_OPEN_POSITIONS_PER_STRATEGY:
             return {"action": "reject",
                     "reason": f"max {MAX_OPEN_POSITIONS_PER_STRATEGY} open positions for {strategy}"}
@@ -235,8 +238,11 @@ class PaperTrader:
         if not result["ok"]:
             return {"action": "error", "reason": f"sandbox: {result['error']}"}
 
-        # 5. Record the open position in the DB
-        ok = db.open_paper_position(
+        # 5. Record the open position in the DB — atomic with a fresh
+        # cap re-check (see open_paper_position_if_capacity docstring):
+        # closes the race where two concurrent scan jobs both pass the
+        # pre-check above and jointly overshoot the strategy's cap.
+        insert = db.open_paper_position_if_capacity(
             symbol=symbol,
             side=side,
             quantity=order.quantity,
@@ -245,11 +251,13 @@ class PaperTrader:
             target=order.target,
             strategy=strategy,
             timeframe=timeframe,
+            max_positions=MAX_OPEN_POSITIONS_PER_STRATEGY,
             risk_amount=decision.risk_amount,
             order_id=result["order_id"],
         )
-        if not ok:
-            return {"action": "error", "reason": "sandbox order placed but DB write failed"}
+        if not insert["opened"]:
+            action = "reject" if insert.get("cause") == "cap" else "error"
+            return {"action": action, "reason": insert["reason"]}
 
         return {
             "action":   "opened",

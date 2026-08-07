@@ -428,10 +428,18 @@ def build_scheduler() -> BlockingScheduler:
         max_instances=1, coalesce=True,
     )
 
+    # OFFSET from the 5-min job's minutes (Aug 6: 1,16,31,46 collided with
+    # EVERY 15-min fire, and with the 1-hour job too at :16 — three
+    # full-507-instrument scans launching in the same instant, each
+    # spinning up its own 10-thread pool against the same rate-limited
+    # Upstox API. Cycles that should take ~1-2 min were taking 12-19 min,
+    # cascading into skipped 5-min runs for the rest of the hour. Offsets
+    # below (3/18/33/48 and :09) share no minute with the 5-min set
+    # {1,6,11,16,21,26,31,36,41,46,51,56} or with each other.
     scheduler.add_job(
         lambda: run_scan("15 Minutes", "all"),
         CronTrigger(
-            minute="1,16,31,46",
+            minute="3,18,33,48",
             hour="9,10,11,12,13,14,15",
             day_of_week="mon-fri", timezone=IST,
         ),
@@ -442,7 +450,7 @@ def build_scheduler() -> BlockingScheduler:
     scheduler.add_job(
         lambda: run_scan("1 Hour", "all"),
         CronTrigger(
-            minute="16", hour="10,11,12,13,14,15",
+            minute="9", hour="10,11,12,13,14,15",
             day_of_week="mon-fri", timezone=IST,
         ),
         id="scan_1hour", name="1 Hour Scan",

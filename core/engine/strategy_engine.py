@@ -101,9 +101,25 @@ def _run_paper_trading(provider, results):
                 strength=r.get("strength"),  # drives unit-based sizing in RMS
                 custom_stop=custom_stop,
             )
-            if outcome.get("action") == "opened":
+            action = outcome.get("action")
+            if action == "opened":
                 log.info(f"PAPER OPEN  {r['symbol']}  {r['signal']}  "
                          f"qty={outcome['quantity']}  @ {outcome['entry']}")
+            elif action == "closed":
+                log.info(f"PAPER CLOSE {r['symbol']}  reason={outcome.get('reason')}  "
+                         f"@ {outcome.get('exit')}")
+            elif action == "reject":
+                # Expected sometimes (cap full, RMS sizing) but a signal
+                # that alerted and then went nowhere is exactly what was
+                # invisible before — log it so it can't happen silently.
+                log.info(f"PAPER REJECT {r['symbol']}  {r['signal']}  "
+                         f"strategy={r['strategy']}  reason={outcome.get('reason')}")
+            elif action == "error":
+                log.warning(f"PAPER ERROR {r['symbol']}  {r['signal']}  "
+                            f"strategy={r['strategy']}  reason={outcome.get('reason')}")
+            elif action == "skip":
+                log.debug(f"PAPER SKIP  {r['symbol']}  {r['signal']}  "
+                          f"reason={outcome.get('reason')}")
         except Exception as e:
             log.warning(f"paper on_signal failed for {r.get('symbol')}: {e}")
 
@@ -789,16 +805,31 @@ class StrategyEngine:
                 for inst in instruments
             }
 
-            # FIXED: added timeout=300 (5 min max per scan) to prevent hanging
-            for future in as_completed(futures, timeout=300):
-                try:
-                    result = future.result(timeout=30)
-                    if result:
-                        results.append(result)
-                        if result["signal"] != "HOLD":
-                            signals += 1
-                except Exception as e:
-                    log.warning(f"Instrument scan error: {e}")
+            # timeout=300 (5 min max per scan) to prevent hanging. NOTE:
+            # as_completed() itself raises TimeoutError once the overall
+            # deadline passes with futures still unfinished — that's NOT
+            # caught by the per-future try/except below (which only
+            # guards future.result()), so it must be caught around the
+            # whole loop. Previously uncaught, this escaped run_scan()
+            # entirely on slow cycles, discarding every result gathered
+            # so far and erroring out the whole scheduler job.
+            try:
+                for future in as_completed(futures, timeout=300):
+                    try:
+                        result = future.result(timeout=30)
+                        if result:
+                            results.append(result)
+                            if result["signal"] != "HOLD":
+                                signals += 1
+                    except Exception as e:
+                        log.warning(f"Instrument scan error: {e}")
+            except TimeoutError:
+                unfinished = sum(1 for f in futures if not f.done())
+                log.warning(
+                    f"SCAN [{self.strategy_name}] {tf_name} hit the 300s deadline "
+                    f"with {unfinished}/{len(futures)} instruments still running — "
+                    f"proceeding with the {len(results)} results collected so far."
+                )
 
         elapsed = round(time.time() - start_time, 1)
         log.info(
@@ -879,15 +910,35 @@ class StrategyEngine:
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_scan_one, inst): inst for inst in instruments}
-            for future in as_completed(futures, timeout=300):
-                try:
-                    res_list = future.result(timeout=60)
-                    for r in (res_list or []):
-                        results.append(r)
-                        if r["signal"] != "HOLD":
-                            signals += 1
-                except Exception as e:
-                    log.warning(f"Instrument multi-scan error: {e}")
+            # NOTE: as_completed() itself raises TimeoutError once the
+            # overall 300s deadline passes with futures still unfinished
+            # — that's NOT caught by the per-future try/except below
+            # (which only guards future.result()), so it must be caught
+            # around the whole loop. Previously uncaught, this escaped
+            # run_multi_scan() entirely on slow cycles (seen repeatedly
+            # in production — up to 150/174 instruments still running at
+            # the deadline), which meant _run_paper_trading() below never
+            # ran at all: every signal from that cycle, including ones
+            # whose Telegram alert had already fired from inside the
+            # worker threads, was silently discarded.
+            try:
+                for future in as_completed(futures, timeout=300):
+                    try:
+                        res_list = future.result(timeout=60)
+                        for r in (res_list or []):
+                            results.append(r)
+                            if r["signal"] != "HOLD":
+                                signals += 1
+                    except Exception as e:
+                        log.warning(f"Instrument multi-scan error: {e}")
+            except TimeoutError:
+                unfinished = sum(1 for f in futures if not f.done())
+                log.warning(
+                    f"MULTI SCAN {tf_name} hit the 300s deadline with "
+                    f"{unfinished}/{len(futures)} instruments still running — "
+                    f"proceeding with the {len(results)} results collected so far "
+                    f"(paper trading still runs on these)."
+                )
 
         elapsed = round(time.time() - start_time, 1)
         log.info(
