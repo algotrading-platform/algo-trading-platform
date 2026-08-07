@@ -289,6 +289,40 @@ def get_primary_engine() -> StrategyEngine:
 # SCAN FUNCTIONS
 # ============================================================
 
+_EOD_TIMEFRAMES = ("1 Day", "1 Week", "1 Month")
+
+
+def _is_scan_due(tf_name: str) -> bool:
+    """
+    Whether tf_name's scan should actually run THIS cycle.
+
+    run_single_scan.py (the Container Apps Job entry point) calls
+    run_scan() for every timeframe on every Job execution — unlike the
+    old per-timeframe APScheduler jobs (build_scheduler(), no longer
+    deployed), there's no external trigger enforcing each timeframe's
+    own cadence, so it's enforced here instead. The Job fires every
+    5 min at IST minutes 1,6,11,16,21,26,31,36,41,46,51,56 — every
+    minute check below is chosen from that same set, or it would never
+    be reached.
+    """
+    now = datetime.now(IST)
+    minute, hour, weekday = now.minute, now.hour, now.weekday()
+
+    if tf_name == "5 Minutes":
+        return True
+    if tf_name == "15 Minutes":
+        return minute in (1, 16, 31, 46)
+    if tf_name == "1 Hour":
+        return minute == 6
+    if tf_name == "1 Day":
+        return hour == 15 and minute == 31
+    if tf_name == "1 Week":
+        return weekday == 4 and hour == 15 and minute == 36
+    if tf_name == "1 Month":
+        return is_last_trading_day_of_month() and hour == 15 and minute == 41
+    return True
+
+
 def run_primary_scan(tf_name: str) -> None:
     """
     Parallel multi-strategy scan on all instruments.
@@ -306,12 +340,21 @@ def run_primary_scan(tf_name: str) -> None:
     interval = TIMEFRAMES[tf_name]
     period   = PERIOD_MAP[tf_name]
 
-    if tf_name == "1 Week" and datetime.now(IST).weekday() != 4:
+    if not _is_scan_due(tf_name):
         return
-    if tf_name == "1 Month" and not is_last_trading_day_of_month():
-        return
-    if not is_market_hours():
-        return
+
+    # EOD timeframes (1 Day/Week/Month) run AFTER the 15:15 entry-window
+    # cutoff by design (15:31/15:36/15:41) — they only need a valid
+    # trading day, not the narrower scan/entry window is_market_hours()
+    # enforces. Gating them on is_market_hours() (as before) meant they
+    # could never run at all: the window it checks ends at 15:15, before
+    # any of their scheduled times.
+    if tf_name in _EOD_TIMEFRAMES:
+        if not is_market_day():
+            return
+    else:
+        if not is_market_hours():
+            return
 
     _multi_engine.run_multi_scan(
         provider=provider,
