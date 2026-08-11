@@ -908,7 +908,24 @@ class StrategyEngine:
                 tf_name, interval, period, nifty_trends,
             )
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # NOT a `with` block on purpose: ThreadPoolExecutor's context-manager
+        # __exit__ calls shutdown(wait=True) unconditionally, which blocks
+        # until EVERY submitted future finishes — not just the ones done by
+        # the 300s deadline below. With max_workers=10, at most ~10 futures
+        # are actually running at that moment; the other 300+ (of 507) are
+        # merely queued. The `with` block was silently waiting for all of
+        # those to run to completion too, 10 at a time, after already
+        # logging "proceeding with results collected so far" — a second,
+        # unlogged, 10-20+ minute stall on every slow cycle. That stall
+        # was the real reason "15 Minutes"/"1 Hour" scans never got reached
+        # in the same execution: this function simply never returned in
+        # time, no matter how the outer scheduling logic was fixed.
+        # cancel_futures=True (3.9+) drops the still-queued ones immediately;
+        # wait=False means we don't block on the handful genuinely in flight
+        # either — they finish in the background and their results are
+        # simply never collected, which is fine, this data is already stale.
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
             futures = {executor.submit(_scan_one, inst): inst for inst in instruments}
             # NOTE: as_completed() itself raises TimeoutError once the
             # overall 300s deadline passes with futures still unfinished
@@ -939,6 +956,8 @@ class StrategyEngine:
                     f"proceeding with the {len(results)} results collected so far "
                     f"(paper trading still runs on these)."
                 )
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         elapsed = round(time.time() - start_time, 1)
         log.info(

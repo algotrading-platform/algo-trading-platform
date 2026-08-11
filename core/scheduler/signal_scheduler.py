@@ -292,7 +292,7 @@ def get_primary_engine() -> StrategyEngine:
 _EOD_TIMEFRAMES = ("1 Day", "1 Week", "1 Month")
 
 
-def _is_scan_due(tf_name: str) -> bool:
+def _is_scan_due(tf_name: str, now: datetime = None) -> bool:
     """
     Whether tf_name's scan should actually run THIS cycle.
 
@@ -300,30 +300,58 @@ def _is_scan_due(tf_name: str) -> bool:
     run_scan() for every timeframe on every Job execution — unlike the
     old per-timeframe APScheduler jobs (build_scheduler(), no longer
     deployed), there's no external trigger enforcing each timeframe's
-    own cadence, so it's enforced here instead. The Job fires every
-    5 min at IST minutes 1,6,11,16,21,26,31,36,41,46,51,56 — every
-    minute check below is chosen from that same set, or it would never
-    be reached.
+    own cadence, so it's enforced here instead.
+
+    THE ACTUAL DEPLOYED TRIGGER (checked directly against the Container
+    App Job's scheduleTriggerConfig, Aug 10 2026): cron `*/5 3-10 * * 1-5`
+    in UTC. That's every 5 min within UTC hours 3-10, which in IST
+    (UTC+5:30) lands on minutes {0,5,10,15,20,25,30,35,40,45,50,55} —
+    i.e. every IST minute ending in 0 or 5.
+    IT IS NOT the {1,6,11,16,21,26,31,36,41,46,51,56} grid this function
+    assumed before this fix (and that the "Fix daily/weekly/monthly
+    scans never running" commit still assumed). Every minute check
+    below — 15 Minutes' (1,16,31,46), 1 Hour's 6, and the three EOD
+    timeframes' 31/36/41 — required a minute that can NEVER occur on
+    the real grid, so those scans were mathematically guaranteed to
+    never fire, independent of anything else. Confirmed via
+    `az containerapp job show ... scheduleTriggerConfig` and by
+    watching zero "15 Minutes"/"1 Hour" MULTI SCAN lines appear all
+    day on Aug 10 despite the 5-Minute scan running fine. Every
+    hardcoded minute below is the old value minus 1, moving each
+    check onto the real grid at the same relative offset from its
+    candle close / market close.
+
+    `now` should be the single timestamp snapshotted once at the top
+    of the Job's run (see run_single_scan.py). Timeframes are checked
+    sequentially in one process, and the "5 Minutes" scan alone
+    regularly takes several minutes — re-reading datetime.now(IST) at
+    each timeframe meant that by the time "15 Minutes"/"1 Hour" were
+    checked, the clock had already drifted past their exact-minute
+    window. That drift bug is real and independently fixed by this same
+    change, but it was never the reason these scans were stuck at
+    zero — the minute values above were simply unreachable on any
+    clock reading, drifted or not.
     """
-    now = datetime.now(IST)
+    if now is None:
+        now = datetime.now(IST)
     minute, hour, weekday = now.minute, now.hour, now.weekday()
 
     if tf_name == "5 Minutes":
         return True
     if tf_name == "15 Minutes":
-        return minute in (1, 16, 31, 46)
+        return minute in (0, 15, 30, 45)
     if tf_name == "1 Hour":
-        return minute == 6
+        return minute == 5
     if tf_name == "1 Day":
-        return hour == 15 and minute == 31
+        return hour == 15 and minute == 30
     if tf_name == "1 Week":
-        return weekday == 4 and hour == 15 and minute == 36
+        return weekday == 4 and hour == 15 and minute == 35
     if tf_name == "1 Month":
-        return is_last_trading_day_of_month() and hour == 15 and minute == 41
+        return is_last_trading_day_of_month() and hour == 15 and minute == 40
     return True
 
 
-def run_primary_scan(tf_name: str) -> None:
+def run_primary_scan(tf_name: str, now: datetime = None) -> None:
     """
     Parallel multi-strategy scan on all instruments.
 
@@ -336,11 +364,13 @@ def run_primary_scan(tf_name: str) -> None:
     The dashboard strategy dropdown now only changes the VIEW (filter)
     — it no longer switches which strategies are scanned. All parallel
     strategies always run.
+
+    `now`: shared snapshot from run_scan() — see _is_scan_due().
     """
     interval = TIMEFRAMES[tf_name]
     period   = PERIOD_MAP[tf_name]
 
-    if not _is_scan_due(tf_name):
+    if not _is_scan_due(tf_name, now=now):
         return
 
     # EOD timeframes (1 Day/Week/Month) run AFTER the 15:15 entry-window
@@ -366,7 +396,7 @@ def run_primary_scan(tf_name: str) -> None:
     )
 
 
-def run_arbitrage_scan(tf_name: str) -> None:
+def run_arbitrage_scan(tf_name: str, now: datetime = None) -> None:
     """
     Arbitrage scan on F&O stocks only.
 
@@ -380,13 +410,22 @@ def run_arbitrage_scan(tf_name: str) -> None:
 
     Futures contracts are cached in PostgreSQL (fetched once/day), so
     only the futures PRICE is fetched each run — keeps API calls low.
+
+    `now`: shared snapshot from run_scan() — see _is_scan_due(). Reading
+    a fresh datetime.now(IST) here (after the primary scan for this
+    same timeframe has already run) is exactly the drift bug that
+    starved "15 Minutes"/"1 Hour" — this cadence check is just as
+    exact-minute-sensitive, so it needs the same shared snapshot.
     """
     # Only piggyback on the 15-minute pass (avoids running on every tf)
     if tf_name != "15 Minutes":
         return
 
+    if now is None:
+        now = datetime.now(IST)
+
     # 30-minute cadence: fire near :00 and :30 only
-    minute = datetime.now(IST).minute
+    minute = now.minute
     if not (minute < 5 or 30 <= minute <= 34):
         return
 
@@ -412,30 +451,104 @@ def run_arbitrage_scan(tf_name: str) -> None:
     )
 
 
-def run_scan(tf_name: str, mode: str = "all") -> None:
+def run_scan(tf_name: str, mode: str = "all", now: datetime = None) -> None:
     """
     Runs primary strategy then Arbitrage (hourly only).
     Updates LAST_SCAN_TIME after every scan.
+
+    `now`: pass the single timestamp snapshotted once at the top of
+    the calling Job run, so every timeframe's due-check in this same
+    run sees the same clock reading — see _is_scan_due() for why that
+    matters. Defaults to a fresh read for any other/manual caller.
     """
+    if now is None:
+        now = datetime.now(IST)
+
     try:
-        run_primary_scan(tf_name)
+        run_primary_scan(tf_name, now=now)
     except Exception as e:
         log.warning(f"primary scan failed for {tf_name} (non-fatal): {e}")
 
     try:
-        run_arbitrage_scan(tf_name)  # Only runs on 15 Minutes — no-op for other timeframes
+        run_arbitrage_scan(tf_name, now=now)  # Only runs on 15 Minutes — no-op for other timeframes
     except Exception as e:
         log.warning(f"arbitrage scan failed for {tf_name} (non-fatal): {e}")
 
-    # Paper trading: close any open positions that hit stop/target.
-    # Once per scan cycle, single-threaded, fully guarded.
+
+def _monitor_open_with_timeout(pm, timeout_seconds: float = 60):
+    """
+    Runs pm.monitor_open() on a daemon thread and gives up after
+    timeout_seconds instead of blocking forever.
+
+    Aug 11 2026: pm.monitor_open() was observed hanging in production for
+    25+ minutes — not reproducible standalone (fast every time in
+    isolation), only when called shortly after a real 300s+, 507-instrument
+    multi-scan whose ThreadPoolExecutor was abandoned via
+    cancel_futures=True (see run_multi_scan) rather than waited out. Moving
+    the call to run once per execution (see run_post_scan_housekeeping)
+    didn't fix it — it still hung on that single call — so the trigger is
+    "shortly after a heavy scan", not "called more than once". Root cause
+    (presumably contention with the abandoned threads over the shared DB
+    pool / Upstox provider / Azure SQL capacity) is still unconfirmed.
+    Rather than let that block the whole cycle indefinitely again, this
+    bounds it: past the timeout, square-off/stop-target checks are simply
+    skipped for this cycle and retried next time, instead of the entire
+    execution — signal generation for every timeframe — being lost with it.
+    The abandoned thread is daemonized so it can't block process exit
+    either, mirroring the same non-blocking philosophy as
+    cancel_futures=True above.
+    """
+    import threading
+    result = {}
+
+    def _run():
+        try:
+            result["closed"] = pm.monitor_open()
+        except Exception as e:
+            result["error"] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout_seconds)
+    if t.is_alive():
+        log.warning(
+            f"pm.monitor_open() did not return within {timeout_seconds}s — "
+            "abandoning it for this cycle (square-off/stop-target checks "
+            "SKIPPED, will retry next cycle). The call keeps running in the "
+            "background on a daemon thread; it cannot block process exit."
+        )
+        return None
+    if "error" in result:
+        raise result["error"]
+    return result.get("closed", [])
+
+
+def run_post_scan_housekeeping() -> None:
+    """
+    Paper-position monitoring (stop/target/square-off) + LAST_SCAN_TIME
+    bookkeeping — ONCE per Job execution, not once per timeframe.
+
+    This used to live inside run_scan(), called once per timeframe in
+    run_single_scan.py's loop — meaning pm.monitor_open() ran up to 6x
+    per execution against the same open positions, for no benefit (it
+    checks EXISTING positions against stop/target/square-off, which
+    isn't timeframe-specific). Running this once, after all timeframes'
+    signal generation is done for the cycle, matches what the original
+    "once per scan cycle" comment here always intended — see
+    _monitor_open_with_timeout()'s docstring for why the call itself is
+    also now bounded, not just de-duplicated.
+    """
     try:
         pm = _get_paper_monitor()
         if pm is not None:
-            closed = pm.monitor_open()
-            for c in (closed or []):
-                log.info(f"PAPER CLOSE  {c['symbol']}  {c['reason']}  "
-                         f"exit={c['exit']}  pnl={c['pnl']}")
+            closed = _monitor_open_with_timeout(pm, timeout_seconds=60)
+            if closed is None:
+                pass  # timed out — _monitor_open_with_timeout already logged the warning
+            else:
+                log.info(f"Paper monitor: {len(closed)} position(s) closed this cycle")
+                for c in closed:
+                    log.info(f"PAPER CLOSE  {c['symbol']}  {c['reason']}  "
+                             f"exit={c['exit']}  pnl={c['pnl']}")
         else:
             # Previously silent — this exact silence is what made the
             # "positions never square off" bug invisible: nothing in
