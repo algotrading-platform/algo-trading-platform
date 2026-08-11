@@ -1,31 +1,40 @@
 # ============================================================
 # core/database/db.py
 #
-# Central database layer using Azure PostgreSQL.
-# Drop-in replacement for the Supabase version.
-# All function signatures and return types are identical —
-# zero changes needed in any other file.
+# Central database layer using Azure SQL.
+# Translated from the Azure PostgreSQL version — all function
+# signatures and return types are identical, so no other file
+# needs to change.
 #
-# Environment variables required:
-#   DATABASE_URL : postgresql://algoadmin:password@host:5432/postgres?sslmode=require
+# Environment variables:
+#   AZURE_SQL_CONNECTION_STRING : full ODBC connection string (optional
+#                                  override, use if you need extra ODBC
+#                                  keywords)
 #
-# Fallback (if DATABASE_URL not set):
-#   AZURE_DB_HOST     : ariqt-algo-trading-db-001.postgres.database.azure.com
+# Fallback (if AZURE_SQL_CONNECTION_STRING not set), built from parts:
+#   AZURE_DB_HOST     : algo-sql2-rjw4desia2hqk.database.windows.net
+#   AZURE_DB_PORT     : 1433
+#   AZURE_DB_NAME     : algodb
 #   AZURE_DB_USER     : algoadmin
-#   AZURE_DB_PASSWORD : (see .env / secrets manager)
-#   AZURE_DB_NAME     : postgres
+#   AZURE_DB_PASSWORD : (see .env / Key Vault)
+#   AZURE_SQL_DRIVER  : {ODBC Driver 17 for SQL Server}  (default)
+#
+# NOTE ON DEFAULTS: the host/db defaults above match what's actually
+# deployed (see infra/DEPLOYED_RESOURCES.md) — but they're defaults,
+# not a substitute for setting the real values in .env. Confirm
+# against your actual .env before relying on them.
 # ============================================================
 
 import logging
 import os
+import queue
+import struct
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
-import psycopg2
-import psycopg2.extras
-import psycopg2.pool
+import pyodbc
 import pytz
 from dotenv import load_dotenv
 
@@ -35,70 +44,180 @@ IST = pytz.timezone("Asia/Kolkata")
 load_dotenv()
 
 # ============================================================
+# DATETIMEOFFSET OUTPUT CONVERTER
+# ============================================================
+#
+# pyodbc does not decode SQL Server's DATETIMEOFFSET type by default —
+# without this converter registered, every timestamp column in this
+# file (all of them, since the schema uses DATETIMEOFFSET throughout)
+# would come back as raw bytes instead of a Python datetime, silently
+# breaking every .tzinfo / .astimezone() call in this module.
+#
+# SQL_SS_TIMESTAMPOFFSET = -155. Byte layout per the ODBC driver's
+# SQL_SS_TIMESTAMPOFFSET_STRUCT: this is a widely-used community
+# workaround (pyodbc does not support this type natively as of
+# writing) — flagging that this is the one piece of this file most
+# worth testing directly against a real query before trusting it.
+
+def _handle_datetimeoffset(dto_value: bytes) -> datetime:
+    tup = struct.unpack("<6hI2h", dto_value)
+    return datetime(
+        tup[0], tup[1], tup[2], tup[3], tup[4], tup[5], tup[6] // 1000,
+        timezone(timedelta(hours=tup[7], minutes=tup[8])),
+    )
+
+
+# ============================================================
 # CONNECTION
 # ============================================================
 #
-# A pooled connection is reused across calls instead of opening a new
-# TCP+TLS connection to Azure PostgreSQL on every single query. Under
-# a full scan cycle (500+ instruments x multiple strategies/timeframes,
-# each hitting insert_signal/get_alert_state/etc.), the old connect-
-# per-call pattern could open hundreds of short-lived connections per
-# cycle -- enough to intermittently exceed the server's max_connections
-# limit under Azure's Burstable/GP-small tiers, surfacing as sporadic
-# "database not reachable" errors with no other explanation.
+# Same reasoning as the Postgres version: a pooled connection is reused
+# across calls instead of opening a new TCP+TLS connection to Azure SQL
+# on every single query, for the same reason (500+ instruments x
+# multiple strategies/timeframes per scan cycle).
+#
+# pyodbc has no built-in pool comparable to psycopg2.pool — this is a
+# minimal thread-safe pool mirroring that pool's getconn()/putconn()
+# interface, so the rest of this file needed almost no structural change.
 
 _pool      = None
 _pool_lock = threading.Lock()
 
 
-def _get_conn_params() -> dict:
+def _build_connection_string() -> str:
     """
-    Returns psycopg2 connection parameters.
-    Prefers DATABASE_URL, falls back to individual vars.
+    Builds a pyodbc connection string for Azure SQL.
+    Prefers AZURE_SQL_CONNECTION_STRING, falls back to building one
+    from individual AZURE_DB_* vars — same fallback pattern the
+    Postgres version used with DATABASE_URL.
     """
-    url = os.getenv("DATABASE_URL", "")
+    full = os.getenv("AZURE_SQL_CONNECTION_STRING", "")
+    if full:
+        return full
 
-    if url:
-        return {"dsn": url}
+    driver   = os.getenv("AZURE_SQL_DRIVER",  "{ODBC Driver 17 for SQL Server}")
+    host     = os.getenv("AZURE_DB_HOST",     "algo-sql2-rjw4desia2hqk.database.windows.net")
+    port     = os.getenv("AZURE_DB_PORT",     "1433")
+    dbname   = os.getenv("AZURE_DB_NAME",     "algodb")
+    user     = os.getenv("AZURE_DB_USER",     "algoadmin")
+    password = os.getenv("AZURE_DB_PASSWORD", "")
 
-    return {
-        "host":     os.getenv("AZURE_DB_HOST",     "ariqt-algo-trading-db-001.postgres.database.azure.com"),
-        "port":     int(os.getenv("AZURE_DB_PORT", "5432")),
-        "user":     os.getenv("AZURE_DB_USER",     "algoadmin"),
-        "password": os.getenv("AZURE_DB_PASSWORD", ""),
-        "dbname":   os.getenv("AZURE_DB_NAME",     "postgres"),
-        "sslmode":  "require",
-    }
+    return (
+        f"DRIVER={driver};"
+        f"SERVER=tcp:{host},{port};"
+        f"DATABASE={dbname};"
+        f"UID={user};"
+        f"PWD={password};"
+        f"Encrypt=yes;TrustServerCertificate=no;Connection Timeout=15;"
+    )
 
 
-def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
+class _PyodbcPool:
+    """
+    Minimal thread-safe connection pool for pyodbc. Mirrors the
+    getconn() / putconn(conn, close=bool) interface the original
+    psycopg2.pool.ThreadedConnectionPool exposed.
+    """
+
+    def __init__(self, minconn: int, maxconn: int, conn_str: str):
+        self._conn_str = conn_str
+        self._maxconn  = maxconn
+        self._pool     = queue.LifoQueue(maxsize=maxconn)
+        self._created  = 0
+        self._lock     = threading.Lock()
+        for _ in range(minconn):
+            self._pool.put(self._new_conn())
+
+    def _new_conn(self):
+        conn = pyodbc.connect(self._conn_str, autocommit=False)
+        conn.add_output_converter(-155, _handle_datetimeoffset)  # SQL_SS_TIMESTAMPOFFSET
+        with self._lock:
+            self._created += 1
+        return conn
+
+    def getconn(self):
+        try:
+            return self._pool.get_nowait()
+        except queue.Empty:
+            with self._lock:
+                if self._created < self._maxconn:
+                    return self._new_conn()
+            return self._pool.get(timeout=30)  # pool exhausted -- wait for one to free up
+
+    def putconn(self, conn, close: bool = False):
+        if close:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self._lock:
+                self._created -= 1
+            return
+        try:
+            self._pool.put_nowait(conn)
+        except queue.Full:
+            conn.close()
+            with self._lock:
+                self._created -= 1
+
+
+def _get_pool() -> _PyodbcPool:
     """
     Lazily creates the process-wide connection pool on first use.
-    Each process (dashboard, scheduler, ws listener) gets its own pool.
-    Sized above the scan engine's max_workers=10 thread pool so a full
+    Each process (dashboard, scheduler, ws listener) gets its own pool,
+    sized above the scan engine's max_workers=10 thread pool so a full
     scan cycle never blocks waiting for a free connection.
     """
     global _pool
     if _pool is None:
         with _pool_lock:
             if _pool is None:
-                params  = _get_conn_params()
-                maxconn = int(os.getenv("DB_POOL_MAX", "20"))
-                if "dsn" in params:
-                    _pool = psycopg2.pool.ThreadedConnectionPool(
-                        1, maxconn, dsn=params["dsn"], connect_timeout=15,
-                    )
-                else:
-                    _pool = psycopg2.pool.ThreadedConnectionPool(
-                        1, maxconn, connect_timeout=15, **params,
-                    )
+                conn_str = _build_connection_string()
+                maxconn  = int(os.getenv("DB_POOL_MAX", "20"))
+                _pool = _PyodbcPool(1, maxconn, conn_str)
     return _pool
+
+
+class _DictCursor:
+    """
+    Wraps a raw pyodbc cursor to behave like psycopg2.extras.RealDictCursor:
+    .fetchone() / .fetchall() return dict(s) keyed by column name instead
+    of pyodbc's positional Row objects, matching every `row["col"]` /
+    `row.get("col")` call site elsewhere in this file.
+    """
+
+    def __init__(self, raw_cursor):
+        self._cur = raw_cursor
+
+    def execute(self, query: str, params=None):
+        if params is None:
+            return self._cur.execute(query)
+        return self._cur.execute(query, params)
+
+    def executemany(self, query: str, seq_of_params):
+        return self._cur.executemany(query, seq_of_params)
+
+    def _row_to_dict(self, row):
+        if row is None:
+            return None
+        cols = [c[0] for c in self._cur.description]
+        return dict(zip(cols, row))
+
+    def fetchone(self):
+        return self._row_to_dict(self._cur.fetchone())
+
+    def fetchall(self):
+        return [self._row_to_dict(r) for r in self._cur.fetchall()]
+
+    @property
+    def rowcount(self):
+        return self._cur.rowcount
 
 
 @contextmanager
 def _get_cursor():
     """
-    Context manager that yields a psycopg2 cursor from the pool.
+    Context manager that yields a dict-row cursor from the pool.
     Commits on success, rolls back on error, always returns the
     connection to the pool (discarding it instead of returning it if
     the connection itself is bad, so the pool self-heals).
@@ -107,11 +226,10 @@ def _get_cursor():
     conn = pool.getconn()
     bad_conn = False
     try:
-        conn.autocommit = False
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur = _DictCursor(conn.cursor())
         yield cur
         conn.commit()
-    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+    except (pyodbc.OperationalError, pyodbc.InterfaceError):
         bad_conn = True
         raise
     except Exception:
@@ -141,9 +259,9 @@ def insert_signal(
         with _get_cursor() as cur:
             cur.execute("""
                 INSERT INTO signals
-                    (timestamp, stock, timeframe, signal, rsi, price, strategy)
+                    ([timestamp], stock, timeframe, signal, rsi, price, strategy)
                 VALUES
-                    (NOW(), %s, %s, %s, %s, %s, %s)
+                    (SYSDATETIMEOFFSET(), ?, ?, ?, ?, ?, ?)
             """, (
                 stock,
                 timeframe,
@@ -169,27 +287,28 @@ def get_signals(
     Returns DataFrame sorted newest first.
     """
     try:
-        # Signals are stored with NOW() (UTC, timestamptz). The cutoff MUST
-        # be timezone-aware UTC too — a naive datetime.now() is local IST and
-        # would shift the window ~5.5h, silently hiding the most recent rows
-        # (this was the "dashboard shows no records" bug).
+        # Signals are stored via SYSDATETIMEOFFSET() (UTC-equivalent,
+        # datetimeoffset). The cutoff MUST be timezone-aware UTC too --
+        # a naive datetime.now() is local IST and would shift the window
+        # ~5.5h, silently hiding the most recent rows (this was the
+        # "dashboard shows no records" bug in the Postgres version).
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
-        conditions = ["timestamp >= %s"]
+        conditions = ["[timestamp] >= ?"]
         params     = [cutoff]
 
         if timeframe:
-            conditions.append("timeframe = %s")
+            conditions.append("timeframe = ?")
             params.append(timeframe)
         if strategy:
-            conditions.append("strategy = %s")
+            conditions.append("strategy = ?")
             params.append(strategy)
 
         where = " AND ".join(conditions)
 
         with _get_cursor() as cur:
             cur.execute(
-                f"SELECT * FROM signals WHERE {where} ORDER BY timestamp DESC",
+                f"SELECT * FROM signals WHERE {where} ORDER BY [timestamp] DESC",
                 params,
             )
             rows = cur.fetchall()
@@ -197,7 +316,7 @@ def get_signals(
         if not rows:
             return pd.DataFrame()
 
-        df = pd.DataFrame([dict(r) for r in rows])
+        df = pd.DataFrame(rows)
 
         # Rename columns to match dashboard expectations
         df = df.rename(columns={
@@ -230,17 +349,15 @@ def get_last_signal(stock: str, timeframe: str, strategy: str = None) -> str | N
         with _get_cursor() as cur:
             if strategy is not None:
                 cur.execute("""
-                    SELECT signal FROM signals
-                    WHERE stock = %s AND timeframe = %s AND strategy = %s
-                    ORDER BY timestamp DESC
-                    LIMIT 1
+                    SELECT TOP 1 signal FROM signals
+                    WHERE stock = ? AND timeframe = ? AND strategy = ?
+                    ORDER BY [timestamp] DESC
                 """, (stock, timeframe, strategy))
             else:
                 cur.execute("""
-                    SELECT signal FROM signals
-                    WHERE stock = %s AND timeframe = %s
-                    ORDER BY timestamp DESC
-                    LIMIT 1
+                    SELECT TOP 1 signal FROM signals
+                    WHERE stock = ? AND timeframe = ?
+                    ORDER BY [timestamp] DESC
                 """, (stock, timeframe))
             row = cur.fetchone()
 
@@ -259,9 +376,6 @@ def get_last_scan_time() -> str | None:
     Reads from app_config LAST_SCAN_TIME — updated after every scan.
     Falls back to last signal timestamp if app_config not set.
     """
-    import pytz
-    IST = pytz.timezone("Asia/Kolkata")
-
     def _format(last_ts):
         now = datetime.now(IST)
         if last_ts.tzinfo is None:
@@ -286,9 +400,8 @@ def get_last_scan_time() -> str | None:
     try:
         with _get_cursor() as cur:
             cur.execute("""
-                SELECT timestamp FROM signals
-                ORDER BY timestamp DESC
-                LIMIT 1
+                SELECT TOP 1 [timestamp] FROM signals
+                ORDER BY [timestamp] DESC
             """)
             row = cur.fetchone()
 
@@ -320,15 +433,13 @@ def get_alert_state(stock: str, timeframe: str, strategy: str = None) -> str | N
         with _get_cursor() as cur:
             if strategy is not None:
                 cur.execute("""
-                    SELECT signal FROM alert_states
-                    WHERE stock = %s AND timeframe = %s AND strategy = %s
-                    LIMIT 1
+                    SELECT TOP 1 signal FROM alert_states
+                    WHERE stock = ? AND timeframe = ? AND strategy = ?
                 """, (stock, timeframe, strategy))
             else:
                 cur.execute("""
-                    SELECT signal FROM alert_states
-                    WHERE stock = %s AND timeframe = %s
-                    LIMIT 1
+                    SELECT TOP 1 signal FROM alert_states
+                    WHERE stock = ? AND timeframe = ?
                 """, (stock, timeframe))
             row = cur.fetchone()
 
@@ -350,37 +461,44 @@ def upsert_alert_state(
     """
     Insert or update the alert state for stock+timeframe+strategy.
 
-    Requires the alert_states table to have a `strategy` column and a
-    UNIQUE (stock, timeframe, strategy) constraint — see
-    core/database/migration_multistrategy.sql.
+    Postgres's ON CONFLICT ... DO UPDATE has no T-SQL equivalent --
+    this is rewritten as a MERGE statement, matched against the same
+    (stock, timeframe, strategy) unique constraint the table already has.
 
-    Falls back to the legacy (stock, timeframe) conflict target if the
-    migration has not been applied yet, so deploys never hard-fail.
+    Falls back to a (stock, timeframe)-only match if the strategy-aware
+    MERGE fails for any reason, mirroring the original's fallback intent
+    -- though note the deployed schema only has the 3-column unique
+    constraint, so this fallback path is a legacy safety net rather than
+    something expected to trigger in normal operation.
     """
     try:
         with _get_cursor() as cur:
             cur.execute("""
-                INSERT INTO alert_states (stock, timeframe, strategy, signal, updated_at)
-                VALUES (%s, %s, %s, %s, NOW())
-                ON CONFLICT (stock, timeframe, strategy)
-                DO UPDATE SET
-                    signal     = EXCLUDED.signal,
-                    updated_at = NOW()
+                MERGE INTO alert_states AS target
+                USING (SELECT ? AS stock, ? AS timeframe, ? AS strategy, ? AS signal) AS source
+                ON (target.stock = source.stock
+                    AND target.timeframe = source.timeframe
+                    AND target.strategy = source.strategy)
+                WHEN MATCHED THEN
+                    UPDATE SET signal = source.signal, updated_at = SYSDATETIMEOFFSET()
+                WHEN NOT MATCHED THEN
+                    INSERT (stock, timeframe, strategy, signal, updated_at)
+                    VALUES (source.stock, source.timeframe, source.strategy, source.signal, SYSDATETIMEOFFSET());
             """, (stock, timeframe, strategy, signal))
     except Exception as e:
-        # Migration not yet applied — fall back to legacy 2-column upsert
-        # so the scanner keeps working until the SQL migration is run.
         print(f"[DB] upsert_alert_state (strategy-aware) failed, "
               f"falling back to legacy: {e}")
         try:
             with _get_cursor() as cur:
                 cur.execute("""
-                    INSERT INTO alert_states (stock, timeframe, signal, updated_at)
-                    VALUES (%s, %s, %s, NOW())
-                    ON CONFLICT (stock, timeframe)
-                    DO UPDATE SET
-                        signal     = EXCLUDED.signal,
-                        updated_at = NOW()
+                    MERGE INTO alert_states AS target
+                    USING (SELECT ? AS stock, ? AS timeframe, ? AS signal) AS source
+                    ON (target.stock = source.stock AND target.timeframe = source.timeframe)
+                    WHEN MATCHED THEN
+                        UPDATE SET signal = source.signal, updated_at = SYSDATETIMEOFFSET()
+                    WHEN NOT MATCHED THEN
+                        INSERT (stock, timeframe, signal, updated_at)
+                        VALUES (source.stock, source.timeframe, source.signal, SYSDATETIMEOFFSET());
                 """, (stock, timeframe, signal))
         except Exception as e2:
             print(f"[DB] upsert_alert_state legacy fallback error: {e2}")
@@ -404,24 +522,33 @@ def upsert_backtest(
     period:    str,
     strategy:  str = "RSI Reversal",
 ) -> None:
-    """Insert or update backtest result for symbol+timeframe+strategy."""
+    """Insert or update backtest result for symbol+timeframe+strategy (MERGE)."""
     try:
         with _get_cursor() as cur:
             cur.execute("""
-                INSERT INTO backtest_results
-                    (symbol, name, timeframe, category, strategy,
-                     trades, pnl, pnl_pct, win_rate, wins, losses, period, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                ON CONFLICT (symbol, timeframe, strategy)
-                DO UPDATE SET
-                    trades     = EXCLUDED.trades,
-                    pnl        = EXCLUDED.pnl,
-                    pnl_pct    = EXCLUDED.pnl_pct,
-                    win_rate   = EXCLUDED.win_rate,
-                    wins       = EXCLUDED.wins,
-                    losses     = EXCLUDED.losses,
-                    period     = EXCLUDED.period,
-                    updated_at = NOW()
+                MERGE INTO backtest_results AS target
+                USING (SELECT ? AS symbol, ? AS name, ? AS timeframe, ? AS category, ? AS strategy,
+                              ? AS trades, ? AS pnl, ? AS pnl_pct, ? AS win_rate, ? AS wins,
+                              ? AS losses, ? AS period) AS source
+                ON (target.symbol = source.symbol
+                    AND target.timeframe = source.timeframe
+                    AND target.strategy = source.strategy)
+                WHEN MATCHED THEN
+                    UPDATE SET
+                        trades     = source.trades,
+                        pnl        = source.pnl,
+                        pnl_pct    = source.pnl_pct,
+                        win_rate   = source.win_rate,
+                        wins       = source.wins,
+                        losses     = source.losses,
+                        period     = source.period,
+                        updated_at = SYSDATETIMEOFFSET()
+                WHEN NOT MATCHED THEN
+                    INSERT (symbol, name, timeframe, category, strategy,
+                            trades, pnl, pnl_pct, win_rate, wins, losses, period, updated_at)
+                    VALUES (source.symbol, source.name, source.timeframe, source.category, source.strategy,
+                            source.trades, source.pnl, source.pnl_pct, source.win_rate, source.wins,
+                            source.losses, source.period, SYSDATETIMEOFFSET());
             """, (
                 symbol, name, timeframe, category, strategy,
                 trades,
@@ -444,10 +571,10 @@ def get_backtest_results(
         params     = []
 
         if timeframe:
-            conditions.append("timeframe = %s")
+            conditions.append("timeframe = ?")
             params.append(timeframe)
         if strategy:
-            conditions.append("strategy = %s")
+            conditions.append("strategy = ?")
             params.append(strategy)
 
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
@@ -462,7 +589,7 @@ def get_backtest_results(
         if not rows:
             return pd.DataFrame()
 
-        df = pd.DataFrame([dict(r) for r in rows])
+        df = pd.DataFrame(rows)
         df = df.rename(columns={
             "symbol":    "Symbol",
             "name":      "Name",
@@ -491,8 +618,6 @@ def get_backtest_results(
 def save_upstox_token(access_token: str) -> bool:
     """Save Upstox access token. Expires at 3:30 AM next day IST."""
     try:
-        import pytz
-        IST        = pytz.timezone("Asia/Kolkata")
         now        = datetime.now(IST)
         expires_at = (now + timedelta(days=1)).replace(
             hour=3, minute=30, second=0, microsecond=0
@@ -500,7 +625,7 @@ def save_upstox_token(access_token: str) -> bool:
         with _get_cursor() as cur:
             cur.execute("""
                 INSERT INTO upstox_tokens (access_token, created_at, expires_at)
-                VALUES (%s, NOW(), %s)
+                VALUES (?, SYSDATETIMEOFFSET(), ?)
             """, (access_token, expires_at))
         return True
     except Exception as e:
@@ -514,15 +639,11 @@ def get_upstox_token() -> str | None:
     Returns None if not found or expired.
     """
     try:
-        import pytz
-        IST = pytz.timezone("Asia/Kolkata")
-
         with _get_cursor() as cur:
             cur.execute("""
-                SELECT access_token, expires_at
+                SELECT TOP 1 access_token, expires_at
                 FROM upstox_tokens
                 ORDER BY created_at DESC
-                LIMIT 1
             """)
             row = cur.fetchone()
 
@@ -552,9 +673,8 @@ def get_config(key: str) -> str | None:
     try:
         with _get_cursor() as cur:
             cur.execute("""
-                SELECT value FROM app_config
-                WHERE key = %s
-                LIMIT 1
+                SELECT TOP 1 value FROM app_config
+                WHERE [key] = ?
             """, (key,))
             row = cur.fetchone()
 
@@ -568,34 +688,27 @@ def get_config(key: str) -> str | None:
 
 
 def set_config(key: str, value: str) -> bool:
-    """Set a config value — upserts into app_config table."""
+    """Set a config value — upserts into app_config table (MERGE)."""
     try:
         with _get_cursor() as cur:
             cur.execute("""
-                INSERT INTO app_config (key, value, updated_at)
-                VALUES (%s, %s, NOW())
-                ON CONFLICT (key)
-                DO UPDATE SET
-                    value      = EXCLUDED.value,
-                    updated_at = NOW()
+                MERGE INTO app_config AS target
+                USING (SELECT ? AS [key], ? AS value) AS source
+                ON (target.[key] = source.[key])
+                WHEN MATCHED THEN
+                    UPDATE SET value = source.value, updated_at = SYSDATETIMEOFFSET()
+                WHEN NOT MATCHED THEN
+                    INSERT ([key], value, updated_at) VALUES (source.[key], source.value, SYSDATETIMEOFFSET());
             """, (key, value))
         return True
     except Exception as e:
         print(f"[DB] set_config error: {e}")
         return False
-    
-    # ============================================================
-# PAPER TRADING — append these to core/database/db.py
-#
-# Matches the existing db.py patterns exactly:
-#   - _get_cursor() context manager
-#   - RealDictCursor rows
-#   - server-side NOW() for timestamps (timestamptz)
-#   - returns bool / DataFrame / dict like the rest of the module
-#
-# Requires the paper_positions table — see migration_paper_trading.sql
-# ============================================================
 
+
+# ============================================================
+# PAPER TRADING — SYMMETRIC BUY/SELL + MANUAL CONTROLS
+# ============================================================
 
 def open_paper_position_if_capacity(
     symbol:        str,
@@ -612,11 +725,14 @@ def open_paper_position_if_capacity(
 ) -> dict:
     """
     Atomically re-check the per-strategy open-position cap and insert
-    in the same transaction, so concurrent scan jobs (5min/15min/1h/1d/
-    1w/1m all racing on the same strategy's pool) can't each read a
-    stale count and jointly overshoot the cap. pg_advisory_xact_lock
-    serializes same-strategy callers for the rest of this transaction
-    and auto-releases on commit/rollback — no explicit unlock needed.
+    in the same transaction, so concurrent scan jobs can't each read a
+    stale count and jointly overshoot the cap.
+
+    Postgres's pg_advisory_xact_lock(hashtext(...)) is replaced with
+    T-SQL's sp_getapplock, using @LockOwner='Transaction' so it
+    auto-releases on commit/rollback just like the Postgres version --
+    no explicit unlock needed, and no hashing required since
+    sp_getapplock takes the resource name directly as a string.
 
     Returns {"opened": True} on success, or {"opened": False, "reason": ...}
     if the cap was already full (checked fresh, under the lock).
@@ -624,11 +740,13 @@ def open_paper_position_if_capacity(
     try:
         initial_stop_distance = round(abs(float(entry_price) - float(stop_loss)), 2)
         with _get_cursor() as cur:
-            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
-                        (f"paper_pos_cap:{strategy}",))
+            cur.execute(
+                "EXEC sp_getapplock @Resource = ?, @LockMode = 'Exclusive', @LockOwner = 'Transaction'",
+                (f"paper_pos_cap:{strategy}",)
+            )
             cur.execute("""
                 SELECT COUNT(*) AS n FROM paper_positions
-                WHERE status = 'OPEN' AND strategy = %s
+                WHERE status = 'OPEN' AND strategy = ?
             """, (strategy,))
             if int(cur.fetchone()["n"]) >= max_positions:
                 return {"opened": False, "cause": "cap",
@@ -641,7 +759,7 @@ def open_paper_position_if_capacity(
                      peak_price, initial_stop_distance,
                      status, opened_at)
                 VALUES
-                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN', NOW())
+                    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', SYSDATETIMEOFFSET())
             """, (
                 symbol, side, int(quantity),
                 round(float(entry_price), 2),
@@ -675,10 +793,8 @@ def open_paper_position(
     Insert a new OPEN paper position. Returns True on success.
 
     peak_price starts at entry_price and initial_stop_distance is
-    snapshotted at open time — both feed the Volume Spike trailing
-    stop in paper_trader.py (Jwala Jul 11: "we can design that
-    trailing stop loss kind of thing for the volume part"). Harmless
-    for RSI Reversal positions, which don't use trailing logic.
+    snapshotted at open time -- both feed the Volume Spike trailing
+    stop in paper_trader.py.
     """
     try:
         initial_stop_distance = round(abs(float(entry_price) - float(stop_loss)), 2)
@@ -690,7 +806,7 @@ def open_paper_position(
                      peak_price, initial_stop_distance,
                      status, opened_at)
                 VALUES
-                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN', NOW())
+                    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', SYSDATETIMEOFFSET())
             """, (
                 symbol, side, int(quantity),
                 round(float(entry_price), 2),
@@ -715,22 +831,17 @@ def close_paper_position(
 ) -> bool:
     """
     Close an OPEN position: set exit price/time, compute realized P&L.
-    pnl = (exit-entry)*qty for BUY, (entry-exit)*qty for SELL — this
-    is GROSS P&L, unchanged from before (Jwala Jul 11: "we'll not
-    call this net, we'll call this gross profit and loss"). Also
-    computes charges (estimated brokerage/STT/exchange/GST — see
-    charges.py) and net_pnl = pnl - charges. Returns True on success.
+    pnl = (exit-entry)*qty for BUY, (entry-exit)*qty for SELL -- GROSS
+    P&L. Also computes charges and net_pnl = pnl - charges.
     """
     try:
         from core.execution.charges import estimate_charges_for_trade
 
         with _get_cursor() as cur:
-            # fetch the open position
             cur.execute("""
-                SELECT side, quantity, entry_price
+                SELECT TOP 1 side, quantity, entry_price
                 FROM paper_positions
-                WHERE id = %s AND status = 'OPEN'
-                LIMIT 1
+                WHERE id = ? AND status = 'OPEN'
             """, (position_id,))
             row = cur.fetchone()
             if not row:
@@ -752,18 +863,99 @@ def close_paper_position(
             cur.execute("""
                 UPDATE paper_positions
                 SET status      = 'CLOSED',
-                    exit_price  = %s,
-                    exit_reason = %s,
-                    pnl         = %s,
-                    charges     = %s,
-                    net_pnl     = %s,
-                    closed_at   = NOW()
-                WHERE id = %s
+                    exit_price  = ?,
+                    exit_reason = ?,
+                    pnl         = ?,
+                    charges     = ?,
+                    net_pnl     = ?,
+                    closed_at   = SYSDATETIMEOFFSET()
+                WHERE id = ?
             """, (exitp, exit_reason, round(pnl, 2), charges, net_pnl, position_id))
         return True
     except Exception as e:
         print(f"[DB] close_paper_position error: {e}")
         return False
+
+
+def get_open_position(symbol: str) -> dict | None:
+    """
+    Return the OPEN position row for a symbol (full dict, includes
+    side), or None if nothing is open for it.
+    """
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                SELECT TOP 1 * FROM paper_positions
+                WHERE status = 'OPEN' AND symbol = ?
+                ORDER BY opened_at DESC
+            """, (symbol,))
+            row = cur.fetchone()
+        return row if row else None
+    except Exception as e:
+        print(f"[DB] get_open_position error: {e}")
+        return None
+
+
+def update_trailing_state(position_id: int, peak_price: float, new_stop: float = None) -> bool:
+    """
+    Persists the Volume Spike trailing-stop state each monitor cycle.
+    Always updates peak_price; only touches stop_loss if new_stop is given.
+    """
+    try:
+        with _get_cursor() as cur:
+            if new_stop is not None:
+                cur.execute("""
+                    UPDATE paper_positions
+                    SET peak_price = ?, stop_loss = ?
+                    WHERE id = ? AND status = 'OPEN'
+                """, (round(float(peak_price), 2), round(float(new_stop), 2), position_id))
+            else:
+                cur.execute("""
+                    UPDATE paper_positions
+                    SET peak_price = ?
+                    WHERE id = ? AND status = 'OPEN'
+                """, (round(float(peak_price), 2), position_id))
+            return cur.rowcount > 0
+    except Exception as e:
+        print(f"[DB] update_trailing_state error: {e}")
+        return False
+
+
+def update_paper_position_stop(position_id: int, new_stop: float) -> bool:
+    """Manually move the stop-loss of an OPEN position."""
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                UPDATE paper_positions
+                SET stop_loss = ?
+                WHERE id = ? AND status = 'OPEN'
+            """, (round(float(new_stop), 2), position_id))
+            return cur.rowcount > 0
+    except Exception as e:
+        print(f"[DB] update_paper_position_stop error: {e}")
+        return False
+
+
+def get_capital_deployed(strategy: str = None) -> float:
+    """Sum of (entry_price * quantity) across OPEN positions."""
+    try:
+        with _get_cursor() as cur:
+            if strategy:
+                cur.execute("""
+                    SELECT COALESCE(SUM(entry_price * quantity), 0) AS deployed
+                    FROM paper_positions
+                    WHERE status = 'OPEN' AND strategy = ?
+                """, (strategy,))
+            else:
+                cur.execute("""
+                    SELECT COALESCE(SUM(entry_price * quantity), 0) AS deployed
+                    FROM paper_positions
+                    WHERE status = 'OPEN'
+                """)
+            row = cur.fetchone()
+        return round(float(row["deployed"]), 2) if row else 0.0
+    except Exception as e:
+        print(f"[DB] get_capital_deployed error: {e}")
 
 
 def get_open_paper_positions(symbol: str = None) -> pd.DataFrame:
@@ -773,7 +965,7 @@ def get_open_paper_positions(symbol: str = None) -> pd.DataFrame:
             if symbol:
                 cur.execute("""
                     SELECT * FROM paper_positions
-                    WHERE status = 'OPEN' AND symbol = %s
+                    WHERE status = 'OPEN' AND symbol = ?
                     ORDER BY opened_at DESC
                 """, (symbol,))
             else:
@@ -785,7 +977,7 @@ def get_open_paper_positions(symbol: str = None) -> pd.DataFrame:
             rows = cur.fetchall()
         if not rows:
             return pd.DataFrame()
-        return pd.DataFrame([dict(r) for r in rows])
+        return pd.DataFrame(rows)
     except Exception as e:
         log.error(f"get_open_paper_positions error: {e}")
         return pd.DataFrame()
@@ -798,13 +990,13 @@ def get_closed_paper_positions(days: int = 30) -> pd.DataFrame:
         with _get_cursor() as cur:
             cur.execute("""
                 SELECT * FROM paper_positions
-                WHERE status = 'CLOSED' AND closed_at >= %s
+                WHERE status = 'CLOSED' AND closed_at >= ?
                 ORDER BY closed_at DESC
             """, (cutoff,))
             rows = cur.fetchall()
         if not rows:
             return pd.DataFrame()
-        return pd.DataFrame([dict(r) for r in rows])
+        return pd.DataFrame(rows)
     except Exception as e:
         print(f"[DB] get_closed_paper_positions error: {e}")
         return pd.DataFrame()
@@ -812,10 +1004,8 @@ def get_closed_paper_positions(days: int = 30) -> pd.DataFrame:
 
 def _ist_today_bounds_utc() -> tuple:
     """
-    (start, end) of the CURRENT IST calendar day, as UTC datetimes —
-    for querying timestamptz columns against a trading-day boundary.
-    IST, not UTC, since that's what "today" means for this system
-    (Jwala Jul 11: "we would want to start fresh every day").
+    (start, end) of the CURRENT IST calendar day, as UTC datetimes --
+    for querying datetimeoffset columns against a trading-day boundary.
     """
     now_ist   = datetime.now(IST)
     start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -824,41 +1014,32 @@ def _ist_today_bounds_utc() -> tuple:
 
 
 def get_today_closed_paper_positions() -> pd.DataFrame:
-    """
-    CLOSED positions from TODAY (IST calendar day) only — NOT a
-    rolling window. This is the live-board version; get_closed_
-    paper_positions(days=N) above is kept as-is for the eventual
-    multi-day Excel/CSV report feature.
-    """
+    """CLOSED positions from TODAY (IST calendar day) only."""
     try:
         start_utc, end_utc = _ist_today_bounds_utc()
         with _get_cursor() as cur:
             cur.execute("""
                 SELECT * FROM paper_positions
-                WHERE status = 'CLOSED' AND closed_at >= %s AND closed_at < %s
+                WHERE status = 'CLOSED' AND closed_at >= ? AND closed_at < ?
                 ORDER BY closed_at DESC
             """, (start_utc, end_utc))
             rows = cur.fetchall()
         if not rows:
             return pd.DataFrame()
-        return pd.DataFrame([dict(r) for r in rows])
+        return pd.DataFrame(rows)
     except Exception as e:
         print(f"[DB] get_today_closed_paper_positions error: {e}")
         return pd.DataFrame()
 
 
 def count_open_paper_positions(strategy: str = None) -> int:
-    """
-    How many positions are currently OPEN (for the max-concurrent cap).
-    Pass `strategy` to scope the count to that strategy's own pool
-    (Jul 27: concurrency caps are now per-strategy, not portfolio-wide).
-    """
+    """How many positions are currently OPEN (for the max-concurrent cap)."""
     try:
         with _get_cursor() as cur:
             if strategy:
                 cur.execute("""
                     SELECT COUNT(*) AS n FROM paper_positions
-                    WHERE status = 'OPEN' AND strategy = %s
+                    WHERE status = 'OPEN' AND strategy = ?
                 """, (strategy,))
             else:
                 cur.execute("SELECT COUNT(*) AS n FROM paper_positions WHERE status = 'OPEN'")
@@ -874,9 +1055,8 @@ def is_paper_position_open(symbol: str) -> bool:
     try:
         with _get_cursor() as cur:
             cur.execute("""
-                SELECT 1 FROM paper_positions
-                WHERE status = 'OPEN' AND symbol = %s
-                LIMIT 1
+                SELECT TOP 1 1 AS x FROM paper_positions
+                WHERE status = 'OPEN' AND symbol = ?
             """, (symbol,))
             return cur.fetchone() is not None
     except Exception as e:
@@ -885,19 +1065,7 @@ def is_paper_position_open(symbol: str) -> bool:
 
 
 def get_paper_pnl_summary(days: int = 30) -> dict:
-    """
-    Scorecard: totals over CLOSED positions in the last N days.
-    Returns dict with total_pnl (GROSS — unchanged meaning), the new
-    total_net_pnl and total_charges (Jwala Jul 11: Gross vs Net P&L),
-    trades, wins, losses, win_rate, open_count.
-
-    NOTE — a judgment call worth knowing about: win/loss classification
-    below still uses GROSS pnl (pnl > 0), not net_pnl. A trade that's
-    gross-positive but net-negative after charges still counts as a
-    "win" here. Flagging this rather than silently redefining what
-    win_rate has meant up to now — say the word if you'd rather this
-    be net-based going forward.
-    """
+    """Scorecard: totals over CLOSED positions in the last N days."""
     try:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         with _get_cursor() as cur:
@@ -910,7 +1078,7 @@ def get_paper_pnl_summary(days: int = 30) -> dict:
                     COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
                     COALESCE(SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), 0) AS losses
                 FROM paper_positions
-                WHERE status = 'CLOSED' AND closed_at >= %s
+                WHERE status = 'CLOSED' AND closed_at >= ?
             """, (cutoff,))
             row = cur.fetchone() or {}
             cur.execute("SELECT COUNT(*) AS n FROM paper_positions WHERE status = 'OPEN'")
@@ -939,17 +1107,7 @@ def get_paper_pnl_summary(days: int = 30) -> dict:
 
 
 def get_today_pnl_summary() -> dict:
-    """
-    Scorecard: totals over CLOSED positions from TODAY (IST calendar
-    day) only — NOT a rolling window. This is the fix for the exact
-    bug Jwala flagged (Jul 11, 0:05): "it was 30 day, 30,000 more,
-    and then it added over it, let's say 20,000 more... we would want
-    to start fresh every day." The old get_paper_pnl_summary(days=30)
-    summed every closed trade from the past 30 days, so yesterday's
-    profit visually stacked onto today's. Same return shape as
-    get_paper_pnl_summary — this is the live-board version, that one
-    stays as-is for the eventual multi-day report feature.
-    """
+    """Scorecard: totals over CLOSED positions from TODAY (IST calendar day) only."""
     try:
         start_utc, end_utc = _ist_today_bounds_utc()
         with _get_cursor() as cur:
@@ -962,7 +1120,7 @@ def get_today_pnl_summary() -> dict:
                     COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
                     COALESCE(SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), 0) AS losses
                 FROM paper_positions
-                WHERE status = 'CLOSED' AND closed_at >= %s AND closed_at < %s
+                WHERE status = 'CLOSED' AND closed_at >= ? AND closed_at < ?
             """, (start_utc, end_utc))
             row = cur.fetchone() or {}
             cur.execute("SELECT COUNT(*) AS n FROM paper_positions WHERE status = 'OPEN'")
@@ -991,148 +1149,55 @@ def get_today_pnl_summary() -> dict:
 
 
 # ============================================================
-# PAPER TRADING — SYMMETRIC BUY/SELL + MANUAL CONTROLS
-# (added for: symmetric long/short, capital visibility, manual
-#  close/stop-edit buttons — Jwala Jul 8 call)
-# ============================================================
-
-def get_open_position(symbol: str) -> dict | None:
-    """
-    Return the OPEN position row for a symbol (full dict, includes
-    side), or None if nothing is open for it.
-
-    Used by PaperTrader.on_signal() to decide what an incoming signal
-    should do: if a position is open in the OPPOSITE direction, close
-    it (reversal exit); if nothing is open, open a new one in the
-    signal's direction; if a position is already open in the SAME
-    direction, skip (no duplicate entry).
-    """
-    try:
-        with _get_cursor() as cur:
-            cur.execute("""
-                SELECT * FROM paper_positions
-                WHERE status = 'OPEN' AND symbol = %s
-                ORDER BY opened_at DESC
-                LIMIT 1
-            """, (symbol,))
-            row = cur.fetchone()
-        return dict(row) if row else None
-    except Exception as e:
-        print(f"[DB] get_open_position error: {e}")
-        return None
-
-
-def update_trailing_state(position_id: int, peak_price: float, new_stop: float = None) -> bool:
-    """
-    Persists the Volume Spike trailing-stop state each monitor cycle
-    (Jwala Jul 11: "we can design that trailing stop loss kind of
-    thing for the volume part"). Always updates peak_price (the best
-    price seen since entry); only touches stop_loss if new_stop is
-    given, so a cycle where the peak moved but the stop hasn't been
-    raised yet doesn't disturb the existing stop.
-    """
-    try:
-        with _get_cursor() as cur:
-            if new_stop is not None:
-                cur.execute("""
-                    UPDATE paper_positions
-                    SET peak_price = %s, stop_loss = %s
-                    WHERE id = %s AND status = 'OPEN'
-                """, (round(float(peak_price), 2), round(float(new_stop), 2), position_id))
-            else:
-                cur.execute("""
-                    UPDATE paper_positions
-                    SET peak_price = %s
-                    WHERE id = %s AND status = 'OPEN'
-                """, (round(float(peak_price), 2), position_id))
-            return cur.rowcount > 0
-    except Exception as e:
-        print(f"[DB] update_trailing_state error: {e}")
-        return False
-
-
-def update_paper_position_stop(position_id: int, new_stop: float) -> bool:
-    """
-    Manually move the stop-loss of an OPEN position (Jwala's
-    breakeven/trailing-stop button on the dashboard — a manual
-    override, not automated trailing logic). Returns True on success,
-    False if the position isn't open (or on error).
-    """
-    try:
-        with _get_cursor() as cur:
-            cur.execute("""
-                UPDATE paper_positions
-                SET stop_loss = %s
-                WHERE id = %s AND status = 'OPEN'
-            """, (round(float(new_stop), 2), position_id))
-            return cur.rowcount > 0
-    except Exception as e:
-        print(f"[DB] update_paper_position_stop error: {e}")
-        return False
-
-
-def get_capital_deployed(strategy: str = None) -> float:
-    """
-    Sum of (entry_price * quantity) across OPEN positions — how much
-    capital is currently tied up. Computed live from existing columns;
-    no new column or migration needed. Pass `strategy` to scope this to
-    one strategy's own pool (Jul 27: capital pools are per-strategy).
-    """
-    try:
-        with _get_cursor() as cur:
-            if strategy:
-                cur.execute("""
-                    SELECT COALESCE(SUM(entry_price * quantity), 0) AS deployed
-                    FROM paper_positions
-                    WHERE status = 'OPEN' AND strategy = %s
-                """, (strategy,))
-            else:
-                cur.execute("""
-                    SELECT COALESCE(SUM(entry_price * quantity), 0) AS deployed
-                    FROM paper_positions
-                    WHERE status = 'OPEN'
-                """)
-            row = cur.fetchone()
-        return round(float(row["deployed"]), 2) if row else 0.0
-    except Exception as e:
-        print(f"[DB] get_capital_deployed error: {e}")
-
-
-# ============================================================
 # LIVE CANDLES (Upstox WebSocket listener — core/marketdata/ws_listener.py)
 # ============================================================
 
 def upsert_live_candles(rows: list[dict]) -> bool:
     """
-    Batched upsert of 1-minute candles from the WS listener. One
-    query for the whole batch (psycopg2.extras.execute_values), not
-    one query per instrument -- the listener flushes every few
-    seconds, not on every tick.
+    Batched upsert of 1-minute candles from the WS listener.
+
+    SQL Server hard-caps queries at ~2100 parameters total. At 8
+    params/row, this chunks into batches of 200 rows (1600 params)
+    per MERGE, all within the same transaction -- a 502-row single
+    batch previously overflowed the limit, surfacing as ODBC's
+    generic 'COUNT field incorrect or syntax error' rather than a
+    clear parameter-count message.
 
     Each row: {instrument_key, symbol, ts, open, high, low, close, volume}
     """
     if not rows:
         return True
+    BATCH_SIZE = 200
     try:
-        values = [
-            (r["instrument_key"], r["symbol"], r["ts"],
-             round(float(r["open"]), 2), round(float(r["high"]), 2),
-             round(float(r["low"]), 2), round(float(r["close"]), 2),
-             int(r.get("volume", 0)))
-            for r in rows
-        ]
         with _get_cursor() as cur:
-            psycopg2.extras.execute_values(cur, """
-                INSERT INTO live_candles_1min
-                    (instrument_key, symbol, ts, open, high, low, close, volume)
-                VALUES %s
-                ON CONFLICT (instrument_key, ts) DO UPDATE SET
-                    high       = EXCLUDED.high,
-                    low        = EXCLUDED.low,
-                    close      = EXCLUDED.close,
-                    volume     = EXCLUDED.volume,
-                    updated_at = NOW()
-            """, values)
+            for i in range(0, len(rows), BATCH_SIZE):
+                chunk = rows[i:i + BATCH_SIZE]
+                values_sql = ", ".join(["(?,?,?,?,?,?,?,?)"] * len(chunk))
+                params = []
+                for r in chunk:
+                    params.extend([
+                        r["instrument_key"], r["symbol"], r["ts"],
+                        round(float(r["open"]), 2), round(float(r["high"]), 2),
+                        round(float(r["low"]), 2), round(float(r["close"]), 2),
+                        int(r.get("volume", 0)),
+                    ])
+                cur.execute(f"""
+                    MERGE INTO live_candles_1min AS target
+                    USING (VALUES {values_sql})
+                        AS source (instrument_key, symbol, ts, [open], high, low, [close], volume)
+                    ON (target.instrument_key = source.instrument_key AND target.ts = source.ts)
+                    WHEN MATCHED THEN
+                        UPDATE SET
+                            high       = source.high,
+                            low        = source.low,
+                            [close]    = source.[close],
+                            volume     = source.volume,
+                            updated_at = SYSDATETIMEOFFSET()
+                    WHEN NOT MATCHED THEN
+                        INSERT (instrument_key, symbol, ts, [open], high, low, [close], volume)
+                        VALUES (source.instrument_key, source.symbol, source.ts,
+                                source.[open], source.high, source.low, source.[close], source.volume);
+                """, params)
         return True
     except Exception as e:
         print(f"[DB] upsert_live_candles error ({len(rows)} rows): {e}")
@@ -1140,20 +1205,30 @@ def upsert_live_candles(rows: list[dict]) -> bool:
 
 
 def get_live_candles_today(symbol: str) -> pd.DataFrame:
-    """Today's 1-minute candles for a symbol, oldest first (for resampling)."""
+    """
+    Today's 1-minute candles for a symbol, oldest first (for resampling).
+
+    Uses the same IST-calendar-day boundary helper as the paper-trading
+    functions (_ist_today_bounds_utc), computed in Python, rather than
+    Postgres's date_trunc('day', NOW()) -- T-SQL has no direct
+    equivalent, and computing the boundary in IST explicitly avoids a
+    UTC-midnight-vs-IST-midnight mismatch that a naive CAST(... AS DATE)
+    could introduce.
+    """
     try:
+        start_utc, _ = _ist_today_bounds_utc()
         with _get_cursor() as cur:
             cur.execute("""
-                SELECT ts AS "Datetime", open AS "Open", high AS "High",
-                       low AS "Low", close AS "Close", volume AS "Volume"
+                SELECT ts AS [Datetime], [open] AS [Open], high AS [High],
+                       low AS [Low], [close] AS [Close], volume AS [Volume]
                 FROM live_candles_1min
-                WHERE symbol = %s AND ts >= date_trunc('day', NOW())
+                WHERE symbol = ? AND ts >= ?
                 ORDER BY ts ASC
-            """, (symbol,))
+            """, (symbol, start_utc))
             rows = cur.fetchall()
         if not rows:
             return pd.DataFrame()
-        return pd.DataFrame([dict(r) for r in rows])
+        return pd.DataFrame(rows)
     except Exception as e:
         print(f"[DB] get_live_candles_today error for {symbol}: {e}")
         return pd.DataFrame()
@@ -1161,22 +1236,84 @@ def get_live_candles_today(symbol: str) -> pd.DataFrame:
 
 def get_latest_live_price(symbol: str, max_age_minutes: int = 2) -> float | None:
     """
-    Latest close for a symbol from the live feed. Returns None (not
-    a stale value) if the WS listener hasn't updated this symbol
-    within max_age_minutes -- callers should fall back to REST/
-    yfinance in that case, same as if the row didn't exist at all.
+    Latest close for a symbol from the live feed. Returns None (not a
+    stale value) if the WS listener hasn't updated this symbol within
+    max_age_minutes -- callers should fall back to REST/yfinance in
+    that case.
+
+    Postgres's `NOW() - INTERVAL '1 minute' * %s` is replaced with a
+    Python-computed cutoff timestamp, passed as a parameter -- the same
+    pattern get_signals() already uses elsewhere in this file, so this
+    is consistent with the rest of the module rather than introducing
+    a new style.
     """
     try:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)
         with _get_cursor() as cur:
             cur.execute("""
-                SELECT close FROM live_candles_1min
-                WHERE symbol = %s
-                  AND updated_at >= NOW() - INTERVAL '1 minute' * %s
-                ORDER BY ts DESC LIMIT 1
-            """, (symbol, max_age_minutes))
+                SELECT TOP 1 [close] FROM live_candles_1min
+                WHERE symbol = ? AND updated_at >= ?
+                ORDER BY ts DESC
+            """, (symbol, cutoff))
             row = cur.fetchone()
         return round(float(row["close"]), 2) if row else None
     except Exception as e:
         print(f"[DB] get_latest_live_price error for {symbol}: {e}")
         return None
-        return 0.0
+
+
+# ============================================================
+# SCAN RUN-LOCK (prevents overlapping Container Apps Job executions)
+# ============================================================
+#
+# Container Apps Jobs do NOT prevent a new cron-triggered execution
+# from starting while a previous one is still running -- parallelism/
+# replicaCompletionCount only limit replicas *within* one execution,
+# not across separate scheduled triggers. Without this, an overlapping
+# run means every timeframe gets scanned twice concurrently: duplicate
+# signals, duplicate paper positions, races on alert_states.
+#
+# Implemented as a row in app_config rather than sp_getapplock, since
+# sp_getapplock is tied to one connection/transaction -- this lock
+# needs to stay held across the whole script's runtime, spanning many
+# separate short-lived pooled connections.
+
+def try_acquire_scan_lock(lock_name: str, stale_after_seconds: int = 900) -> bool:
+    """
+    Atomically acquire a named run-lock. A lock is free if its value
+    is 'FREE', or if it's been 'RUNNING' longer than stale_after_seconds
+    (so a crashed prior run that never released it doesn't permanently
+    block every future scan). Returns True if acquired, False if
+    another run currently holds it (or the check itself failed --
+    fails closed: skip this cycle rather than risk a duplicate run).
+    """
+    key = f"SCAN_LOCK::{lock_name}"
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                MERGE INTO app_config AS target
+                USING (SELECT ? AS [key]) AS source
+                ON (target.[key] = source.[key])
+                WHEN MATCHED AND (target.value = 'FREE'
+                                   OR target.updated_at < DATEADD(second, ?, SYSDATETIMEOFFSET())) THEN
+                    UPDATE SET value = 'RUNNING', updated_at = SYSDATETIMEOFFSET()
+                WHEN NOT MATCHED THEN
+                    INSERT ([key], value, updated_at) VALUES (source.[key], 'RUNNING', SYSDATETIMEOFFSET());
+            """, (key, -stale_after_seconds))
+            return cur.rowcount > 0
+    except Exception as e:
+        print(f"[DB] try_acquire_scan_lock error: {e}")
+        return False
+
+
+def release_scan_lock(lock_name: str) -> None:
+    """Marks a scan lock as FREE again. Always call in a finally block."""
+    key = f"SCAN_LOCK::{lock_name}"
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                UPDATE app_config SET value = 'FREE', updated_at = SYSDATETIMEOFFSET()
+                WHERE [key] = ?
+            """, (key,))
+    except Exception as e:
+        print(f"[DB] release_scan_lock error: {e}")
