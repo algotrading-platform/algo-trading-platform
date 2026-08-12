@@ -109,6 +109,21 @@ def _build_connection_string() -> str:
         f"UID={user};"
         f"PWD={password};"
         f"Encrypt=yes;TrustServerCertificate=no;Connection Timeout=15;"
+        # MARS lets one physical connection hold more than one open result
+        # set at a time. Off by default for this driver, which is the
+        # standard cause of "Connection is busy with results for another
+        # command" the moment any code path issues a second command on a
+        # connection before fully consuming/closing the first (seen in
+        # production Aug 12 2026). Each _get_cursor() call already gets its
+        # own connection from the pool, so this shouldn't be strictly
+        # necessary — but it's a one-line change that makes that whole
+        # error class structurally impossible instead of relying on every
+        # call site getting cursor lifecycle exactly right.
+        # NOTE: "MultipleActiveResultSets=True" (first attempt) is the
+        # ADO.NET/SqlClient keyword and is silently ignored by the ODBC
+        # driver pyodbc talks to — confirmed by the error still appearing
+        # after deploying it. The actual ODBC keyword is MARS_Connection.
+        "MARS_Connection=yes;"
     )
 
 
@@ -124,7 +139,16 @@ class _PyodbcPool:
         self._maxconn  = maxconn
         self._pool     = queue.LifoQueue(maxsize=maxconn)
         self._created  = 0
-        self._lock     = threading.Lock()
+        # RLock, not Lock: getconn() acquires this and calls _new_conn()
+        # *while still holding it*, and _new_conn() acquires the same lock
+        # again to bump _created. With a plain Lock that's a guaranteed
+        # self-deadlock — silent, no exception — for any thread that needs
+        # to grow the pool under concurrent load (i.e. exactly a busy scan
+        # cycle). Found Aug 12 2026 while chasing why some fraction of
+        # in-flight instrument scans never completed even accounting for
+        # the 300s deadline, and intermittent "connection busy" /
+        # transient token-lookup failures under load.
+        self._lock     = threading.RLock()
         for _ in range(minconn):
             self._pool.put(self._new_conn())
 
