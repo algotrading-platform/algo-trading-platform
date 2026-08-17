@@ -294,7 +294,16 @@ def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
             return df
 
         df = df.copy()
-        df["Datetime"] = pd.to_datetime(df["Datetime"])
+        # utc=True first: without it, pandas raises "Tz-aware
+        # datetime.datetime cannot be converted to datetime64 unless
+        # utc=True" whenever the column mixes datetimes with different
+        # UTC offsets (e.g. live_candles_1min rows written before vs.
+        # after the 2026-08-17 DATETIMEOFFSET fix carry different
+        # offsets for the same day). Then convert to naive IST
+        # wall-clock, since .between_time() below (and every other
+        # caller of this function, including the REST/yfinance path)
+        # has always assumed a naive IST-local index, not UTC.
+        df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True).dt.tz_convert(IST).dt.tz_localize(None)
         df = df.set_index("Datetime")
 
         # Resample OHLCV
