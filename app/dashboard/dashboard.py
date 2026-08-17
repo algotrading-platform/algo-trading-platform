@@ -5,7 +5,9 @@
 import sys
 import os
 import json
+import time
 import contextlib
+import urllib.parse
 
 _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 sys.path.append(_project_root)
@@ -17,6 +19,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 import pytz
+import msal
 from streamlit_autorefresh import st_autorefresh
 
 from data.providers.upstox_provider import UpstoxProvider
@@ -46,26 +49,43 @@ st.set_page_config(
 )
 
 # ============================================================
-# LOGIN GATE (Jwala, Jul 11: "I think we need to put some login
-# credentials also"; redesign Jul 19 — "make it modern")
+# LOGIN GATE — Microsoft Entra ID (MSAL) sign-in
 #
-# Interim app-level auth via streamlit-authenticator — not Azure Easy
-# Auth (confirmed blocked: 401 on Entra ID App registration, Jul 13).
-# Cookie-based session so the 5-min autorefresh below doesn't force
-# re-login on every rerun — only on real browser refresh/cookie
-# expiry (7 days, configs/auth_config.yaml).
+# Auth-code flow via msal.ConfidentialClientApplication. The pending
+# flow (state/nonce/code_verifier) lives in a process-wide
+# st.cache_resource store, NOT st.session_state — the sign-in link is
+# a real top-level browser navigation away to login.microsoftonline.com
+# and back, which starts a brand-new Streamlit session with empty
+# session_state, so anything stashed there before the redirect would
+# already be gone by the time Entra redirects back.
 #
 # Must run BEFORE st_autorefresh and everything else, so an
 # unauthenticated visitor never triggers any dashboard logic at all —
 # not even the refresh timer.
-#
-# To add/remove people or set real passwords: see the instructions at
-# the top of configs/auth_config.yaml and scripts/hash_password.py.
 # ============================================================
 
 IST = pytz.timezone("Asia/Kolkata")  # moved up from below set_page_config —
                                       # needed here for the login screen's
                                       # own live market-status readout
+
+ENTRA_CLIENT_ID     = os.environ.get("ENTRA_CLIENT_ID", "")
+ENTRA_TENANT_ID     = os.environ.get("ENTRA_TENANT_ID", "")
+ENTRA_CLIENT_SECRET = os.environ.get("ENTRA_CLIENT_SECRET", "")
+ENTRA_REDIRECT_URI  = os.environ.get("ENTRA_REDIRECT_URI", "")
+
+
+@st.cache_resource
+def _pending_flows():
+    return {}  # state -> (flow_dict, created_at_epoch)
+
+
+def _msal_app():
+    return msal.ConfidentialClientApplication(
+        ENTRA_CLIENT_ID,
+        authority=f"https://login.microsoftonline.com/{ENTRA_TENANT_ID}",
+        client_credential=ENTRA_CLIENT_SECRET,
+    )
+
 
 # ── LOGIN SCREEN — styled unconditionally, before auth succeeds, so it
 # never renders as bare unstyled Streamlit. Dark terminal aesthetic
@@ -75,7 +95,46 @@ IST = pytz.timezone("Asia/Kolkata")  # moved up from below set_page_config —
 # reuses the same badge classes and market-hours logic as the live
 # dashboard, so the login screen reads as part of the terminal, not a
 # bolted-on auth wall, before a single credential is even typed.
-if not st.session_state.get("authentication_status"):
+if not st.session_state.get("user"):
+    qp = st.query_params
+
+    if "error" in qp:
+        _msg = qp.get("error_description", qp.get("error", "Sign-in failed."))
+        qp.clear()
+        st.error(_msg.split("\r\n")[0])
+        st.stop()
+
+    if "code" in qp:
+        # Exchange the auth code exactly once: pop() (not get()) removes
+        # the flow so a stray reload of this same callback URL fails
+        # cleanly instead of re-exchanging an already-redeemed code.
+        _flows = _pending_flows()
+        _now = time.time()
+        for _stale in [s for s, (_, ts) in _flows.items() if _now - ts > 600]:
+            _flows.pop(_stale, None)
+
+        _entry = _flows.pop(qp.get("state", ""), None)
+        if _entry is None:
+            st.error("Sign-in session expired or was already used — please try again.")
+            st.stop()
+
+        _flow, _ = _entry
+        try:
+            _result = _msal_app().acquire_token_by_auth_code_flow(_flow, qp.to_dict())
+        except ValueError:
+            qp.clear()
+            st.error("Sign-in could not be verified — please try again.")
+            st.stop()
+
+        if "error" in _result:
+            qp.clear()
+            st.error(_result.get("error_description", _result["error"]))
+            st.stop()
+
+        st.session_state["user"] = _result["id_token_claims"]
+        qp.clear()
+        st.rerun()  # strip ?code&state from the URL before anything else runs
+
     from datetime import time as _dtime
     _login_now = datetime.now(IST)
     _login_open = _login_now.weekday() < 5 and _dtime(9, 15) <= _login_now.time() <= _dtime(15, 30)
@@ -112,44 +171,35 @@ if not st.session_state.get("authentication_status"):
     .pulse-dot { width:6px; height:6px; border-radius:50%; background:currentColor; animation:loginpulse 2s infinite; }
     @keyframes loginpulse { 0%,100%{opacity:1} 50%{opacity:0.35} }
 
-    /* The form itself becomes the "card" */
-    div[data-testid="stForm"] {
-        background: linear-gradient(180deg, #101828 0%, #0d1526 100%) !important;
-        border: 1px solid #1a2840 !important; border-radius: 14px !important;
-        padding: 32px 32px 26px !important;
+    .login-card {
+        background: linear-gradient(180deg, #101828 0%, #0d1526 100%);
+        border: 1px solid #1a2840; border-radius: 14px;
+        padding: 32px 32px 26px;
         box-shadow: 0 0 0 1px rgba(74,144,226,0.06), 0 20px 50px rgba(0,0,0,0.45);
         position: relative; overflow: hidden;
     }
-    div[data-testid="stForm"]::before {
+    .login-card::before {
         content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
         background: linear-gradient(90deg, #4a90e2, #9b6dff);
     }
-    div[data-testid="stForm"] h3 {
-        font-family: 'IBM Plex Sans', sans-serif !important; font-size: 17px !important;
-        font-weight: 600 !important; color: #f1f5fb !important; margin-bottom: 18px !important;
+    .login-card h3 {
+        font-family: 'IBM Plex Sans', sans-serif; font-size: 17px;
+        font-weight: 600; color: #f1f5fb; margin: 0 0 18px;
     }
-    div[data-testid="stForm"] label p {
-        font-family: 'JetBrains Mono', monospace !important; font-size: 10px !important;
-        color: #6b7fa0 !important; text-transform: uppercase; letter-spacing: 1.5px;
-    }
-    div[data-testid="stForm"] input {
-        background: #080c18 !important; border: 1px solid #263d60 !important;
-        border-radius: 8px !important; color: #f1f5fb !important; font-size: 14px !important;
-        padding: 10px 12px !important; transition: border-color 0.15s ease;
-    }
-    div[data-testid="stForm"] input:focus {
-        border-color: #4a90e2 !important; box-shadow: 0 0 0 3px rgba(74,144,226,0.15) !important;
-    }
-    div[data-testid="stForm"] button {
-        width: 100% !important; margin-top: 8px !important; border-radius: 8px !important;
-        background: #4a90e2 !important; border: 1px solid #4a90e2 !important;
-        color: #fff !important; font-weight: 600 !important; padding: 10px !important;
+    .entra-signin-btn {
+        display: flex; align-items: center; justify-content: center; gap: 10px;
+        width: 100%; margin-top: 4px; border-radius: 8px; box-sizing: border-box;
+        background: #4a90e2; border: 1px solid #4a90e2;
+        color: #fff !important; font-weight: 600; font-size: 14px; padding: 11px;
+        font-family: 'IBM Plex Sans', sans-serif; text-decoration: none !important;
         transition: all 0.15s ease;
     }
-    div[data-testid="stForm"] button:hover {
-        background: #3d7dc9 !important; border-color: #3d7dc9 !important;
+    .entra-signin-btn:hover {
+        background: #3d7dc9; border-color: #3d7dc9;
         box-shadow: 0 4px 14px rgba(74,144,226,0.35);
     }
+    .ms-logo { display: inline-grid; grid-template-columns: 1fr 1fr; gap: 2px; width: 16px; height: 16px; }
+    .ms-logo span { display: block; }
     .login-footer {
         text-align: center; margin-top: 22px; font-family: 'JetBrains Mono', monospace;
         font-size: 10px; color: #3d5070; letter-spacing: 1px;
@@ -168,63 +218,24 @@ if not st.session_state.get("authentication_status"):
     </div>
     """, unsafe_allow_html=True)
 
-import yaml
-import streamlit_authenticator as stauth
-from streamlit_authenticator.utilities.exceptions import LoginError
+    _flow = _msal_app().initiate_auth_code_flow(scopes=["User.Read"], redirect_uri=ENTRA_REDIRECT_URI)
+    _pending_flows()[_flow["state"]] = (_flow, time.time())
 
-_AUTH_CONFIG_PATH = os.path.join(_project_root, "configs", "auth_config.yaml")
+    st.markdown(f"""
+    <div class="login-card">
+        <h3>Sign in</h3>
+        <a href="{_flow['auth_uri']}" class="entra-signin-btn">
+            <span class="ms-logo">
+                <span style="background:#f25022;"></span><span style="background:#7fba00;"></span>
+                <span style="background:#00a4ef;"></span><span style="background:#ffb900;"></span>
+            </span>
+            Sign in with Microsoft
+        </a>
+    </div>
+    """, unsafe_allow_html=True)
 
-# NOT wrapped in @st.cache_resource — deliberately. Authenticate()
-# constructs a CookieManager, which is a per-browser-session component;
-# caching it as a shared resource would hand every visitor the SAME
-# authenticator/cookie-manager instance, which is wrong for per-user
-# cookies and also triggers Streamlit's "widget created inside a
-# cached function" warning (caught by AppTest before this shipped).
-# Rebuilding it each run is cheap — a small YAML read + dict wrap.
-try:
-    with open(_AUTH_CONFIG_PATH, "r", encoding="utf-8") as f:
-        _auth_cfg = yaml.safe_load(f)
-    authenticator = stauth.Authenticate(
-        credentials=_auth_cfg["credentials"],
-        cookie_name=_auth_cfg["cookie"]["name"],
-        cookie_key=_auth_cfg["cookie"]["key"],
-        cookie_expiry_days=_auth_cfg["cookie"]["expiry_days"],
-    )
-except Exception as e:
-    st.error(
-        f"Login config could not be loaded ({e}). "
-        f"Check configs/auth_config.yaml exists and real password hashes "
-        f"have replaced the REPLACE_ME_* placeholders — see "
-        f"scripts/hash_password.py."
-    )
-    st.stop()
-
-# LoginError fires specifically when someone has a still-valid browser
-# cookie for a username that's since been REMOVED from auth_config.yaml
-# (access revoked) — without this catch it shows an uncaught traceback
-# instead of a clean message. Confirmed by reading the library source:
-# this is the only way LoginError fires given we don't use
-# single_session/max_concurrent_users/max_login_attempts.
-try:
-    authenticator.login(
-        location="main",
-        fields={
-            "Form name": "Sign in",
-            "Username":  "Username",
-            "Password":  "Password",
-            "Login":     "Sign in",
-        },
-    )
-except LoginError:
-    st.error("Your access has been removed. Contact the admin if this is unexpected.")
-    st.stop()
-
-if st.session_state.get("authentication_status") is False:
-    st.error("Username or password is incorrect.")
-    st.stop()
-elif st.session_state.get("authentication_status") is not True:
     st.markdown('<div class="login-footer">FOR RESEARCH & INFORMATIONAL PURPOSES ONLY &nbsp;·&nbsp; NOT FINANCIAL ADVICE</div>', unsafe_allow_html=True)
-    st.stop()  # not yet submitted — login form is already showing, nothing else to render
+    st.stop()
 
 st_autorefresh(interval=300000, key="dashboard_refresh")  # 5 min — matches scheduler
 
@@ -372,19 +383,26 @@ div[data-baseweb="select"] span { color: var(--t1) !important; }
    by coincidence) but a jarring white box in Dark Mode — exactly the
    "buttons not aligned with dark mode" bug. Now explicitly themed with
    the same CSS variables as .stButton > button, so it follows
-   whichever mode is active instead of Streamlit's hardcoded default. */
-div[data-testid="stPopover"] > button {
+   whichever mode is active instead of Streamlit's hardcoded default.
+   FIXED 2026-08-16: the original selector (`div[data-testid="stPopover"]
+   > button`) matched NOTHING — confirmed against the installed
+   Streamlit 1.45.1 frontend bundle, the actual trigger element carries
+   its own `data-testid="stPopoverButton"` directly (a BaseButton), not
+   a bare <button> as a direct child of the stPopover wrapper div. That
+   selector mismatch is why this "fix" never actually applied despite
+   looking correct in the source. */
+[data-testid="stPopoverButton"] {
     background: var(--card) !important; border: 1px solid var(--border2) !important;
     color: var(--t2) !important; font-size: 12px !important; font-weight: 500 !important;
     font-family: 'IBM Plex Sans', sans-serif !important;
     border-radius: 8px !important; min-height: 34px;
     box-shadow: 0 1px 2px rgba(0,0,0,0.06); transition: all 0.15s ease;
 }
-div[data-testid="stPopover"] > button:hover {
+[data-testid="stPopoverButton"]:hover {
     border-color: var(--blue) !important; color: var(--blue) !important;
     background: var(--card2) !important; box-shadow: 0 2px 6px rgba(74,144,226,0.18);
 }
-div[data-testid="stPopover"] > button p { color: inherit !important; }
+[data-testid="stPopoverButton"] p { color: inherit !important; }
 
 /* KPI Metrics */
 div[data-testid="metric-container"] { background: var(--card) !important; border: 1px solid var(--border) !important; border-radius: 10px !important; padding: 16px 20px !important; }
@@ -499,41 +517,56 @@ div[data-testid="stDataFrame"] { background:var(--card) !important; }
     div[data-testid="metric-container"] { padding:10px 12px !important; }
 }
 
-/* Small-screen table layout fix (Om, Jul 22: "if it gets into the
-   small screen, the buttons are being disrupted and not being on the
+/* Dense table layout fix (Om, Jul 22: "if it gets into the small
+   screen, the buttons are being disrupted and not being on the
    layout"). Root cause: st.columns() is Streamlit's own layout
-   primitive — below Streamlit's internal breakpoint it stacks
-   columns VERTICALLY instead of horizontally, which for an
+   primitive — below Streamlit's internal PER-COLUMN width threshold
+   it stacks columns VERTICALLY instead of horizontally, which for an
    11-column Open Positions row (with a further nested 3-column
    Chart/Close/Stop group) turns each table row into a jumbled
-   vertical stack rather than reflowing text sizes gracefully like
-   the KPI cards above do. There's no CSS-only way to make Streamlit's
-   own column primitive reflow more gracefully — the buttons/columns
-   live inside Streamlit's own generated containers, not something
-   this app's markup wraps directly. So instead of letting it break,
-   this forces every column row to stay in a single line and lets the
-   PAGE scroll horizontally on narrow screens, which is standard
-   practice for dense trading tables on mobile (most real trading
-   platforms do the same rather than reflowing a data-dense table).
-   Scoped to <=900px so normal desktop layouts are completely
-   unaffected. */
-@media (max-width: 900px) {
-    div[data-testid="stHorizontalBlock"] {
-        flex-wrap: nowrap !important;
-        min-width: max-content;
-    }
-    div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
-        min-width: fit-content;
-        flex-shrink: 0;
-    }
-    .stButton > button, div[data-testid="stPopover"] > button {
-        min-width: 54px; white-space: nowrap;
-    }
-    .main .block-container {
-        overflow-x: auto;
-        padding-left: 1rem !important;
-        padding-right: 1rem !important;
-    }
+   vertical stack / letter-wrapped buttons rather than reflowing
+   gracefully like the KPI cards above do.
+   FIXED 2026-08-16: that threshold is driven by how many pixels each
+   individual column gets once the row is split N ways, NOT by the
+   browser's overall viewport width — so gating this behind
+   `@media (max-width: 900px)` was wrong. An 11-column row (with a
+   nested 3-column group inside its narrowest column) can hit
+   Streamlit's per-column stacking threshold on a perfectly wide
+   desktop window; confirmed broken live on a normal-width window
+   despite the previous <=900px scoping, because the media query
+   simply never activated. Applied unconditionally instead: forces
+   every column row to stay in a single line and lets the PAGE scroll
+   horizontally whenever content is denser than the available width —
+   standard practice for dense trading tables (most real trading
+   platforms do the same rather than reflowing a data-dense table). */
+div[data-testid="stHorizontalBlock"] {
+    flex-wrap: nowrap !important;
+    min-width: max-content;
+}
+div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+    min-width: fit-content;
+    flex-shrink: 0;
+}
+.stButton > button, [data-testid="stPopoverButton"] {
+    min-width: 54px !important; white-space: nowrap !important;
+    /* white-space:nowrap alone only stops breaks AT spaces — a single
+       word like "Close" can still split mid-word ("Clos"/"e") if
+       overflow-wrap/word-break elsewhere allows an emergency break
+       when the button is narrower than the label. Force the button to
+       overflow instead of breaking the word. Needs !important — this
+       stylesheet's own convention throughout, and without it Streamlit's
+       own button styles keep winning (confirmed: the first attempt at
+       this fix silently did nothing because it omitted !important). */
+    overflow-wrap: normal !important; word-break: normal !important;
+}
+.stButton > button p, [data-testid="stPopoverButton"] p,
+.stButton > button div, [data-testid="stPopoverButton"] div {
+    white-space: nowrap !important; overflow-wrap: normal !important; word-break: normal !important;
+}
+.main .block-container {
+    overflow-x: auto;
+    padding-left: 1rem !important;
+    padding-right: 1rem !important;
 }
 """
 
@@ -637,6 +670,10 @@ _STRATEGY_STYLE = {
     "RSI + MA":               ("rgba(74,144,226,0.12)",  "rgba(74,144,226,0.35)",  "var(--blue)"),
     "Volume Spike":           ("rgba(247,168,0,0.12)",   "rgba(247,168,0,0.35)",   "var(--amber)"),
     "3 Bar Play":             ("rgba(20,184,166,0.12)",  "rgba(20,184,166,0.35)", "var(--teal)"),
+    # Amber/caution color deliberately distinct from "3 Bar Play"'s teal —
+    # visually marks this one as the experimental/unproven pattern, kept
+    # running under its old logic but relabeled per client feedback.
+    "Experiment 3 Bar Play":  ("rgba(247,168,0,0.10)",   "rgba(247,168,0,0.30)",  "var(--amber)"),
     "Cash-Futures Arbitrage": ("rgba(155,109,255,0.12)", "rgba(155,109,255,0.35)","var(--purple)"),
 }
 _DEFAULT_STRATEGY_STYLE = ("rgba(74,144,226,0.12)", "rgba(74,144,226,0.35)", "var(--blue)")
@@ -674,7 +711,8 @@ def build_tv_chart(
         df = provider.fetch_data(symbol=symbol, interval=interval, period=period)
 
         if df is None or df.empty or len(df) < 5:
-            return "<div style='padding:20px;color:#6b7fa0;font-family:monospace;'>No data available for chart</div>"
+            _bg, _fg = ("#0d1526", "#6b7fa0") if is_dark else ("#ffffff", "#7a8fad")
+            return f"<div style='padding:20px;background:{_bg};color:{_fg};font-family:monospace;height:510px;box-sizing:border-box;'>No data available for chart</div>"
 
         # IST display offset for Lightweight Charts.
         # The chart library renders every epoch as if it were UTC. To make
@@ -943,7 +981,8 @@ priceChart.timeScale().fitContent();
         return html
 
     except Exception as e:
-        return f"<div style='padding:20px;color:#f05555;font-family:monospace;'>Chart error: {e}</div>"
+        _bg = "#0d1526" if is_dark else "#ffffff"
+        return f"<div style='padding:20px;background:{_bg};color:#f05555;font-family:monospace;height:510px;box-sizing:border-box;'>Chart error: {e}</div>"
 
 
 # ============================================================
@@ -961,10 +1000,29 @@ with st.sidebar:
 
     st.markdown(
         f"<div style='font-size:12px;color:var(--t2);margin-bottom:8px;'>"
-        f"Logged in as <b>{st.session_state.get('name', '')}</b></div>",
+        f"Logged in as <b>{st.session_state.get('user', {}).get('name', '')}</b></div>",
         unsafe_allow_html=True,
     )
-    authenticator.logout("Logout", "sidebar")
+    # Full sign-out: also ends the browser's Entra SSO session (via
+    # /oauth2/v2.0/logout) so the next Sign-in-with-Microsoft shows the
+    # account picker instead of silently re-authenticating the same user.
+    _logout_url = (
+        f"https://login.microsoftonline.com/{ENTRA_TENANT_ID}/oauth2/v2.0/logout"
+        f"?post_logout_redirect_uri={urllib.parse.quote(ENTRA_REDIRECT_URI, safe='')}"
+    )
+    st.markdown(f"""
+    <style>
+    .entra-logout-btn {{
+        display: block; width: 100%; text-align: center; text-decoration: none !important;
+        background: var(--card); border: 1px solid var(--border2); color: var(--t2) !important;
+        font-size: 12px; font-weight: 500; font-family: 'IBM Plex Sans', sans-serif;
+        border-radius: 8px; padding: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+        box-sizing: border-box; transition: all 0.15s ease;
+    }}
+    .entra-logout-btn:hover {{ border-color: var(--blue); color: var(--blue) !important; }}
+    </style>
+    <a href="{_logout_url}" class="entra-logout-btn">Logout</a>
+    """, unsafe_allow_html=True)
     st.markdown("<div style='margin:10px 0;border-top:1px solid var(--border);'></div>", unsafe_allow_html=True)
 
     btn_label = "☀️ Light Mode" if st.session_state.dark_mode else "🌙 Dark Mode"
@@ -1291,7 +1349,9 @@ show_chart_panel()
 # have the KPI bar live inside the Signals tab specifically instead.
 # ============================================================
 
-tab_live, tab_paper, tab_signals = st.tabs(["🔴 Live Trading", "📊 Paper Trading", "📡 Signals"])
+tab_live, tab_paper, tab_signals, tab_reports = st.tabs(
+    ["🔴 Live Trading", "📊 Paper Trading", "📡 Signals", "📑 Reports"]
+)
 
 with tab_live:
     st.info(
@@ -1331,7 +1391,7 @@ def backtest_summary_bar(rows, period):
 # RENDER SECTION
 # ============================================================
 
-def render_section(rows, title, dot_color="#4a90e2", scroll_height=None):
+def render_section(rows, title, dot_color="var(--blue)", scroll_height=None):
     """
     scroll_height: if given, the header row + all instrument rows render
     inside a native Streamlit scrollable container of that pixel height
@@ -1511,7 +1571,7 @@ def _fmt_duration(opened_at, closed_at) -> str:
 # "RSI Reversal" kept alongside "RSI + MA" (Jul 24 rename was forward-
 # only — old closed trades still say "RSI Reversal" and need their own
 # ordered table section, not to fall into the dynamic catch-all).
-_CANONICAL_STRATEGY_ORDER = ["RSI Reversal", "RSI + MA", "Volume Spike", "3 Bar Play"]
+_CANONICAL_STRATEGY_ORDER = ["RSI Reversal", "RSI + MA", "Volume Spike", "3 Bar Play", "Experiment 3 Bar Play"]
 
 def _ordered_strategies_present(df) -> list:
     if df is None or df.empty or "strategy" not in df.columns:
@@ -1760,7 +1820,7 @@ def render_paper_trading():
     <div class="sec-hdr" style='margin-top:6px;'>
         <div style='width:7px;height:7px;border-radius:50%;background:var(--purple);flex-shrink:0;'></div>
         <span class="sec-title">Paper Trading — Simulated Portfolio (Today)</span>
-        <span class="sec-meta">Upstox Sandbox &nbsp;·&nbsp; RSI + MA + Volume Spike + 3 Bar Play &nbsp;·&nbsp; Long + Short</span>
+        <span class="sec-meta">Upstox Sandbox &nbsp;·&nbsp; RSI + MA + Volume Spike + 3 Bar Play + Experiment 3 Bar Play &nbsp;·&nbsp; Long + Short</span>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1919,9 +1979,9 @@ with tab_signals:
     # RENDER ALL SECTIONS
     # ============================================================
 
-    if show_idx: render_section(idx_rows, "INDEXES",                    "#9b6dff")
-    if show_stk: render_section(stk_rows, "NSE STOCKS — F&O WATCHLIST", "#4a90e2", scroll_height=560)
-    if show_com: render_section(com_rows, "COMMODITIES — MCX",          "#f7a800")
+    if show_idx: render_section(idx_rows, "INDEXES",                    "var(--purple)")
+    if show_stk: render_section(stk_rows, "NSE STOCKS — F&O WATCHLIST", "var(--blue)", scroll_height=560)
+    if show_com: render_section(com_rows, "COMMODITIES — MCX",          "var(--amber)")
 
     # ============================================================
     # SIGNAL HISTORY
@@ -2009,6 +2069,83 @@ with tab_signals:
     """, unsafe_allow_html=True)
     except Exception as e:
         st.warning(f"Signal history unavailable: {e}")
+
+
+# ============================================================
+# REPORTS TAB — daily/weekly/monthly/yearly Excel reports for Paper
+# Trading and Signal History, generated on demand (no job/scheduler —
+# a single filtered SELECT + in-memory openpyxl build is sub-second
+# at this app's trade volume, see core/reporting/'s own design notes).
+# Chosen as its own tab (rather than embedding controls inside the
+# already-dense Paper Trading/Signals tabs, or a sidebar section that
+# would compete with the existing strategy/timeframe/search filters)
+# so both report types share one consolidated set of controls.
+# ============================================================
+
+def render_reports():
+    from core.reporting.paper_trading_report import build_paper_trading_report
+    from core.reporting.signal_history_report import build_signal_history_report
+
+    st.markdown("""
+    <div class="sec-hdr" style='margin-top:6px;'>
+        <div style='width:7px;height:7px;border-radius:50%;background:var(--teal);flex-shrink:0;'></div>
+        <span class="sec-title">Reports</span>
+        <span class="sec-meta">Daily / Weekly / Monthly / Yearly &nbsp;·&nbsp; Downloadable Excel</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    r1, r2, r3, r4 = st.columns([1.3, 1, 1, 1])
+    with r1:
+        report_type = st.radio("Report Type", ["Paper Trading", "Signal History"], horizontal=True, key="rpt_type")
+    with r2:
+        period_label = st.selectbox("Period", ["Daily", "Weekly", "Monthly", "Yearly", "Custom"], key="rpt_period")
+    with r3:
+        strategy_choice = st.selectbox("Strategy", ALL_STRATEGY_NAMES, key="rpt_strategy")
+    with r4:
+        timeframe_choice = st.selectbox("Timeframe", ["All Timeframes"] + list(TIMEFRAMES.keys()), key="rpt_timeframe")
+
+    custom_start = custom_end = None
+    if period_label == "Custom":
+        d1, d2 = st.columns(2)
+        with d1:
+            custom_start = st.date_input("Start date", key="rpt_custom_start")
+        with d2:
+            custom_end = st.date_input("End date", key="rpt_custom_end")
+
+    strategy_filter  = None if strategy_choice == "All Strategies" else strategy_choice
+    timeframe_filter = None if timeframe_choice == "All Timeframes" else timeframe_choice
+    period_key = period_label.lower()
+
+    if st.button("Generate Report", type="primary", key="rpt_generate"):
+        try:
+            builder = build_paper_trading_report if report_type == "Paper Trading" else build_signal_history_report
+            file_bytes, filename, stats_caption = builder(
+                period_key, custom_start=custom_start, custom_end=custom_end,
+                strategy=strategy_filter, timeframe=timeframe_filter,
+            )
+            st.session_state["rpt_file_bytes"] = file_bytes
+            st.session_state["rpt_filename"]   = filename
+            st.session_state["rpt_caption"]    = stats_caption
+        except ValueError as e:
+            st.warning(str(e))
+            st.session_state.pop("rpt_file_bytes", None)
+        except Exception as e:
+            st.error(f"Report generation failed: {e}")
+            st.session_state.pop("rpt_file_bytes", None)
+
+    if st.session_state.get("rpt_file_bytes"):
+        st.caption(st.session_state["rpt_caption"])
+        st.download_button(
+            "⬇ Download Excel Report",
+            data=st.session_state["rpt_file_bytes"],
+            file_name=st.session_state["rpt_filename"],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="rpt_download",
+        )
+
+
+with tab_reports:
+    render_reports()
 
 
 # ============================================================

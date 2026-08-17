@@ -196,6 +196,12 @@ _arb_engine = StrategyEngine("Cash-Futures Arbitrage")
 # candle + a real pullback, which is a lot less meaningful to detect
 # on 5m/15m noise than on slower charts. RSI + MA and Volume Spike are
 # untouched, still scan every timeframe exactly as before.
+#
+# "3 Bar Play" was relabeled "Experiment 3 Bar Play" (unchanged logic,
+# client feedback: unproven calibration, keep running but mark
+# experimental) and the freed-up "3 Bar Play" name now belongs to a
+# new, distinct volatility-contraction strategy. Both share the same
+# higher-timeframe-only gating as the original for now.
 ALWAYS_ON_STRATEGIES     = ["RSI + MA", "Volume Spike"]
 THREE_BAR_PLAY_TIMEFRAMES = ["1 Hour", "1 Day", "1 Week", "1 Month"]
 
@@ -204,13 +210,14 @@ THREE_BAR_PLAY_TIMEFRAMES = ["1 Hour", "1 Day", "1 Week", "1 Month"]
 # set, not what runs on every single timeframe. Use
 # _strategies_for_timeframe(tf_name) wherever the actual per-scan
 # strategy list is needed.
-PARALLEL_STRATEGIES = ALWAYS_ON_STRATEGIES + ["3 Bar Play"]
+PARALLEL_STRATEGIES = ALWAYS_ON_STRATEGIES + ["Experiment 3 Bar Play", "3 Bar Play"]
 
 
 def _strategies_for_timeframe(tf_name: str) -> list:
     """Which strategies actually run on a given timeframe's scan."""
     strategies = list(ALWAYS_ON_STRATEGIES)
     if tf_name in THREE_BAR_PLAY_TIMEFRAMES:
+        strategies.append("Experiment 3 Bar Play")
         strategies.append("3 Bar Play")
     return strategies
 

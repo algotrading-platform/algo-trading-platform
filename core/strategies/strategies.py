@@ -863,11 +863,20 @@ class ThreeBarPlayStrategy(BaseStrategy):
     price, which is why RMS recalculates the real target itself rather
     than trusting these directly.
     """
-    name = "3 Bar Play"
+    # Relabeled "Experiment 3 Bar Play" (was "3 Bar Play") — client
+    # feedback: this pattern's calibration is unproven ("miscalculated
+    # but also working fine"), so it's kept running exactly as-is but
+    # now clearly marked experimental. The plain "3 Bar Play" name is
+    # freed up for ThreeBarContractionStrategy below. Old historical
+    # signals/paper_positions rows keep the literal string '3 Bar Play'
+    # — not backfilled, same forward-only precedent as the earlier
+    # "RSI Reversal" -> "RSI + MA" rename.
+    name = "Experiment 3 Bar Play"
     description = (
         "Detects an igniting bar + shallow pullback + breakout "
         "trigger, filtered by above-average volume on the igniting "
-        "bar. Intended mainly for 1-10 min charts near market open."
+        "bar. Intended mainly for 1-10 min charts near market open. "
+        "Experimental — calibration not yet validated."
     )
 
     RETRACE_LIMIT        = 0.5   # pullback can't retrace >50% of bar1's range
@@ -939,7 +948,7 @@ class ThreeBarPlayStrategy(BaseStrategy):
                 indicators.update({"Pattern_Entry": round(entry, 2), "Pattern_Stop": round(stop, 2),
                                     "Pattern_Target": round(target, 2)})
                 reason = (
-                    f"3-Bar Play LONG: igniting bar at {volume_ratio:.1f}x avg volume, "
+                    f"Experiment 3-Bar Play LONG: igniting bar at {volume_ratio:.1f}x avg volume, "
                     f"pullback held within {self.RETRACE_LIMIT*100:.0f}% of bar1's range, "
                     f"trigger broke above pullback high (₹{bar2['High']:.2f})."
                 )
@@ -957,7 +966,7 @@ class ThreeBarPlayStrategy(BaseStrategy):
                 indicators.update({"Pattern_Entry": round(entry, 2), "Pattern_Stop": round(stop, 2),
                                     "Pattern_Target": round(target, 2)})
                 reason = (
-                    f"3-Bar Play SHORT: igniting bar at {volume_ratio:.1f}x avg volume, "
+                    f"Experiment 3-Bar Play SHORT: igniting bar at {volume_ratio:.1f}x avg volume, "
                     f"pullback held within {self.RETRACE_LIMIT*100:.0f}% of bar1's range, "
                     f"trigger broke below pullback low (₹{bar2['Low']:.2f})."
                 )
@@ -967,8 +976,147 @@ class ThreeBarPlayStrategy(BaseStrategy):
                                  indicators, self.name)
 
         except Exception as e:
+            return SignalResult("HOLD", "WEAK", f"Experiment 3-Bar Play calculation error: {e}", strategy=self.name)
+
+
+STRATEGIES["Experiment 3 Bar Play"] = ThreeBarPlayStrategy()
+STRATEGY_NAMES = list(STRATEGIES.keys())
+
+# ============================================================
+# 3 BAR PLAY (v2) — volatility-contraction breakout
+#
+# Distinct from the (now "Experiment 3 Bar Play") pullback-
+# continuation pattern above. This is a 3-bar volatility "coil":
+#   Bar 1, Bar 2, Bar 3 — each bar's range <= the previous bar's
+#     range (a contraction/squeeze, NR3-style).
+#   Trigger — next bar breaks above the 3-bar range's high (long)
+#     or below its low (short), confirmed by volume on the
+#     breakout bar itself (not just the coil bars).
+# Stop is the opposite side of the (naturally tight) 3-bar range.
+# Target is a fixed reward multiple (1.5R — tighter than the 2R
+# used by the continuation pattern, since a breakout-from-
+# compression setup is a higher-probability/lower-magnitude trade
+# than a continuation).
+# ============================================================
+
+class ThreeBarContractionStrategy(BaseStrategy):
+    """
+    3-bar volatility-contraction breakout: three consecutive bars of
+    non-increasing range (a coil), entry on the following bar
+    breaking the coil's high/low, confirmed by above-average volume
+    on the breakout bar. Stop at the opposite side of the coil range,
+    target at REWARD_MULTIPLE x risk.
+    """
+    name = "3 Bar Play"
+    description = (
+        "Detects a 3-bar volatility contraction (each bar's range <= "
+        "the last) followed by a volume-confirmed breakout beyond the "
+        "coil's high/low. A tighter, higher-probability alternative to "
+        "the continuation-style 'Experiment 3 Bar Play'."
+    )
+
+    VOLUME_LOOKBACK   = 20   # 20-period average for the breakout bar's volume filter
+    REWARD_MULTIPLE   = 1.5  # tighter target than the continuation pattern's 2.0
+    STRONG_VOLUME_MULTIPLE = 2.0
+
+    def generate_signal(self, df: pd.DataFrame) -> SignalResult:
+        need = self.VOLUME_LOOKBACK + 4
+        if df is None or df.empty or len(df) < need:
+            return SignalResult("HOLD", "WEAK", f"Insufficient data (need {need}+ candles)", strategy=self.name)
+
+        if "Volume" not in df.columns:
+            return SignalResult("HOLD", "WEAK", "Volume data not available", strategy=self.name)
+
+        try:
+            df = df.copy()
+            df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce")
+            df.dropna(subset=["Volume"], inplace=True)
+            if len(df) < need:
+                return SignalResult("HOLD", "WEAK", "Insufficient volume data", strategy=self.name)
+
+            bar1 = df.iloc[-4]   # coil start
+            bar2 = df.iloc[-3]   # coil middle
+            bar3 = df.iloc[-2]   # coil end
+            brk  = df.iloc[-1]   # breakout bar
+
+            range1 = float(bar1["High"] - bar1["Low"])
+            range2 = float(bar2["High"] - bar2["Low"])
+            range3 = float(bar3["High"] - bar3["Low"])
+            if range1 <= 0 or range2 <= 0 or range3 <= 0:
+                return SignalResult("HOLD", "WEAK", "Zero-range bar in coil", strategy=self.name)
+
+            is_coil = range2 <= range1 and range3 <= range2
+            if not is_coil:
+                return SignalResult("HOLD", "WEAK", "No 3-bar contraction on the latest bars", strategy=self.name)
+
+            coil_high = max(bar1["High"], bar2["High"], bar3["High"])
+            coil_low  = min(bar1["Low"],  bar2["Low"],  bar3["Low"])
+            coil_range = coil_high - coil_low
+            if coil_range <= 0:
+                return SignalResult("HOLD", "WEAK", "Zero-range coil", strategy=self.name)
+
+            # Volume filter on the BREAKOUT bar (not the coil bars —
+            # a genuine breakout should show a volume pickup relative
+            # to the quiet coil that preceded it).
+            baseline_window = df["Volume"].iloc[-(self.VOLUME_LOOKBACK + 4):-4]
+            if len(baseline_window) < self.VOLUME_LOOKBACK:
+                return SignalResult("HOLD", "WEAK", "Insufficient volume baseline", strategy=self.name)
+
+            avg_volume    = float(baseline_window.mean())
+            breakout_volume = float(brk["Volume"])
+            volume_ratio  = breakout_volume / avg_volume if avg_volume > 0 else 0.0
+
+            indicators = {
+                "Coil_Range":    round(coil_range, 2),
+                "Coil_High":     round(float(coil_high), 2),
+                "Coil_Low":      round(float(coil_low), 2),
+                "Breakout_Volume": int(breakout_volume),
+                "Avg_Volume_20": int(avg_volume),
+                "Volume_Ratio":  round(volume_ratio, 2),
+            }
+
+            if volume_ratio <= 1.0:
+                return SignalResult(
+                    "HOLD", "WEAK",
+                    f"Breakout bar volume ({int(breakout_volume):,}) not above its 20-period "
+                    f"average ({int(avg_volume):,}) — volume filter not met",
+                    indicators, self.name,
+                )
+
+            if brk["High"] > coil_high:
+                entry, stop = float(coil_high), float(coil_low)
+                risk = abs(entry - stop)
+                target = entry + self.REWARD_MULTIPLE * risk
+                strength = "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE"
+                indicators.update({"Pattern_Entry": round(entry, 2), "Pattern_Stop": round(stop, 2),
+                                    "Pattern_Target": round(target, 2)})
+                reason = (
+                    f"3-Bar Play LONG: 3-bar contraction (ranges {range1:.2f} -> {range2:.2f} -> "
+                    f"{range3:.2f}), breakout above coil high (₹{coil_high:.2f}) at "
+                    f"{volume_ratio:.1f}x avg volume."
+                )
+                return SignalResult("BUY", strength, reason, indicators, self.name)
+
+            if brk["Low"] < coil_low:
+                entry, stop = float(coil_low), float(coil_high)
+                risk = abs(entry - stop)
+                target = entry - self.REWARD_MULTIPLE * risk
+                strength = "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE"
+                indicators.update({"Pattern_Entry": round(entry, 2), "Pattern_Stop": round(stop, 2),
+                                    "Pattern_Target": round(target, 2)})
+                reason = (
+                    f"3-Bar Play SHORT: 3-bar contraction (ranges {range1:.2f} -> {range2:.2f} -> "
+                    f"{range3:.2f}), breakout below coil low (₹{coil_low:.2f}) at "
+                    f"{volume_ratio:.1f}x avg volume."
+                )
+                return SignalResult("SELL", strength, reason, indicators, self.name)
+
+            return SignalResult("HOLD", "WEAK", "Coil formed but no breakout on the latest bar",
+                                 indicators, self.name)
+
+        except Exception as e:
             return SignalResult("HOLD", "WEAK", f"3-Bar Play calculation error: {e}", strategy=self.name)
 
 
-STRATEGIES["3 Bar Play"] = ThreeBarPlayStrategy()
+STRATEGIES["3 Bar Play"] = ThreeBarContractionStrategy()
 STRATEGY_NAMES = list(STRATEGIES.keys())

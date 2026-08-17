@@ -980,6 +980,7 @@ def get_capital_deployed(strategy: str = None) -> float:
         return round(float(row["deployed"]), 2) if row else 0.0
     except Exception as e:
         print(f"[DB] get_capital_deployed error: {e}")
+        return 0.0
 
 
 def get_open_paper_positions(symbol: str = None) -> pd.DataFrame:
@@ -1170,6 +1171,171 @@ def get_today_pnl_summary() -> dict:
         return {"total_pnl": 0.0, "total_net_pnl": 0.0, "total_charges": 0.0,
                 "trades": 0, "wins": 0, "losses": 0,
                 "win_rate": 0.0, "open_count": 0}
+
+
+# ============================================================
+# REPORTING (core/reporting/) — date-range + optional strategy/
+# timeframe filtered queries, distinct from the rolling-N-days /
+# fixed-"today" functions above. Report periods are historical
+# (a past week/month/year), not "last N days from now", so these
+# take explicit UTC bounds from core.reporting.periods.get_period_bounds().
+# ============================================================
+
+def get_paper_trades_for_report(
+    start_utc: datetime, end_utc: datetime,
+    strategy: str = None, timeframe: str = None,
+) -> pd.DataFrame:
+    """
+    CLOSED positions with closed_at in [start_utc, end_utc), oldest
+    first. Drives the report's Trade Log sheet AND every pandas-derived
+    sheet (equity curve, symbol breakdown, day/hour patterns) from one
+    fetch, rather than one query per sheet.
+    """
+    try:
+        conditions = ["status = 'CLOSED'", "closed_at >= ?", "closed_at < ?"]
+        params     = [start_utc, end_utc]
+        if strategy:
+            conditions.append("strategy = ?")
+            params.append(strategy)
+        if timeframe:
+            conditions.append("timeframe = ?")
+            params.append(timeframe)
+        where = " AND ".join(conditions)
+
+        with _get_cursor() as cur:
+            cur.execute(
+                f"SELECT * FROM paper_positions WHERE {where} ORDER BY closed_at ASC",
+                params,
+            )
+            rows = cur.fetchall()
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame(rows)
+    except Exception as e:
+        print(f"[DB] get_paper_trades_for_report error: {e}")
+        return pd.DataFrame()
+
+
+def get_paper_summary_by_strategy(
+    start_utc: datetime, end_utc: datetime,
+    strategy: str = None, timeframe: str = None,
+) -> pd.DataFrame:
+    """GROUP BY strategy over CLOSED positions in [start_utc, end_utc) —
+    trades/wins/losses/gross/net/charges/best/worst per strategy."""
+    try:
+        conditions = ["status = 'CLOSED'", "closed_at >= ?", "closed_at < ?"]
+        params     = [start_utc, end_utc]
+        if strategy:
+            conditions.append("strategy = ?")
+            params.append(strategy)
+        if timeframe:
+            conditions.append("timeframe = ?")
+            params.append(timeframe)
+        where = " AND ".join(conditions)
+
+        with _get_cursor() as cur:
+            cur.execute(f"""
+                SELECT
+                    strategy,
+                    COUNT(*)                                                 AS trades,
+                    COALESCE(SUM(CASE WHEN pnl > 0  THEN 1 ELSE 0 END), 0)    AS wins,
+                    COALESCE(SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), 0)    AS losses,
+                    COALESCE(SUM(pnl), 0)                                    AS total_pnl,
+                    COALESCE(SUM(net_pnl), 0)                                AS total_net_pnl,
+                    COALESCE(SUM(charges), 0)                                AS total_charges,
+                    COALESCE(SUM(CASE WHEN pnl > 0  THEN pnl ELSE 0 END), 0)  AS gross_win,
+                    COALESCE(SUM(CASE WHEN pnl <= 0 THEN pnl ELSE 0 END), 0)  AS gross_loss,
+                    MAX(pnl)                                                 AS best_trade,
+                    MIN(pnl)                                                 AS worst_trade
+                FROM paper_positions
+                WHERE {where}
+                GROUP BY strategy
+                ORDER BY strategy
+            """, params)
+            rows = cur.fetchall()
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame(rows)
+    except Exception as e:
+        print(f"[DB] get_paper_summary_by_strategy error: {e}")
+        return pd.DataFrame()
+
+
+def get_signals_for_report(
+    start_utc: datetime, end_utc: datetime,
+    strategy: str = None, timeframe: str = None,
+) -> pd.DataFrame:
+    """Generalizes get_signals(days=N) to an explicit [start_utc, end_utc)
+    UTC range — report periods are historical, not a rolling cutoff."""
+    try:
+        conditions = ["[timestamp] >= ?", "[timestamp] < ?"]
+        params     = [start_utc, end_utc]
+        if strategy:
+            conditions.append("strategy = ?")
+            params.append(strategy)
+        if timeframe:
+            conditions.append("timeframe = ?")
+            params.append(timeframe)
+        where = " AND ".join(conditions)
+
+        with _get_cursor() as cur:
+            cur.execute(
+                f"SELECT * FROM signals WHERE {where} ORDER BY [timestamp] ASC",
+                params,
+            )
+            rows = cur.fetchall()
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+        df = df.rename(columns={
+            "timestamp": "Timestamp", "stock": "Stock", "timeframe": "Timeframe",
+            "signal": "Signal", "rsi": "RSI", "price": "Price", "strategy": "Strategy",
+        })
+        df["Timestamp"] = pd.to_datetime(df["Timestamp"], utc=True)
+        return df
+    except Exception as e:
+        print(f"[DB] get_signals_for_report error: {e}")
+        return pd.DataFrame()
+
+
+def get_signal_summary_by_strategy(
+    start_utc: datetime, end_utc: datetime,
+    strategy: str = None, timeframe: str = None,
+) -> pd.DataFrame:
+    """GROUP BY strategy, timeframe over signals in [start_utc, end_utc) —
+    signal_count/buy_count/sell_count/distinct symbols."""
+    try:
+        conditions = ["[timestamp] >= ?", "[timestamp] < ?"]
+        params     = [start_utc, end_utc]
+        if strategy:
+            conditions.append("strategy = ?")
+            params.append(strategy)
+        if timeframe:
+            conditions.append("timeframe = ?")
+            params.append(timeframe)
+        where = " AND ".join(conditions)
+
+        with _get_cursor() as cur:
+            cur.execute(f"""
+                SELECT
+                    strategy, timeframe,
+                    COUNT(*)                                              AS signal_count,
+                    COALESCE(SUM(CASE WHEN signal = 'BUY'  THEN 1 ELSE 0 END), 0) AS buy_count,
+                    COALESCE(SUM(CASE WHEN signal = 'SELL' THEN 1 ELSE 0 END), 0) AS sell_count,
+                    COUNT(DISTINCT stock)                                 AS symbols
+                FROM signals
+                WHERE {where}
+                GROUP BY strategy, timeframe
+                ORDER BY strategy, timeframe
+            """, params)
+            rows = cur.fetchall()
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame(rows)
+    except Exception as e:
+        print(f"[DB] get_signal_summary_by_strategy error: {e}")
+        return pd.DataFrame()
 
 
 # ============================================================

@@ -30,21 +30,24 @@ from typing import Optional
 class RMSConfig:
     # Per-strategy pools (Om, Jul 27: "let each strategy have only 5
     # positions opened out of 15... let's allot 20 lakhs for each
-    # strategy") — each of the 3 parallel strategies (RSI + MA, Volume
-    # Spike, 3 Bar Play) gets its OWN ₹20L capital pool and its own
-    # 5-position concurrency cap, tracked independently per strategy
-    # rather than pooled. paper_trader.py passes strategy-scoped
-    # counts/deployed-capital into evaluate() below so sizing and the
-    # concurrency check are both per-strategy.
+    # strategy") — each of the 4 parallel strategies (RSI + MA, Volume
+    # Spike, Experiment 3 Bar Play, 3 Bar Play) gets its OWN ₹20L
+    # capital pool and its own 5-position concurrency cap, tracked
+    # independently per strategy rather than pooled. paper_trader.py
+    # passes strategy-scoped counts/deployed-capital into evaluate()
+    # below so sizing and the concurrency check are both per-strategy.
+    # (Was 3 parallel strategies; became 4 when "3 Bar Play" was
+    # relabeled "Experiment 3 Bar Play" and a new "3 Bar Play" strategy
+    # was added alongside it.)
     CAPITAL_PER_STRATEGY            = 2_000_000.0  # ₹20L per strategy
     MAX_OPEN_POSITIONS_PER_STRATEGY = 5            # per strategy
 
     # Aggregate figures — derived from the per-strategy numbers above,
     # not independent settings. Kept for anything that still wants a
     # single portfolio-wide total (e.g. the dashboard's "Total Capital"
-    # card): 3 strategies x ₹20L = ₹60L, 3 x 5 = 15 total slots.
-    CAPITAL            = CAPITAL_PER_STRATEGY * 3
-    MAX_OPEN_POSITIONS = MAX_OPEN_POSITIONS_PER_STRATEGY * 3
+    # card): 4 strategies x ₹20L = ₹80L, 4 x 5 = 20 total slots.
+    CAPITAL            = CAPITAL_PER_STRATEGY * 4
+    MAX_OPEN_POSITIONS = MAX_OPEN_POSITIONS_PER_STRATEGY * 4
 
     STOP_LOSS_PCT        = 0.01          # 1% stop from entry (Jwala, Jul 17:
                                           # "reducing the stop so that when we
@@ -65,11 +68,15 @@ class RMSConfig:
     # 1.2×, since volume-driven moves can run further). Anything not
     # listed here falls back to RISK_REWARD above.
     RISK_REWARD_BY_STRATEGY = {
-        "Volume Spike": 2.0,
-        "3 Bar Play":   2.0,  # matches Jwala's own reference code example
-                              # (reward_multiple=2); spec said "2x-3x,
-                              # configurable" with no single number chosen —
-                              # this is the conservative end, easy to bump.
+        "Volume Spike":            2.0,
+        "Experiment 3 Bar Play":   2.0,  # matches Jwala's own reference code example
+                                         # (reward_multiple=2); spec said "2x-3x,
+                                         # configurable" with no single number chosen —
+                                         # this is the conservative end, easy to bump.
+        "3 Bar Play":              1.5,  # new volatility-contraction strategy —
+                                         # tighter target than the continuation
+                                         # pattern above, fits a breakout-from-
+                                         # compression setup.
     }
 
     # Grade-based position sizing (Jwala, Jul 14, 4:19-5:22): "If the

@@ -33,5 +33,9 @@ pytz>=2024.1
 typing_extensions>=4.14.1
 watchdog>=6.0.0
 upstox-python-sdk>=2.28.0
-streamlit-authenticator>=0.4.2
-PyYAML>=6.0
+
+# --- Auth (Microsoft Entra ID) ---
+msal>=1.31.0
+
+# --- Reporting (Excel export) ---
+openpyxl>=3.1.0
