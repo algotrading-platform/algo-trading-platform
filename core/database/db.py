@@ -1438,7 +1438,23 @@ def get_live_candles_today(symbol: str) -> pd.DataFrame:
             rows = cur.fetchall()
         if not rows:
             return pd.DataFrame()
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+        # pyodbc returns SQL Server DECIMAL columns as Python
+        # decimal.Decimal, not float -- live_candles_1min's open/high/
+        # low/close are DECIMAL(12,2), so without this cast the
+        # DataFrame's OHLC columns come back as object dtype holding
+        # Decimal values. resample_ohlc()'s own aggregation (first/max/
+        # min/last) tolerates that silently, but every strategy's own
+        # arithmetic on this data (RSI, pivots, range/pattern math) then
+        # raises "unsupported operand type(s) for -: 'decimal.Decimal'
+        # and 'float'" the moment it mixes a Decimal cell with a float
+        # -- confirmed 2026-08-17 via production logs: every "1 Hour"
+        # instrument failing on exactly this error, real-money-blocking
+        # since it silences every strategy's signal generation for that
+        # timeframe.
+        for col in ("Open", "High", "Low", "Close"):
+            df[col] = df[col].astype(float)
+        return df
     except Exception as e:
         print(f"[DB] get_live_candles_today error for {symbol}: {e}")
         return pd.DataFrame()
