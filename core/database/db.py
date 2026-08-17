@@ -646,11 +646,16 @@ def save_upstox_token(access_token: str) -> bool:
         expires_at = (now + timedelta(days=1)).replace(
             hour=3, minute=30, second=0, microsecond=0
         )
+        # Convert to UTC before binding -- same pyodbc/DATETIMEOFFSET
+        # issue as upsert_live_candles: a tz-aware IST datetime bound
+        # directly as a parameter gets its wall-clock value stored as
+        # if it were already UTC, silently losing the +05:30 offset.
+        # Confirmed 2026-08-17 alongside the live_candles_1min bug.
         with _get_cursor() as cur:
             cur.execute("""
                 INSERT INTO upstox_tokens (access_token, created_at, expires_at)
                 VALUES (?, SYSDATETIMEOFFSET(), ?)
-            """, (access_token, expires_at))
+            """, (access_token, expires_at.astimezone(timezone.utc)))
         return True
     except Exception as e:
         print(f"[DB] save_upstox_token error: {e}")
@@ -1365,8 +1370,23 @@ def upsert_live_candles(rows: list[dict]) -> bool:
                 values_sql = ", ".join(["(?,?,?,?,?,?,?,?)"] * len(chunk))
                 params = []
                 for r in chunk:
+                    ts = r["ts"]
+                    # Normalize to UTC in Python before binding -- pyodbc has
+                    # no native support for SQL Server's DATETIMEOFFSET type
+                    # (see the output-converter workaround at the top of this
+                    # file) and was silently transmitting the tz-aware IST
+                    # wall-clock value (e.g. 10:11 IST) without its +05:30
+                    # offset, so SQL Server stored it as if it were already
+                    # UTC -- every row in live_candles_1min ended up ~5.5h
+                    # (the IST offset, exactly) ahead of true UTC. Converting
+                    # here means the wall-clock number actually sent is
+                    # correct UTC regardless of what the driver does with
+                    # the offset metadata. Confirmed 2026-08-17: MAX(ts) was
+                    # reading ~5.5h in the future relative to real UTC "now".
+                    if ts.tzinfo is not None:
+                        ts = ts.astimezone(timezone.utc)
                     params.extend([
-                        r["instrument_key"], r["symbol"], r["ts"],
+                        r["instrument_key"], r["symbol"], ts,
                         round(float(r["open"]), 2), round(float(r["high"]), 2),
                         round(float(r["low"]), 2), round(float(r["close"]), 2),
                         int(r.get("volume", 0)),
