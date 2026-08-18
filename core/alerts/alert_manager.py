@@ -200,7 +200,14 @@ class AlertManager:
         # RSI / other strategy format
         str_emoji   = _strength_emoji(strength)
         data_source = alert.get("data_source", "yfinance")
-        src_tag     = "✅" if data_source == "upstox" else "⚠"
+        # FIXED 2026-08-18: providers tag data_source as "upstox" (REST) OR
+        # "upstox_ws" (live WebSocket feed via core/marketdata/ws_listener.py)
+        # -- this strict == "upstox" check excluded "upstox_ws" entirely, so
+        # even a signal built from the freshest possible source (a live tick,
+        # not even a REST call) showed the "unverified" warning tick instead
+        # of the green check. Confirmed live: an RSI + MA signal generated
+        # right after the WS listener was confirmed healthy still showed ⚠.
+        src_tag     = "✅" if data_source in ("upstox", "upstox_ws") else "⚠"
 
         indicators  = result.indicators if (result and hasattr(result, "indicators")) else {}
 
