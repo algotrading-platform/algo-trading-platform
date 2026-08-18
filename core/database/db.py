@@ -1215,7 +1215,16 @@ def get_paper_trades_for_report(
             rows = cur.fetchall()
         if not rows:
             return pd.DataFrame()
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+        # pyodbc returns SQL Server DECIMAL columns as object-dtype
+        # decimal.Decimal, never auto-cast -- coerce to float here so
+        # every downstream pandas op (groupby/round/chart) gets a real
+        # numeric dtype instead of crashing on "object".
+        for col in ("entry_price", "exit_price", "stop_loss", "target",
+                    "quantity", "pnl", "net_pnl", "charges", "risk_amount"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
     except Exception as e:
         print(f"[DB] get_paper_trades_for_report error: {e}")
         return pd.DataFrame()
@@ -1260,7 +1269,15 @@ def get_paper_summary_by_strategy(
             rows = cur.fetchall()
         if not rows:
             return pd.DataFrame()
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+        # Same Decimal -> float coercion as get_paper_trades_for_report --
+        # these are all SUM/MAX/MIN over DECIMAL columns, so pyodbc hands
+        # them back as object-dtype decimal.Decimal.
+        for col in ("total_pnl", "total_net_pnl", "total_charges",
+                    "gross_win", "gross_loss", "best_trade", "worst_trade"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
     except Exception as e:
         print(f"[DB] get_paper_summary_by_strategy error: {e}")
         return pd.DataFrame()
@@ -1298,6 +1315,9 @@ def get_signals_for_report(
             "signal": "Signal", "rsi": "RSI", "price": "Price", "strategy": "Strategy",
         })
         df["Timestamp"] = pd.to_datetime(df["Timestamp"], utc=True)
+        for col in ("RSI", "Price"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
         return df
     except Exception as e:
         print(f"[DB] get_signals_for_report error: {e}")

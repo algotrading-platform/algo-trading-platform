@@ -9,8 +9,12 @@ streamlit-autorefresh==1.0.1
 
 # --- Data ---
 yfinance>=0.2.60
-pandas>=2.2.0
-numpy>=1.26.0
+# Pinned exact (not >=): unpinned pandas/numpy let a container rebuild
+# silently pick up a newer major version than what's tested locally,
+# which is the leading suspect behind a pandas-dtype report bug that
+# reproduced in prod but not against the locally installed versions.
+pandas==2.2.3
+numpy==2.2.5
 
 # --- Technical Analysis ---
 ta==0.11.0
@@ -38,4 +42,4 @@ upstox-python-sdk>=2.28.0
 msal>=1.31.0
 
 # --- Reporting (Excel export) ---
-openpyxl>=3.1.0
+openpyxl==3.1.5
