@@ -253,7 +253,17 @@ if not st.session_state.get("user"):
     </div>
     """, unsafe_allow_html=True)
 
-    _flow = _msal_app().initiate_auth_code_flow(scopes=["User.Read"], redirect_uri=ENTRA_REDIRECT_URI)
+    # prompt="login" forces a plain interactive sign-in and skips Entra's
+    # silent-SSO / device-broker check -- that silent check is what hands
+    # control to Edge's own native "sign in to browser" flow (confirmed via
+    # an incognito test: same "Switch Edge profile" prompt shows up there
+    # with zero existing session), which completes in a DIFFERENT tab tied
+    # to whichever browser profile it resolves to, stranding the original
+    # tab on the pre-auth login screen. Skipping the silent check removes
+    # the one hook that hands off to that broker in the first place.
+    _flow = _msal_app().initiate_auth_code_flow(
+        scopes=["User.Read"], redirect_uri=ENTRA_REDIRECT_URI, prompt="login",
+    )
     _store_pending_flow(_flow["state"], _flow)
 
     st.markdown(f"""
