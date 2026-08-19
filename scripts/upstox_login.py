@@ -4,7 +4,7 @@
 #
 # Run ONCE every morning before 9:15 AM IST.
 # Generates a fresh Upstox access token, saves it to Azure
-# PostgreSQL, and VERIFIES the write actually landed.
+# SQL, and VERIFIES the write actually landed.
 #
 # WHAT CHANGED vs the old version (and why it matters):
 #   - The OLD browser page said "Login successful! Token saved"
@@ -24,6 +24,8 @@
 
 import os
 import sys
+import time
+import secrets
 import webbrowser
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -45,11 +47,12 @@ TOKEN_URL    = "https://api.upstox.com/v2/login/authorization/token"
 # STEP 1 — Generate login URL
 # ============================================================
 
-def get_login_url() -> str:
+def get_login_url(state: str) -> str:
     params = {
         "client_id":     API_KEY,
         "redirect_uri":  REDIRECT_URI,
         "response_type": "code",
+        "state":         state,
     }
     return f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
 
@@ -61,6 +64,7 @@ def get_login_url() -> str:
 # ============================================================
 
 auth_code = None
+expected_state = None
 
 class CallbackHandler(BaseHTTPRequestHandler):
 
@@ -68,6 +72,24 @@ class CallbackHandler(BaseHTTPRequestHandler):
         global auth_code
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
+
+        # Ignore anything that isn't the OAuth callback itself (favicon
+        # requests, browser prefetches, stray probes on this port) instead
+        # of treating the first GET as authoritative -- otherwise one of
+        # those can consume the one-shot server before Upstox's real
+        # redirect arrives, and the script fails with a misleading
+        # "no authorization code received".
+        if "code" not in params and "error" not in params:
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        if params.get("state", [None])[0] != expected_state:
+            self.send_response(400)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"Error: state mismatch (possible CSRF) - aborting.")
+            return
 
         if "code" in params:
             auth_code = params["code"][0]
@@ -144,13 +166,16 @@ def fail(lines):
 # ============================================================
 
 def main():
+    global expected_state
+
     if not API_KEY or not API_SECRET:
         fail(["UPSTOX_API_KEY and UPSTOX_API_SECRET must be set in .env"])
 
     banner(["Upstox Daily Login — Algo Trading Platform"])
     print()
 
-    login_url = get_login_url()
+    expected_state = secrets.token_urlsafe(24)
+    login_url = get_login_url(expected_state)
     print("Opening Upstox login in your browser...")
     print("If it doesn't open, visit this URL manually:")
     print(f"\n  {login_url}\n")
@@ -159,9 +184,22 @@ def main():
     print("Waiting for login callback on http://127.0.0.1:8000 ...")
     print("(Log in with your Upstox credentials in the browser)\n")
 
+    # handle_request() serves exactly ONE request then returns -- a single
+    # stray hit on this port (browser favicon fetch, prefetch, a leftover
+    # tab retrying) used to consume it before Upstox's real redirect
+    # arrived, so the script failed with a misleading "no code received"
+    # even though the user did everything right. Loop until the real
+    # callback sets auth_code or the overall deadline passes; the handler
+    # itself now silently 404s anything that isn't the OAuth callback
+    # instead of treating the first GET as authoritative.
     server = HTTPServer(("127.0.0.1", 8000), CallbackHandler)
-    server.timeout = 120
-    server.handle_request()
+    deadline = time.monotonic() + 120
+    while auth_code is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        server.timeout = remaining
+        server.handle_request()
 
     if not auth_code:
         fail(["No authorization code received from Upstox.",
@@ -174,7 +212,7 @@ def main():
         fail(["Could not exchange code for an access token.",
               "Check UPSTOX_API_KEY / UPSTOX_API_SECRET in .env."])
 
-    print("Access token received. Saving to Azure PostgreSQL...")
+    print("Access token received. Saving to Azure SQL...")
 
     # ---- WRITE ----
     try:
@@ -182,6 +220,7 @@ def main():
     except Exception as e:
         fail([f"Could not import the database layer: {e}"])
 
+    _sql_host = os.getenv("AZURE_DB_HOST", "<AZURE_DB_HOST not set in .env>")
     try:
         saved = save_upstox_token(token)
     except Exception as e:
@@ -189,13 +228,23 @@ def main():
         fail([f"Database write raised an error: {e}",
               "",
               "MOST LIKELY CAUSE: your current IP is not allow-listed on the",
-              "Azure PostgreSQL firewall (your home/office IP changes daily).",
-              "Fix: Azure Portal -> ariqt-algo-trading-db-001 -> Networking",
-              "     -> '+ Add current client IP address' -> Save -> re-run."])
+              "Azure SQL firewall (your home/office IP changes daily).",
+              f"Fix: Azure Portal -> {_sql_host.split('.')[0]} -> Networking",
+              "     -> add your current client IP address -> Save -> re-run."])
 
     if not saved:
+        # save_upstox_token() catches its own exceptions and returns False
+        # on any DB failure (including firewall/connectivity), so this is
+        # the branch that actually fires for the IP-allow-list case above,
+        # not the except block -- keep the guidance in sync with it.
         fail(["save_upstox_token() returned False — the row was not written.",
-              "Check DATABASE_URL and the Azure firewall allow-list."])
+              "",
+              "MOST LIKELY CAUSE: your current IP is not allow-listed on the",
+              "Azure SQL firewall (your home/office IP changes daily).",
+              f"Fix: Azure Portal -> {_sql_host.split('.')[0]} -> Networking",
+              "     -> add your current client IP address -> Save -> re-run.",
+              "",
+              "Check AZURE_DB_HOST/AZURE_DB_USER/AZURE_DB_PASSWORD in .env too."])
 
     # ---- VERIFY (read it back) ----
     # This is the crucial new step: prove the token is actually in the DB
@@ -213,7 +262,7 @@ def main():
 
     # ---- TRUE SUCCESS ----
     print()
-    banner(["SUCCESS — token saved AND verified in Azure PostgreSQL",
+    banner(["SUCCESS — token saved AND verified in Azure SQL",
             "The scheduler will use live Upstox data today.",
             "Market opens at 9:15 AM IST."])
     print()

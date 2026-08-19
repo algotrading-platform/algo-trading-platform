@@ -9,11 +9,15 @@
 // Deploy with (resource group scope):
 //   az deployment group create -g <rg-name> -f main.bicep -p main.parameters.json --parameters sqlAdminPassword=<typed-at-prompt>
 //
-// NOTE: as of this version, telegramBotToken/telegramChatId/upstoxSandboxAccessToken
-// default to empty strings so a deploy without them is a safe no-op (won't wipe
-// the live values) - but if you actually need to CHANGE any of those three,
-// pass the real value explicitly, e.g. --parameters telegramBotToken=<value>,
-// or Container Apps will overwrite the current secret with an empty one.
+// NOTE: telegramBotToken/telegramChatId/upstoxSandboxAccessToken/entraClientSecret
+// have NO default value - Container Apps' `secrets` block is fully replaced on
+// every deploy (there is no way to read back an existing secret's value in
+// Bicep to preserve it), so a default of '' is NOT a safe no-op: it silently
+// wipes the live secret on any deploy that forgets to pass it, which once
+// broke Entra sign-in tenant-wide right after an unrelated redeploy. Making
+// these required forces every deploy to pass the current value explicitly
+// (az deployment group create prompts for missing @secure() params with no
+// default) - see DEPLOY.md for the exact command.
 // ============================================================================
 
 @description('Azure region for compute/support resources (ACR, Log Analytics, Container Apps). Inherits the AlgoTrading resource group location (West Europe) - already successfully deployed there.')
@@ -47,17 +51,17 @@ param sqlSkuTier string = 'Basic'
 @description('Object ID of the account running this deployment (cgummunur@ariqt.com) - needed to grant secret-write access on the Key Vault for this deployment to succeed.')
 param deployerObjectId string = 'cf35cfc5-89f9-43fb-9cf0-7fa0fcd081fe'
 
-@description('Telegram bot token for scan-cycle alerts. Added directly to the live scanJob resource outside this file at some point after initial deploy - added here now to keep main.bicep an accurate description of what is actually deployed. Empty default is intentional: pass the real value at deploy time, never commit it.')
+@description('Telegram bot token for scan-cycle alerts. Added directly to the live scanJob resource outside this file at some point after initial deploy - added here now to keep main.bicep an accurate description of what is actually deployed. No default: pass the current value on every deploy, never commit it - see the note at the top of this file for why an empty default is unsafe here.')
 @secure()
-param telegramBotToken string = ''
+param telegramBotToken string
 
 @description('Telegram chat ID for scan-cycle alerts. Same provenance/rationale as telegramBotToken above.')
 @secure()
-param telegramChatId string = ''
+param telegramChatId string
 
 @description('Upstox sandbox access token, used for validating live signals against Upstox before using the production Upstox flow. Same provenance/rationale as telegramBotToken above.')
 @secure()
-param upstoxSandboxAccessToken string = ''
+param upstoxSandboxAccessToken string
 
 @description('Entra ID (Azure AD) app registration client ID for dashboard sign-in - the "Algo-Trading" single-tenant app registration in the ariqt.com tenant.')
 param entraClientId string = '6064f100-172f-4fc1-9798-b4e493e44717'
@@ -68,9 +72,12 @@ param entraTenantId string = '8f6bd982-92c3-4de0-985d-0e287c55e379'
 @description('OAuth redirect URI for the dashboard auth-code flow - must exactly match a registered Web redirect URI on the app registration (no trailing slash).')
 param entraRedirectUri string = 'https://algo-dashboard.lemonglacier-23c89c18.westeurope.azurecontainerapps.io'
 
-@description('Client secret for the Entra app registration. Same provenance/rationale as telegramBotToken above: empty default so a deploy without it is a safe no-op, pass the real value at deploy time only, never commit it.')
+@description('Client secret for the Entra app registration. Same provenance/rationale as telegramBotToken above: no default - pass the current value on every deploy, never commit it.')
 @secure()
-param entraClientSecret string = ''
+param entraClientSecret string
+
+@description('Comma-separated allow-list of UPNs permitted to use the dashboard after a successful Entra sign-in - app-level defense in depth on top of the app registration''s "assignment required" toggle, which is otherwise the ONLY thing enforcing this. Not secret, safe to default here.')
+param entraAllowedUpns string = 'cgummunur@ariqt.com,rkumar@ariqt.com,algotrading@ariqt.com'
 
 var uniqueSuffix = uniqueString(resourceGroup().id)
 var acrName = '${namePrefix}acr${uniqueSuffix}'
@@ -286,6 +293,10 @@ resource dashboardApp 'Microsoft.App/containerApps@2023-05-01' = {
             {
               name: 'ENTRA_CLIENT_SECRET'
               secretRef: 'entra-client-secret'
+            }
+            {
+              name: 'ENTRA_ALLOWED_UPNS'
+              value: entraAllowedUpns
             }
           ]
           resources: {

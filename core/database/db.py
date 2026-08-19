@@ -642,10 +642,16 @@ def get_backtest_results(
 def save_upstox_token(access_token: str) -> bool:
     """Save Upstox access token. Expires at 3:30 AM next day IST."""
     try:
-        now        = datetime.now(IST)
-        expires_at = (now + timedelta(days=1)).replace(
-            hour=3, minute=30, second=0, microsecond=0
-        )
+        now = datetime.now(IST)
+        # "Next 3:30 AM IST", not "tomorrow 3:30 AM" -- a login run between
+        # midnight and 03:30 IST (e.g. a retry after a late-night failure)
+        # would otherwise get an expires_at ~24h further out than Upstox's
+        # actual token expiry, and get_upstox_token() would keep handing out
+        # a token Upstox has already invalidated instead of correctly
+        # reporting it as expired.
+        expires_at = now.replace(hour=3, minute=30, second=0, microsecond=0)
+        if expires_at <= now:
+            expires_at += timedelta(days=1)
         # Convert to UTC before binding -- same pyodbc/DATETIMEOFFSET
         # issue as upsert_live_candles: a tz-aware IST datetime bound
         # directly as a parameter gets its wall-clock value stored as
@@ -681,7 +687,10 @@ def get_upstox_token() -> str | None:
 
         expires_at = row["expires_at"]
         if expires_at.tzinfo is None:
-            expires_at = IST.localize(expires_at)
+            # Fallback for if the DATETIMEOFFSET output converter isn't
+            # registered: the column is written in UTC (see
+            # save_upstox_token), so a naive read-back is UTC, not IST.
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
 
         if datetime.now(IST) >= expires_at:
             return None

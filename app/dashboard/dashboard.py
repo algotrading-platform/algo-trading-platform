@@ -52,12 +52,19 @@ st.set_page_config(
 # LOGIN GATE — Microsoft Entra ID (MSAL) sign-in
 #
 # Auth-code flow via msal.ConfidentialClientApplication. The pending
-# flow (state/nonce/code_verifier) lives in a process-wide
-# st.cache_resource store, NOT st.session_state — the sign-in link is
+# flow (state/nonce/code_verifier) is persisted in the app_config DB
+# table (see _store_pending_flow/_pop_pending_flow below), NOT
+# st.session_state and NOT an in-process store — the sign-in link is
 # a real top-level browser navigation away to login.microsoftonline.com
-# and back, which starts a brand-new Streamlit session with empty
-# session_state, so anything stashed there before the redirect would
-# already be gone by the time Entra redirects back.
+# and back, which starts a brand-new Streamlit session (and can land on
+# a different container replica/process) with empty session_state, so
+# anything stashed in-process before the redirect would already be gone
+# by the time Entra redirects back.
+#
+# Both the sign-in and logout links use target="_self": Streamlit's
+# markdown renderer stamps target="_blank" on any <a> left unspecified,
+# which was sending the Entra round-trip to a new tab and leaving the
+# original tab stuck on this screen forever.
 #
 # Must run BEFORE st_autorefresh and everything else, so an
 # unauthenticated visitor never triggers any dashboard logic at all —
@@ -72,6 +79,21 @@ ENTRA_CLIENT_ID     = os.environ.get("ENTRA_CLIENT_ID", "")
 ENTRA_TENANT_ID     = os.environ.get("ENTRA_TENANT_ID", "")
 ENTRA_CLIENT_SECRET = os.environ.get("ENTRA_CLIENT_SECRET", "")
 ENTRA_REDIRECT_URI  = os.environ.get("ENTRA_REDIRECT_URI", "")
+
+# App-level allow-list, checked in addition to (not instead of) the Entra app
+# registration's "assignment required" toggle -- that toggle is otherwise the
+# ONLY thing restricting sign-in to these 3 accounts, with no code-level
+# fallback if it's ever flipped or the app is made multi-tenant. Defaults to
+# the current deliberately-final 3-person list so this is safe even where
+# ENTRA_ALLOWED_UPNS isn't set.
+ENTRA_ALLOWED_UPNS = {
+    u.strip().lower()
+    for u in os.environ.get(
+        "ENTRA_ALLOWED_UPNS",
+        "cgummunur@ariqt.com,rkumar@ariqt.com,algotrading@ariqt.com",
+    ).split(",")
+    if u.strip()
+}
 
 
 # Pending OAuth flows (state -> MSAL flow dict) are persisted in the
@@ -89,10 +111,10 @@ FLOW_TTL_SECONDS = 900  # was implicitly 600s via the old dict's own prune
                         # round-trip before Entra redirects back.
 
 
-def _store_pending_flow(state: str, flow: dict) -> None:
+def _store_pending_flow(state: str, flow: dict) -> bool:
     from core.database import set_config, delete_config_prefix_older_than
     delete_config_prefix_older_than("oauth_flow:", FLOW_TTL_SECONDS)
-    set_config(f"oauth_flow:{state}", json.dumps({"flow": flow, "created_at": time.time()}))
+    return set_config(f"oauth_flow:{state}", json.dumps({"flow": flow, "created_at": time.time()}))
 
 
 def _pop_pending_flow(state: str):
@@ -138,6 +160,12 @@ if not st.session_state.get("user"):
 
     if "error" in qp:
         _msg = qp.get("error_description", qp.get("error", "Sign-in failed."))
+        if qp.get("state"):
+            # Otherwise this pending flow (e.g. user clicked "Cancel" on the
+            # Microsoft form) just sits in app_config until the next
+            # visitor's TTL sweep instead of being cleaned up immediately.
+            from core.database import delete_config
+            delete_config(f"oauth_flow:{qp.get('state')}")
         qp.clear()
         st.error(_msg.split("\r\n")[0])
         st.stop()
@@ -148,6 +176,7 @@ if not st.session_state.get("user"):
         # cleanly instead of re-exchanging an already-redeemed code.
         _flow, _flow_err = _pop_pending_flow(qp.get("state", ""))
         if _flow is None:
+            qp.clear()  # otherwise F5 replays the same dead ?code&state forever
             if _flow_err == "expired":
                 st.error(f"Sign-in took longer than {FLOW_TTL_SECONDS // 60} minutes and expired — please try again.")
             else:
@@ -156,17 +185,28 @@ if not st.session_state.get("user"):
 
         try:
             _result = _msal_app().acquire_token_by_auth_code_flow(_flow, qp.to_dict())
-        except ValueError:
+        except Exception:
             qp.clear()
             st.error("Sign-in could not be verified — please try again.")
             st.stop()
 
-        if "error" in _result:
+        if "error" in _result or "id_token_claims" not in _result:
             qp.clear()
-            st.error(_result.get("error_description", _result["error"]))
+            st.error(_result.get("error_description", _result.get("error", "Sign-in failed — please try again.")))
             st.stop()
 
-        st.session_state["user"] = _result["id_token_claims"]
+        _claims = _result["id_token_claims"]
+        _upn = (_claims.get("preferred_username") or _claims.get("upn") or "").strip().lower()
+        if _upn not in ENTRA_ALLOWED_UPNS:
+            # Defense in depth: the Entra app registration's "assignment
+            # required" toggle is otherwise the only thing keeping non-
+            # assigned accounts out. This never triggers for an assigned
+            # account today; it only matters if that toggle is ever changed.
+            qp.clear()
+            st.error("This account is not authorized to access this dashboard.")
+            st.stop()
+
+        st.session_state["user"] = _claims
         qp.clear()
         st.rerun()  # strip ?code&state from the URL before anything else runs
 
@@ -253,23 +293,37 @@ if not st.session_state.get("user"):
     </div>
     """, unsafe_allow_html=True)
 
-    # prompt="login" forces a plain interactive sign-in and skips Entra's
-    # silent-SSO / device-broker check -- that silent check is what hands
-    # control to Edge's own native "sign in to browser" flow (confirmed via
-    # an incognito test: same "Switch Edge profile" prompt shows up there
-    # with zero existing session), which completes in a DIFFERENT tab tied
-    # to whichever browser profile it resolves to, stranding the original
-    # tab on the pre-auth login screen. Skipping the silent check removes
-    # the one hook that hands off to that broker in the first place.
-    _flow = _msal_app().initiate_auth_code_flow(
-        scopes=["User.Read"], redirect_uri=ENTRA_REDIRECT_URI, prompt="login",
-    )
-    _store_pending_flow(_flow["state"], _flow)
+    if not (ENTRA_CLIENT_ID and ENTRA_TENANT_ID and ENTRA_CLIENT_SECRET and ENTRA_REDIRECT_URI):
+        st.error("Sign-in is misconfigured — one or more ENTRA_* environment variables are missing. Contact an admin.")
+        st.stop()
 
+    _flow = _msal_app().initiate_auth_code_flow(
+        scopes=["User.Read"], redirect_uri=ENTRA_REDIRECT_URI,
+    )
+    if not _store_pending_flow(_flow["state"], _flow):
+        # set_config() swallows DB errors and returns False -- without this
+        # check a DB outage (e.g. this host's IP not allow-listed on the
+        # Azure SQL firewall) rendered a normal-looking sign-in link that
+        # would always fail at the callback with "already used or could
+        # not be found", with no indication the real cause was the DB.
+        st.error("Sign-in is temporarily unavailable — could not reach the database. Please try again shortly.")
+        st.stop()
+
+    # The sign-in link is a real top-level navigation to
+    # login.microsoftonline.com and back. Streamlit's markdown renderer
+    # stamps target="_blank" on any <a> with no explicit target, which was
+    # sending this navigation to a NEW tab -- the Entra callback then
+    # completed in that new tab while the original tab sat on this login
+    # screen forever, looking like sign-in silently did nothing. Explicit
+    # target="_self" keeps it a same-tab navigation. (prompt="login" and
+    # an inline onclick=window.location.assign were tried earlier and
+    # didn't help: the former doesn't affect tab targeting at all, and the
+    # latter is inert -- React never attaches string on* attributes from
+    # markdown-rendered HTML.)
     st.markdown(f"""
     <div class="login-card">
         <h3>Sign in</h3>
-        <a href="{_flow['auth_uri']}" class="entra-signin-btn">
+        <a href="{_flow['auth_uri']}" class="entra-signin-btn" target="_self">
             <span class="ms-logo">
                 <span style="background:#f25022;"></span><span style="background:#7fba00;"></span>
                 <span style="background:#00a4ef;"></span><span style="background:#ffb900;"></span>
@@ -1066,7 +1120,7 @@ with st.sidebar:
     }}
     .entra-logout-btn:hover {{ border-color: var(--blue); color: var(--blue) !important; }}
     </style>
-    <a href="{_logout_url}" class="entra-logout-btn">Logout</a>
+    <a href="{_logout_url}" class="entra-logout-btn" target="_self">Logout</a>
     """, unsafe_allow_html=True)
     st.markdown("<div style='margin:10px 0;border-top:1px solid var(--border);'></div>", unsafe_allow_html=True)
 

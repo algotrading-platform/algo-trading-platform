@@ -57,16 +57,21 @@ az group show --name AlgoTrading
 this deploy will fail on the Container Apps / SQL / Key Vault resources
 until that's done.**
 
-You'll be prompted for `sqlAdminPassword` — type it directly, it won't be
-saved to any file. Pick something meeting Azure SQL's complexity rules
-(8+ chars, at least 3 of: upper, lower, digit, symbol).
+You'll be prompted for `sqlAdminPassword`, `telegramBotToken`, `telegramChatId`,
+`upstoxSandboxAccessToken`, and `entraClientSecret` — type each directly, none
+are saved to any file. Pick a `sqlAdminPassword` meeting Azure SQL's complexity
+rules (8+ chars, at least 3 of: upper, lower, digit, symbol). These five have
+no default in `main.bicep` **on purpose**: Container Apps' `secrets` block is
+fully replaced on every deploy, so an empty default would silently wipe
+whichever of these already has a real value live — pass the current value
+every time, not just when rotating it.
 
 ```powershell
 az deployment group create `
   --resource-group AlgoTrading `
   --template-file main.bicep `
   --parameters main.parameters.json `
-  --parameters sqlAdminPassword=<type-it-here>
+  --parameters sqlAdminPassword=<type-it-here> telegramBotToken=<current-value> telegramChatId=<current-value> upstoxSandboxAccessToken=<current-value> entraClientSecret=<current-value>
 ```
 
 This takes several minutes (SQL Server + Container Apps Environment are the
@@ -113,17 +118,19 @@ migration, is done).
 
 The dashboard's Microsoft sign-in reads `ENTRA_CLIENT_ID`/`ENTRA_TENANT_ID`/
 `ENTRA_REDIRECT_URI` (plain, safe to leave at their `main.bicep` defaults) and
-`ENTRA_CLIENT_SECRET` (secret, empty default so a normal redeploy is a safe
-no-op). To push a new/rotated client secret to the live dashboard app, redeploy
-with it passed explicitly — same pattern as `sqlAdminPassword`/`telegramBotToken`,
-never add it to `main.parameters.json`:
+`ENTRA_CLIENT_SECRET` (secret, **required on every deploy** — see the note in
+step 3 above for why it has no default). To push a new/rotated client secret to
+the live dashboard app, redeploy with the fresh value in place of the current
+one — same command as any other redeploy, just with `entraClientSecret` (and
+the other required secrets) set to their real current values, never added to
+`main.parameters.json`:
 
 ```powershell
 az deployment group create `
   --resource-group AlgoTrading `
   --template-file main.bicep `
   --parameters main.parameters.json `
-  --parameters sqlAdminPassword=<existing-password> entraClientSecret=<fresh-secret-value>
+  --parameters sqlAdminPassword=<existing-password> telegramBotToken=<existing-value> telegramChatId=<existing-value> upstoxSandboxAccessToken=<existing-value> entraClientSecret=<fresh-secret-value>
 ```
 
 ## What's intentionally NOT done yet (later phases)

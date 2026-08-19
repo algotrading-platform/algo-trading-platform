@@ -257,7 +257,7 @@ _mcx_cache_date: str = ""
 
 def get_token() -> str | None:
     """
-    Fetch the current Upstox access token from Azure PostgreSQL.
+    Fetch the current Upstox access token from Azure SQL.
     Returns None if not found or expired.
     """
     try:
@@ -268,7 +268,7 @@ def get_token() -> str | None:
         return None
 
 def save_token(access_token: str) -> bool:
-    """Save access token to Azure PostgreSQL. Expires at 3:30 AM next day IST."""
+    """Save access token to Azure SQL. Expires at 3:30 AM next day IST."""
     try:
         from core.database.db import save_upstox_token
         return save_upstox_token(access_token)
