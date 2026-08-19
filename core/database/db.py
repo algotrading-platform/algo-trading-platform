@@ -735,6 +735,34 @@ def set_config(key: str, value: str) -> bool:
         return False
 
 
+def delete_config(key: str) -> bool:
+    """Delete a single app_config row by key (no-op if it doesn't exist)."""
+    try:
+        with _get_cursor() as cur:
+            cur.execute("DELETE FROM app_config WHERE [key] = ?", (key,))
+        return True
+    except Exception as e:
+        print(f"[DB] delete_config error: {e}")
+        return False
+
+
+def delete_config_prefix_older_than(prefix: str, seconds: int) -> int:
+    """Delete all app_config rows whose key starts with `prefix` and were
+    last updated more than `seconds` ago. Returns rows deleted (best
+    effort -- 0 on error, never raises)."""
+    try:
+        with _get_cursor() as cur:
+            cur.execute(
+                "DELETE FROM app_config WHERE [key] LIKE ? AND "
+                "updated_at < DATEADD(SECOND, ?, SYSDATETIMEOFFSET())",
+                (f"{prefix}%", -abs(seconds)),
+            )
+            return cur.rowcount or 0
+    except Exception as e:
+        print(f"[DB] delete_config_prefix_older_than error: {e}")
+        return 0
+
+
 # ============================================================
 # PAPER TRADING — SYMMETRIC BUY/SELL + MANUAL CONTROLS
 # ============================================================

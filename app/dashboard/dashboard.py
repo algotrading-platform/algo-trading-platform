@@ -74,9 +74,47 @@ ENTRA_CLIENT_SECRET = os.environ.get("ENTRA_CLIENT_SECRET", "")
 ENTRA_REDIRECT_URI  = os.environ.get("ENTRA_REDIRECT_URI", "")
 
 
-@st.cache_resource
-def _pending_flows():
-    return {}  # state -> (flow_dict, created_at_epoch)
+# Pending OAuth flows (state -> MSAL flow dict) are persisted in the
+# app_config table, NOT an in-process st.cache_resource dict as before.
+# That in-memory store was lost every time the container restarted or
+# redeployed (which happens routinely on this project) -- anyone
+# mid-login at that moment landed on a fresh process with an empty
+# store and got a false "session expired" on an otherwise-valid code
+# exchange. The DB survives restarts, so this removes that failure
+# mode entirely, not just widens the window before it.
+FLOW_TTL_SECONDS = 900  # was implicitly 600s via the old dict's own prune
+                        # loop -- widened since the tenant's Conditional
+                        # Access "sign in to browser" prompt (a policy this
+                        # app doesn't control) can add real minutes to the
+                        # round-trip before Entra redirects back.
+
+
+def _store_pending_flow(state: str, flow: dict) -> None:
+    from core.database import set_config, delete_config_prefix_older_than
+    delete_config_prefix_older_than("oauth_flow:", FLOW_TTL_SECONDS)
+    set_config(f"oauth_flow:{state}", json.dumps({"flow": flow, "created_at": time.time()}))
+
+
+def _pop_pending_flow(state: str):
+    """
+    One-time read of a pending flow. Returns (flow_dict, None) on success.
+    Returns (None, "expired") vs (None, "not_found") as DISTINCT outcomes
+    (was one generic message for both) so a real timeout is now
+    distinguishable from a replayed/duplicate callback URL -- the two
+    have different, actionable causes for the person hitting them.
+    """
+    from core.database import get_config, delete_config
+    raw = get_config(f"oauth_flow:{state}") if state else None
+    if raw is None:
+        return None, "not_found"
+    delete_config(f"oauth_flow:{state}")  # one-time use regardless of outcome below
+    try:
+        entry = json.loads(raw)
+    except (TypeError, ValueError):
+        return None, "not_found"
+    if time.time() - entry["created_at"] > FLOW_TTL_SECONDS:
+        return None, "expired"
+    return entry["flow"], None
 
 
 def _msal_app():
@@ -105,20 +143,17 @@ if not st.session_state.get("user"):
         st.stop()
 
     if "code" in qp:
-        # Exchange the auth code exactly once: pop() (not get()) removes
-        # the flow so a stray reload of this same callback URL fails
+        # Exchange the auth code exactly once: _pop_pending_flow() deletes
+        # the DB row so a stray reload of this same callback URL fails
         # cleanly instead of re-exchanging an already-redeemed code.
-        _flows = _pending_flows()
-        _now = time.time()
-        for _stale in [s for s, (_, ts) in _flows.items() if _now - ts > 600]:
-            _flows.pop(_stale, None)
-
-        _entry = _flows.pop(qp.get("state", ""), None)
-        if _entry is None:
-            st.error("Sign-in session expired or was already used — please try again.")
+        _flow, _flow_err = _pop_pending_flow(qp.get("state", ""))
+        if _flow is None:
+            if _flow_err == "expired":
+                st.error(f"Sign-in took longer than {FLOW_TTL_SECONDS // 60} minutes and expired — please try again.")
+            else:
+                st.error("Sign-in link was already used or could not be found — please try again.")
             st.stop()
 
-        _flow, _ = _entry
         try:
             _result = _msal_app().acquire_token_by_auth_code_flow(_flow, qp.to_dict())
         except ValueError:
@@ -219,7 +254,7 @@ if not st.session_state.get("user"):
     """, unsafe_allow_html=True)
 
     _flow = _msal_app().initiate_auth_code_flow(scopes=["User.Read"], redirect_uri=ENTRA_REDIRECT_URI)
-    _pending_flows()[_flow["state"]] = (_flow, time.time())
+    _store_pending_flow(_flow["state"], _flow)
 
     st.markdown(f"""
     <div class="login-card">
