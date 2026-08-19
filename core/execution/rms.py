@@ -60,7 +60,13 @@ class RMSConfig:
                                           # 1.2 shortly after (Jwala's own follow-up
                                           # correction) — net effect across both
                                           # calls is no change from the original 1.2.
-    DAILY_MAX_LOSS_PCT   = 0.03          # stop trading after -3% in a day
+    DAILY_MAX_LOSS_PCT   = 0.01          # hard stop after -1% in a day (Jwala,
+                                          # Aug 19: "control the loss = 1% which
+                                          # should hit hard stop" — was 3%).
+                                          # Kill switch now also force-closes all
+                                          # open positions, not just new entries
+                                          # — see PaperTrader.monitor_open()'s
+                                          # kill-switch sweep.
     MIN_QUANTITY         = 1             # need at least 1 share to trade
 
     # Strategy-specific reward ratio (Jwala, Jul 11: "once we enter we
@@ -307,3 +313,16 @@ class RMS:
                 "daily_pnl_before":  round(self._realized_pnl_today, 2),
             },
         )
+
+
+# ============================================================
+# SHARED SINGLETON — Om, Aug 19: strategy_engine.py's PaperTrader
+# (opens trades via on_signal) and signal_scheduler.py's PaperTrader
+# (closes trades via monitor_open) used to each construct their OWN
+# RMS(RMSConfig) instance. Since realized P&L is only ever recorded on
+# closes, and the halt is only ever checked on entries, the two
+# instances never saw each other's state — the daily-loss kill switch
+# could never actually have blocked a new trade. Both PaperTrader
+# instances now default to this one shared instance instead.
+# ============================================================
+shared_rms = RMS(RMSConfig)

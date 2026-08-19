@@ -72,7 +72,7 @@ from datetime import datetime, time as dtime
 
 import pytz
 
-from core.execution.rms import RMS, RMSConfig
+from core.execution.rms import RMS, RMSConfig, shared_rms
 from core.execution.order_manager import OrderManager
 from core.execution.sandbox_client import SandboxClient
 from core.database import db
@@ -131,8 +131,13 @@ def _is_equity(symbol: str) -> bool:
 
 class PaperTrader:
 
-    def __init__(self, provider=None):
-        self.rms  = RMS(RMSConfig)
+    def __init__(self, provider=None, rms: RMS = None):
+        # Defaults to the module-level shared_rms singleton (see rms.py)
+        # so the entry-side PaperTrader (strategy_engine.py) and the
+        # monitor-side PaperTrader (signal_scheduler.py) see the SAME
+        # daily P&L / halted state — pass an explicit rms= for tests
+        # that need an isolated instance.
+        self.rms  = rms if rms is not None else shared_rms
         # Order Manager knows what's open (for idempotency + no re-entry)
         self.om   = OrderManager(is_open_position_fn=db.is_paper_position_open)
         self.sbx  = SandboxClient(sandbox=True)
@@ -399,6 +404,48 @@ class PaperTrader:
                         "symbol": symbol, "reason": hit,
                         "exit": price, "pnl": round(pnl, 2),
                     })
+
+        # ── Kill switch: daily loss limit breached (by a close just
+        # above, or already halted from an earlier cycle this same
+        # day) — force-close everything still open. Jwala, Aug 19:
+        # the hard stop should "kill all the existing paper trades",
+        # not just block new entries (that alone was step 1 above,
+        # via RMS.evaluate() rejecting on_signal() while halted).
+        if self.rms.halted:
+            closed.extend(self._kill_switch_close_all())
+
+        return closed
+
+    def _kill_switch_close_all(self) -> list[dict]:
+        """Force-close every remaining open paper position at current
+        market price. Called once the RMS daily-loss kill switch has
+        tripped — positions are closed regardless of their own
+        stop/target, since the portfolio-level limit overrides them."""
+        closed = []
+        open_df = db.get_open_paper_positions()
+        if open_df is None or open_df.empty:
+            return closed
+
+        for _, pos in open_df.iterrows():
+            symbol = pos["symbol"]
+            side   = pos["side"]
+            pid    = int(pos["id"])
+
+            price = self._current_price(symbol)
+            if price is None:
+                log.warning(f"kill_switch: no price for {symbol}, could not force-close this cycle")
+                continue
+
+            if db.close_paper_position(pid, price, exit_reason="kill_switch"):
+                qty   = int(pos["quantity"])
+                entry = float(pos["entry_price"])
+                pnl   = (price - entry) * qty if side == "BUY" else (entry - price) * qty
+                self.rms.record_realized_pnl(pnl)
+                self.om.clear_key(symbol, side, f"{pos['timeframe']}|{pos['strategy']}")
+                closed.append({
+                    "symbol": symbol, "reason": "kill_switch",
+                    "exit": price, "pnl": round(pnl, 2),
+                })
         return closed
 
     def _apply_trailing_stop(self, pos, current_price: float, side: str, current_stop: float) -> float:

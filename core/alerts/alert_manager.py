@@ -181,18 +181,30 @@ class AlertManager:
         except Exception:
             price_str = str(price)
 
-        # Arbitrage format
+        # Arbitrage format — fields per Jwala's request (Aug 19): Spot
+        # Price, Future Price, Basis (Future - Spot), Basis %
+        # (Basis/Spot*100). The strategy already computes all of these
+        # (Spot_Price/Futures_Price/Spread_Abs/Spread_Pct in indicators)
+        # — this just surfaces them, labeled, in the message.
         if strategy == "Cash-Futures Arbitrage":
-            spread     = alert["rsi"]
             indicators = result.indicators if result else {}
+            spot       = indicators.get("Spot_Price", alert.get("price"))
+            future     = indicators.get("Futures_Price")
+            basis      = indicators.get("Spread_Abs")
+            spread     = indicators.get("Spread_Pct", alert["rsi"])
             gross      = indicators.get("Gross_Profit", 0)
             net        = indicators.get("Net_Profit_Est", 0)
             expiry     = indicators.get("Expiry", "")
             fut_sym    = indicators.get("Futures_Symbol", "")
 
+            spot_str   = f"₹{spot:,.2f}"   if spot   is not None else "N/A"
+            future_str = f"₹{future:,.2f}" if future is not None else "N/A"
+            basis_str  = f"₹{basis:,.2f}"  if basis  is not None else "N/A"
+
             return (
                 f"🔵 *{name}  ARB  {price_str}  {ist_now}*\n"
-                f"Spread `{spread}%`  Futures: `{fut_sym}`  Exp: `{expiry}`\n"
+                f"Spot `{spot_str}`  Future `{future_str}`\n"
+                f"Basis `{basis_str}`  ({spread}%)  Futures: `{fut_sym}`  Exp: `{expiry}`\n"
                 f"Gross `₹{gross:,.0f}`  Net `₹{net:,.0f}`\n"
                 f"_Buy spot + Sell futures simultaneously_"
             )
