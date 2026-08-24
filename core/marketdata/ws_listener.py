@@ -207,8 +207,22 @@ class WSListener:
     def _flush_loop(self) -> None:
         while True:
             time.sleep(FLUSH_INTERVAL_SEC)
+            now_minute = datetime.now(IST).replace(second=0, microsecond=0)
             with self._lock:
                 rows = list(self._pending.values())
+                # Evict candles whose minute has already closed -- they
+                # were flushed at least once already and won't receive
+                # any more ticks (a live tick for a new minute replaces
+                # the dict entry instead of mutating this one; see
+                # _extract_candle). Without this, an instrument whose
+                # feed silently dies keeps the SAME stale row here
+                # forever, and it gets re-flushed every cycle with a
+                # bumped updated_at but unchanged ts/close -- making a
+                # dead price look fresh to any staleness check keyed
+                # off updated_at instead of the candle's own ts.
+                for key, row in list(self._pending.items()):
+                    if row["ts"] < now_minute:
+                        del self._pending[key]
             if not rows:
                 continue
             if db.upsert_live_candles(rows):

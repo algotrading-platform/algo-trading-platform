@@ -306,8 +306,16 @@ def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
         df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True).dt.tz_convert(IST).dt.tz_localize(None)
         df = df.set_index("Datetime")
 
-        # Resample OHLCV
-        resampled = df.resample(rule, label="left", closed="left").agg({
+        # Resample OHLCV.
+        # offset="15min" aligns bucket edges to NSE's actual candle
+        # boundaries (09:15, 10:15, 12:15, ...) instead of the clock
+        # hour (09:00, 10:00, ...). Without it, the "1h" rule's first
+        # bucket of every day was labeled "09:00" — before the 09:15
+        # cutoff below — so between_time() silently dropped the entire
+        # first hour of trading (09:15-10:15) from every 1-Hour chart,
+        # every day. No-op for "5min"/"15min" since 15 is already a
+        # multiple of both, so their existing boundaries are unchanged.
+        resampled = df.resample(rule, label="left", closed="left", offset="15min").agg({
             "Open":   "first",
             "High":   "max",
             "Low":    "min",

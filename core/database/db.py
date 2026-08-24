@@ -1520,9 +1520,20 @@ def get_live_candles_today(symbol: str) -> pd.DataFrame:
 def get_latest_live_price(symbol: str, max_age_minutes: int = 2) -> float | None:
     """
     Latest close for a symbol from the live feed. Returns None (not a
-    stale value) if the WS listener hasn't updated this symbol within
-    max_age_minutes -- callers should fall back to REST/yfinance in
-    that case.
+    stale value) if the WS listener hasn't produced a candle for this
+    symbol within max_age_minutes -- callers should fall back to
+    REST/yfinance in that case.
+
+    Staleness is judged by the candle's own `ts` (the actual market
+    minute it represents), NOT `updated_at` (when the row was last
+    written). The WS listener's flush loop used to re-upsert an
+    instrument's last-known candle every cycle even when its feed had
+    gone dead, which bumped `updated_at` to "now" forever while `ts`
+    and `close` stayed frozen -- an `updated_at`-based check treated
+    that frozen price as fresh indefinitely. Confirmed 2026-08-24: a
+    paper position's target was never closing because this function
+    kept returning a 4-day-old close for a symbol whose WS feed had
+    silently stopped.
 
     Postgres's `NOW() - INTERVAL '1 minute' * %s` is replaced with a
     Python-computed cutoff timestamp, passed as a parameter -- the same
@@ -1535,7 +1546,7 @@ def get_latest_live_price(symbol: str, max_age_minutes: int = 2) -> float | None
         with _get_cursor() as cur:
             cur.execute("""
                 SELECT TOP 1 [close] FROM live_candles_1min
-                WHERE symbol = ? AND updated_at >= ?
+                WHERE symbol = ? AND ts >= ?
                 ORDER BY ts DESC
             """, (symbol, cutoff))
             row = cur.fetchone()

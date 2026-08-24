@@ -6,6 +6,7 @@ import sys
 import os
 import json
 import time
+import bisect
 import contextlib
 import urllib.parse
 
@@ -297,8 +298,18 @@ if not st.session_state.get("user"):
         st.error("Sign-in is misconfigured — one or more ENTRA_* environment variables are missing. Contact an admin.")
         st.stop()
 
+    # prompt="login" skips Entra's silent-SSO / device-broker check, which
+    # is what hands off to Edge's own native account/device flow (the
+    # "Sign in with your work account" nudge + Intune "secure this device"
+    # wall seen on 2026-08-24 for algotrading@ariqt.com and for Jwala's
+    # account) before our own MSAL login screen ever gets a chance to run.
+    # This forces a plain interactive Entra sign-in instead, decoupled from
+    # whichever Windows/Edge identity is already cached on the device.
+    # (Tried once before in c30f403, removed in fec7023 -- but only because
+    # it wasn't the fix for that commit's actual bug, the new-tab redirect,
+    # which target="_self" below fixed. Never disproven for THIS issue.)
     _flow = _msal_app().initiate_auth_code_flow(
-        scopes=["User.Read"], redirect_uri=ENTRA_REDIRECT_URI,
+        scopes=["User.Read"], redirect_uri=ENTRA_REDIRECT_URI, prompt="login",
     )
     if not _store_pending_flow(_flow["state"], _flow):
         # set_config() swallows DB errors and returns False -- without this
@@ -791,13 +802,38 @@ def strategy_pill_html(strategy: str, timeframe: str = "") -> str:
 # TRADINGVIEW LIGHTWEIGHT CHART
 # ============================================================
 
+# Lightweight Charts always renders an epoch as if it were UTC.
+IST_OFFSET = 19800  # +5h30m, in seconds
+
+
+def _to_chart_epoch(ts) -> int:
+    """
+    Convert a Datetime value to the epoch Lightweight Charts should be
+    given so it displays the correct IST wall-clock time.
+
+    - tz-aware ts: `.timestamp()` gives the true UTC instant. Add the
+      IST offset so that once the chart renders it "as UTC", the
+      numbers shown are the IST wall-clock time.
+    - tz-naive ts: these already hold IST wall-clock numbers (e.g.
+      upstox_provider.resample_ohlc() strips tz after converting to
+      IST). Pandas' Timestamp.timestamp() treats a naive value as if
+      it were already UTC, so the wall-clock numbers survive
+      unchanged with NO extra offset — adding one here would double
+      the shift (this was the bug: 5m/15m/1h charts rendered ~5.5h
+      later than the real candle time).
+    """
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is None:
+        return int(ts.timestamp())
+    return int(ts.timestamp()) + IST_OFFSET
+
+
 def build_tv_chart(
     symbol:   str,
     name:     str,
     tf_name:  str,
     is_dark:  bool,
     signals:  list[dict] = None,
-    all_tf_data: dict = None,  # pre-loaded data for all timeframes
 ) -> str:
     """
     Fetch OHLCV data and build TradingView Lightweight Charts HTML.
@@ -813,22 +849,11 @@ def build_tv_chart(
             _bg, _fg = ("#0d1526", "#6b7fa0") if is_dark else ("#ffffff", "#7a8fad")
             return f"<div style='padding:20px;background:{_bg};color:{_fg};font-family:monospace;height:510px;box-sizing:border-box;'>No data available for chart</div>"
 
-        # IST display offset for Lightweight Charts.
-        # The chart library renders every epoch as if it were UTC. To make
-        # candles/markers show IST wall-clock time (NSE 9:15-15:30), we add
-        # +5h30m (19,800s) to every epoch. Applied identically to candles,
-        # RSI and markers so they stay aligned with each other.
-        IST_OFFSET = 19800
-
         # Prepare candle data
         candles = []
         for _, row in df.iterrows():
             try:
-                ts = row["Datetime"]
-                if hasattr(ts, "timestamp"):
-                    t = int(ts.timestamp()) + IST_OFFSET
-                else:
-                    t = int(pd.Timestamp(ts).timestamp()) + IST_OFFSET
+                t = _to_chart_epoch(row["Datetime"])
                 candles.append({
                     "time":  t,
                     "open":  round(float(row["Open"]),  2),
@@ -846,8 +871,7 @@ def build_tv_chart(
             rsi_data = []
             for _, row in df_rsi.iterrows():
                 try:
-                    ts = row["Datetime"]
-                    t  = (int(ts.timestamp()) if hasattr(ts, "timestamp") else int(pd.Timestamp(ts).timestamp())) + IST_OFFSET
+                    t = _to_chart_epoch(row["Datetime"])
                     rsi_data.append({"time": t, "value": round(float(row["RSI"]), 2)})
                 except Exception:
                     continue
@@ -872,7 +896,25 @@ def build_tv_chart(
         except Exception:
             pivots = {}
 
-        # Signal markers from Supabase
+        # Signal markers (strategy BUY/SELL alerts, and paper-trading
+        # entry/exit events passed in via `signals` from show_chart_panel)
+        #
+        # Lightweight Charts only reliably renders a marker whose "time"
+        # exactly equals an existing candle's time — a signal's real
+        # timestamp (e.g. 09:52:05) never lands exactly on a bucket
+        # boundary (e.g. 09:15:00), so markers appeared to work at wide
+        # zoom (where the mismatch happens to fall within rendering
+        # tolerance) and silently vanished once zoomed to a range where
+        # it doesn't. Snapping each marker to the last candle at-or-before
+        # its real time removes that dependency entirely.
+        candle_times = [c["time"] for c in candles]
+
+        def _snap_to_candle(epoch: int) -> int:
+            if not candle_times:
+                return epoch
+            idx = bisect.bisect_right(candle_times, epoch) - 1
+            return candle_times[max(idx, 0)]
+
         markers = []
         if signals:
             for sig in signals:
@@ -880,18 +922,37 @@ def build_tv_chart(
                     ts_str = sig.get("Timestamp", "")
                     if not ts_str:
                         continue
-                    ts = pd.to_datetime(ts_str, utc=True)
-                    t  = int(ts.timestamp()) + IST_OFFSET
                     signal_type = sig.get("Signal", "")
+                    # Skip HOLD / anything that isn't an actual BUY or SELL —
+                    # log_signal() writes a row on every scan (including
+                    # HOLD), so without this filter the chart got flooded
+                    # with HOLD rows mislabeled as red SELL arrows.
+                    if signal_type not in ("BUY", "SELL"):
+                        continue
+                    t = _snap_to_candle(_to_chart_epoch(pd.to_datetime(ts_str, utc=True)))
+                    label = sig.get("Label")
+                    text  = f"{label} {signal_type} ₹{sig.get('Price','')}" if label else f"{signal_type} ₹{sig.get('Price','')}"
                     markers.append({
                         "time":     t,
                         "position": "belowBar" if signal_type == "BUY" else "aboveBar",
                         "color":    "#1ec9a0" if signal_type == "BUY" else "#f05555",
                         "shape":    "arrowUp" if signal_type == "BUY" else "arrowDown",
-                        "text":     f"{signal_type} ₹{sig.get('Price','')}"
+                        "text":     text,
                     })
                 except Exception:
                     continue
+
+        # setMarkers() requires the array sorted ascending by time -- our
+        # input list is Stock-filtered signals (newest-first, per
+        # get_signals' ORDER BY DESC) concatenated with open/closed paper
+        # positions (also newest-first), so it's never actually sorted.
+        # Lightweight Charts doesn't just misplace out-of-order markers,
+        # it silently drops the ENTIRE set once the view is zoomed/panned
+        # (confirmed library behavior: github.com/tradingview/
+        # lightweight-charts issues #956 and #1766) -- this, not the
+        # candle-time mismatch, was the real cause of markers vanishing
+        # on zoom even after they were snapped to an exact candle time.
+        markers.sort(key=lambda m: m["time"])
 
         # Theme colors
         if is_dark:
@@ -1044,7 +1105,7 @@ if (rsiData.length > 0) {{
 // RSI 25/75 reference lines (Jwala's levels)
 [25, 75].forEach(level => {{
   const refLine = rsiChart.addLineSeries({{
-    color:           level === 70 ? 'rgba(240,85,85,0.4)' : 'rgba(30,201,160,0.4)',
+    color:           level === 75 ? 'rgba(240,85,85,0.4)' : 'rgba(30,201,160,0.4)',
     lineWidth:       1,
     lineStyle:       LightweightCharts.LineStyle.Dashed,
     priceLineVisible:false,
@@ -1410,6 +1471,42 @@ def show_chart_panel():
         sym_df = all_logs[all_logs["Stock"] == sym].copy()
         if not sym_df.empty:
             sym_signals = sym_df.to_dict("records")
+
+    # Paper-trading entry/exit markers for this symbol. These are NOT
+    # in the `signals` table above — a stop-loss/target/manual/kill-switch
+    # exit is a paper_positions event, not a strategy-generated signal,
+    # so it never gets written by log_signal(). Fetched directly (not via
+    # `all_logs`) so they also aren't hidden by the sidebar's
+    # strategy/timeframe filter or the signals log's 7-day window.
+    try:
+        from core.database.db import get_open_paper_positions, get_closed_paper_positions
+        open_pos = get_open_paper_positions(symbol=sym)
+        if open_pos is not None and not open_pos.empty:
+            for _, p in open_pos.iterrows():
+                sym_signals.append({
+                    "Timestamp": p["opened_at"],
+                    "Signal":    p["side"],
+                    "Price":     p["entry_price"],
+                    "Label":     "ENTRY",
+                })
+        closed_pos = get_closed_paper_positions(days=365)
+        if closed_pos is not None and not closed_pos.empty and "symbol" in closed_pos.columns:
+            closed_pos = closed_pos[closed_pos["symbol"] == sym]
+            for _, p in closed_pos.iterrows():
+                sym_signals.append({
+                    "Timestamp": p["opened_at"],
+                    "Signal":    p["side"],
+                    "Price":     p["entry_price"],
+                    "Label":     "ENTRY",
+                })
+                sym_signals.append({
+                    "Timestamp": p["closed_at"],
+                    "Signal":    "SELL" if p["side"] == "BUY" else "BUY",
+                    "Price":     p["exit_price"],
+                    "Label":     f"EXIT {str(p.get('exit_reason', '')).upper()}".strip(),
+                })
+    except Exception:
+        pass
 
     chart_html = build_tv_chart(
         symbol=sym,
