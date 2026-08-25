@@ -143,6 +143,40 @@ class RMS:
         self._day = date.today()
         self._realized_pnl_today = 0.0
         self._trading_halted = False
+        self._sync_today_pnl_from_db()
+
+    def _sync_today_pnl_from_db(self) -> None:
+        """
+        Seed today's realized P&L / halted state from the database.
+
+        RMS state used to live purely in-memory, which was fine when the
+        scheduler was one long-running process (old run_scheduler.py).
+        Since the move to Container App Jobs — a brand-new process per
+        5-minute cron trigger, see run_single_scan.py — that in-memory
+        state was silently discarded every cycle: _realized_pnl_today
+        reset to 0.0 and _trading_halted reset to False on every single
+        run, so the daily kill switch (Jwala, Aug 19: "control the loss
+        = 1%... hard stop") could never actually accumulate a day's
+        losses across cycles. paper_trader.py's own kill-switch comment
+        ("already halted from an earlier cycle this same day") assumed
+        persistence that never existed under this deployment model.
+        Found in the 2026-08-25 full-system audit.
+
+        Fix: read the true day-to-date realized P&L from the database
+        (which IS correctly accumulated there via paper_positions) at
+        construction time, instead of trusting a fresh in-memory zero.
+        """
+        try:
+            from core.database.db import get_today_pnl_summary
+            summary = get_today_pnl_summary()
+            self._realized_pnl_today = float(summary.get("total_pnl", 0.0) or 0.0)
+            loss_limit = -abs(self.cfg.CAPITAL * self.cfg.DAILY_MAX_LOSS_PCT)
+            self._trading_halted = self._realized_pnl_today <= loss_limit
+        except Exception:
+            # DB unreachable at construction — fail safe to "not halted,
+            # zero P&L known" rather than crash the whole process; the
+            # next record_realized_pnl()/evaluate() call rolls normally.
+            pass
 
     # --------------------------------------------------------
     # Daily P&L tracking (feeds the daily-loss kill switch)

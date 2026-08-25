@@ -90,13 +90,20 @@ _MCX_URL         = "https://assets.upstox.com/market-quote/instruments/exchange/
 _symbol_key_cache: dict = {}
 _instruments_loaded  = False
 
+# Runtime cache: underlying equity symbol (e.g. "M&M", no ".NS") → list of
+# its NSE_FO FUT contracts, sorted nearest-expiry-first. Built from the
+# same instruments file this module already downloads — see the
+# Cash-Futures Arbitrage note in the loop below for why this replaced a
+# remote search call.
+_futures_by_underlying: dict = {}
+
 
 def _load_instruments() -> None:
     """
     Download Upstox instruments file and build symbol→key map.
     Called once at startup. Cached in memory.
     """
-    global _symbol_key_cache, _instruments_loaded
+    global _symbol_key_cache, _instruments_loaded, _futures_by_underlying
 
     if _instruments_loaded:
         return
@@ -143,8 +150,31 @@ def _load_instruments() -> None:
                 elif key == "NSE_INDEX|Nifty 100":
                     _symbol_key_cache["^NSEI100"] = key
 
+            # NSE equity FUTURES contracts — for the Cash-Futures Arbitrage
+            # strategy. Previously looked up via Upstox's
+            # /instruments/search?asset_type=FO, which does NOT actually
+            # filter by asset type — it's a fuzzy top-10-result name search
+            # dominated by equity/index matches, so liquid F&O names like
+            # M&M, LT, BSE, BEL, OIL got zero FUT rows back and were
+            # silently excluded from every arbitrage scan (found in the
+            # 2026-08-25 audit). This builds an exact underlying->contracts
+            # map from the same bulk file already downloaded above instead.
+            if seg == "NSE_FO" and itype == "FUT":
+                underlying = str(inst.get("underlying_symbol", "")).upper()
+                if underlying:
+                    _futures_by_underlying.setdefault(underlying, []).append({
+                        "instrument_key": key,
+                        "expiry_ms":      inst.get("expiry"),
+                        "tradingsymbol":  sym,
+                        "lot_size":       inst.get("lot_size"),
+                    })
+
+        for _contracts in _futures_by_underlying.values():
+            _contracts.sort(key=lambda c: c.get("expiry_ms") or float("inf"))
+
         print(f"[Upstox] Loaded {count} NSE instruments into cache", flush=True)
         print(f"[Upstox] Sample: HDFCBANK.NS -> {_symbol_key_cache.get('HDFCBANK.NS', 'NOT FOUND')}", flush=True)
+        print(f"[Upstox] Loaded FUT contracts for {len(_futures_by_underlying)} underlyings", flush=True)
         _instruments_loaded = True
 
     except Exception as e:
@@ -158,6 +188,39 @@ def get_instrument_key(yf_symbol: str) -> str | None:
     """Get Upstox instrument key for a yfinance symbol."""
     _load_instruments()
     return _symbol_key_cache.get(yf_symbol)
+
+
+def get_nearest_futures_contract(underlying_symbol: str) -> dict | None:
+    """
+    Front-month (nearest-expiry) NSE_FO FUT contract for an equity
+    underlying, looked up locally from the instruments file this module
+    already downloads — NOT via Upstox's /instruments/search, which
+    doesn't actually filter by asset_type (see the FUT-collection
+    comment in _load_instruments() for why that broke arbitrage
+    coverage on names like M&M/LT/BSE/BEL/OIL).
+
+    `underlying_symbol` should be the bare NSE symbol, no ".NS" suffix
+    (e.g. "M&M", "RELIANCE"). Returns None if there's no active FUT
+    contract for it.
+    """
+    _load_instruments()
+    contracts = _futures_by_underlying.get(underlying_symbol.upper())
+    if not contracts:
+        return None
+
+    nearest = contracts[0]
+    expiry_str = ""
+    expiry_ms = nearest.get("expiry_ms")
+    if expiry_ms:
+        from datetime import datetime, timezone
+        expiry_str = datetime.fromtimestamp(expiry_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+
+    return {
+        "instrument_key": nearest["instrument_key"],
+        "expiry":         expiry_str,
+        "tradingsymbol":  nearest["tradingsymbol"],
+        "lot_size":       nearest.get("lot_size"),
+    }
 
 UPSTOX_SYMBOL_MAP = {
     # Indexes

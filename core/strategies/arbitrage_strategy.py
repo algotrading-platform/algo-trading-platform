@@ -132,10 +132,10 @@ def get_active_futures_contract(
 ) -> Optional[dict]:
     """
     Fetch active (front-month) futures contract.
-    Uses 3-level cache to avoid repeated API calls:
+    Uses 3-level cache to avoid repeated instruments-file downloads:
       L1: in-memory (fast, lost on restart)
       L2: PostgreSQL (persists across Container Job runs)
-      L3: Upstox API (rate-limited, last resort)
+      L3: local exact match against the instruments file (last resort)
     """
     global _futures_cache
 
@@ -155,66 +155,32 @@ def get_active_futures_contract(
         _futures_cache[symbol] = db_cached
         return db_cached
 
-    # L3: Upstox API (rate-limited)
-    _rate_limit()
-
+    # L3: local exact match against the full instruments file (replaces
+    # a remote /instruments/search call — Upstox's asset_type=FO param
+    # doesn't actually filter, it's a fuzzy top-10-result name search
+    # that silently dropped liquid names like M&M/LT/BSE/BEL/OIL, since
+    # their FUT contract just didn't rank in the top 10 matches. Found
+    # in the 2026-08-25 audit. get_nearest_futures_contract() does an
+    # exact underlying-symbol lookup against the same bulk instruments
+    # file data/providers/upstox_provider.py already downloads for
+    # equity-symbol mapping, so there's no extra API call or rate limit
+    # to worry about here.
     search_name = symbol.replace(".NS", "")
 
     try:
-        url     = f"{base_url}/instruments/search"
-        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-        # Upstox expects the parameter named 'query' (NOT 'q' — 'q' returns HTTP 400).
-        params  = {"query": search_name, "asset_type": "FO"}
+        from data.providers.upstox_provider import get_nearest_futures_contract
+        active = get_nearest_futures_contract(search_name)
 
-        response = requests.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=8,
-        )
-
-        if response.status_code == 429:
-            log.warning(f"Futures search rate limited for {symbol} — skipping")
-            return None
-
-        if response.status_code != 200:
-            log.warning(f"Futures search failed for {symbol}: {response.status_code}")
-            return None
-
-        data        = response.json()
-        instruments = data.get("data", [])
-
-        if not instruments:
-            log.warning(f"Futures search returned no instruments for {symbol}")
-            return None
-
-        # Filter to the FUTURES contract(s) for THIS underlying.
-        # Correct Upstox response field names (this is what was broken):
-        #   - instrument_type == "FUT"      (excludes EQ / CE / PE options)
-        #   - underlying_symbol == name     (exact match, not a substring)
-        #   - trading_symbol / lot_size      (note: underscores)
-        nse_futures = [
-            inst for inst in instruments
-            if str(inst.get("instrument_type", "")).upper() == "FUT"
-            and str(inst.get("underlying_symbol", "")).upper() == search_name.upper()
-        ]
-
-        if not nse_futures:
+        if not active:
             log.warning(
                 f"No FUT contract matched underlying '{search_name}' for {symbol}"
             )
             return None
 
-        # Front-month = nearest expiry
-        nse_futures.sort(key=lambda x: x.get("expiry", "9999-99-99"))
-        active = nse_futures[0]
-
-        # Store with the key names the rest of this module already expects
-        # (tradingsymbol / lot_size / expiry / instrument_key).
         result = {
             "instrument_key": active.get("instrument_key", ""),
             "expiry":         active.get("expiry", ""),
-            "tradingsymbol":  active.get("trading_symbol", ""),
+            "tradingsymbol":  active.get("tradingsymbol", ""),
             "lot_size":       active.get("lot_size") or get_lot_size(symbol),
             "date":           today,
         }
@@ -230,9 +196,6 @@ def get_active_futures_contract(
 
         return result
 
-    except requests.exceptions.Timeout:
-        log.warning(f"Futures search timed out for {symbol}")
-        return None
     except Exception as e:
         log.error(f"Futures contract lookup error for {symbol}: {e}")
         return None

@@ -660,6 +660,12 @@ class StrategyEngine:
                         "price":       price_val,
                         "data_source": data_source,
                         "alerted":     alert is not None,
+                        # Pattern-based strategies (3 Bar Play) expose their own
+                        # natural stop via indicators["Pattern_Stop"] -- _run_paper_trading()
+                        # reads it from here to pass as custom_stop. Without this key,
+                        # every pattern-strategy trade silently fell back to RMS's
+                        # generic 1%-of-entry stop (found 2026-08-25 audit).
+                        "indicators":  result.indicators,
                     })
 
                 return out

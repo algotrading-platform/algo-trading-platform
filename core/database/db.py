@@ -1263,8 +1263,19 @@ def get_paper_trades_for_report(
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         return df
     except Exception as e:
+        # Reporting functions deliberately do NOT swallow this into an
+        # empty DataFrame (unlike the live-scan DB functions above,
+        # where one symbol's DB hiccup shouldn't crash a 500-instrument
+        # scan). A report is one user-triggered, one-shot call — if the
+        # query genuinely failed (DB contention, timeout, pool
+        # exhaustion), silently returning "0 rows" is indistinguishable
+        # from a period that legitimately had no trades, which produces
+        # a partial/wrong report with no error shown (found in the
+        # 2026-08-25 audit — this is the likely cause of "report data
+        # not loading"). Re-raising lets dashboard.py's render_reports()
+        # existing try/except surface a real error instead.
         print(f"[DB] get_paper_trades_for_report error: {e}")
-        return pd.DataFrame()
+        raise
 
 
 def get_paper_summary_by_strategy(
@@ -1316,8 +1327,10 @@ def get_paper_summary_by_strategy(
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         return df
     except Exception as e:
+        # See get_paper_trades_for_report's comment above — reporting
+        # functions re-raise rather than mask a real failure as "0 rows".
         print(f"[DB] get_paper_summary_by_strategy error: {e}")
-        return pd.DataFrame()
+        raise
 
 
 def get_signals_for_report(
@@ -1357,8 +1370,10 @@ def get_signals_for_report(
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         return df
     except Exception as e:
+        # See get_paper_trades_for_report's comment above — reporting
+        # functions re-raise rather than mask a real failure as "0 rows".
         print(f"[DB] get_signals_for_report error: {e}")
-        return pd.DataFrame()
+        raise
 
 
 def get_signal_summary_by_strategy(
@@ -1396,8 +1411,10 @@ def get_signal_summary_by_strategy(
             return pd.DataFrame()
         return pd.DataFrame(rows)
     except Exception as e:
+        # See get_paper_trades_for_report's comment above — reporting
+        # functions re-raise rather than mask a real failure as "0 rows".
         print(f"[DB] get_signal_summary_by_strategy error: {e}")
-        return pd.DataFrame()
+        raise
 
 
 # ============================================================

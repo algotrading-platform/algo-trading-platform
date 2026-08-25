@@ -59,7 +59,11 @@ def get_nearest_level(price: float, df: pd.DataFrame) -> dict:
     Given current price, find nearest pivot support and resistance.
     Returns dict with nearest S and R levels and distances.
     """
-    if df.empty or "PP" not in df.columns:
+    if df.empty or "PP" not in df.columns or price <= 0:
+        # price <= 0 (bad/zero tick) used to reach the /price divisions
+        # below and raise an uncaught ZeroDivisionError straight out of
+        # RSIPivotStrategy.generate_signal, the only caller (found in
+        # the 2026-08-25 audit). Degrade to "no levels" instead.
         return {}
 
     latest = df.iloc[-1]
@@ -176,7 +180,15 @@ def add_volume_analysis(
     df = df.copy()
     if "Volume" not in df.columns:
         return df
-    df["VOL_MA"]    = df["Volume"].rolling(window=window).mean()
+    # shift(1) before rolling: the baseline average must be the `window`
+    # candles BEFORE the current one, not including it -- a self-inclusive
+    # baseline lets a genuine spike inflate its own average, understating
+    # VOL_RATIO for exactly the candle being evaluated (found in the
+    # 2026-08-25 audit: an exact 1.5x threshold breakout computed as 1.46x
+    # and was rejected as a false breakout). VolumeSpikeStrategy elsewhere
+    # in strategies.py already avoids this exact mistake with explicit
+    # baseline-window slicing; this makes the shared helper consistent.
+    df["VOL_MA"]    = df["Volume"].shift(1).rolling(window=window).mean()
     df["VOL_RATIO"] = df["Volume"] / df["VOL_MA"].replace(0, np.nan)
     df["VOL_SURGE"] = df["VOL_RATIO"] > 1.5
     return df

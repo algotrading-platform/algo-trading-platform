@@ -231,7 +231,12 @@ class RSIPivotStrategy(BaseStrategy):
         rsi_sell = prev2 > 75 and prev < prev2 and current < prev and current < 75
 
         def near_level(level_price: float) -> bool:
-            if level_price <= 0:
+            # `price` is the denominator here too -- a bad/zero tick (a
+            # real occurrence around broker data gaps) threw an unguarded
+            # ZeroDivisionError straight out of generate_signal, unlike
+            # every other strategy in this file, which degrades to HOLD
+            # on bad data instead (found in the 2026-08-25 audit).
+            if level_price <= 0 or price <= 0:
                 return False
             dist_pct = abs(price - level_price) / price * 100
             return dist_pct <= self.PROXIMITY_PCT
@@ -303,6 +308,16 @@ class BollingerStrategy(BaseStrategy):
         "Works best in ranging/consolidating markets."
     )
 
+    # Floor below which BB%B is numerically unreliable, not a real signal
+    # (found in the 2026-08-25 audit): BB%B = (price-lower)/(upper-lower),
+    # so once the band width collapses toward zero (flat/stale price —
+    # this codebase has a documented history of stale-feed bugs), a
+    # single-tick move can swing %B past 1.0 or below 0.0 with no real
+    # price movement behind it. Deliberately well below the 0.1% squeeze
+    # threshold used below, so genuine tight-but-real squeeze setups
+    # still fire — this only rejects near-zero/degenerate width.
+    MIN_BAND_WIDTH_PCT = 0.05
+
     def generate_signal(self, df: pd.DataFrame) -> SignalResult:
         if len(df) < 25:
             return SignalResult("HOLD", "WEAK", "Insufficient data", strategy=self.name)
@@ -333,6 +348,15 @@ class BollingerStrategy(BaseStrategy):
             "BB_WIDTH": round(bb_width, 2),
             "Price":    round(price, 2),
         }
+
+        if bb_width < self.MIN_BAND_WIDTH_PCT:
+            return SignalResult(
+                "HOLD", "WEAK",
+                f"Bands too collapsed for a reliable BB%B reading "
+                f"(width={round(bb_width,4)}% < {self.MIN_BAND_WIDTH_PCT}% floor) — "
+                f"likely a flat/stale price, not a real squeeze.",
+                indicators, self.name,
+            )
 
         # BUY: price was at/below lower band, now recovering
         if prev_bb_pct <= 0.05 and bb_pct > prev_bb_pct and price > prev_price:
@@ -480,6 +504,7 @@ class MACDStrategy(BaseStrategy):
 
         latest = df.iloc[-1]
         prev   = df.iloc[-2]
+        prev2  = df.iloc[-3] if len(df) >= 3 else None
 
         macd        = float(latest["MACD"])
         signal_line = float(latest["MACD_SIGNAL"])
@@ -487,6 +512,7 @@ class MACDStrategy(BaseStrategy):
         prev_macd   = float(prev["MACD"])
         prev_signal = float(prev["MACD_SIGNAL"])
         prev_hist   = float(prev["MACD_HIST"])
+        prev2_hist  = float(prev2["MACD_HIST"]) if prev2 is not None else None
         price       = float(latest["Close"])
 
         indicators = {
@@ -502,8 +528,17 @@ class MACDStrategy(BaseStrategy):
         bearish_cross = prev_macd >= prev_signal and macd < signal_line
 
         if bullish_cross:
-            # Extra strength if histogram is rising
-            hist_rising = hist > prev_hist
+            # "hist > prev_hist" is ALWAYS true immediately after ANY
+            # bullish crossover -- MACD_HIST is defined as MACD-SIGNAL,
+            # so prev_macd<=prev_signal implies prev_hist<=0, and
+            # macd>signal_line implies hist>0, making hist>prev_hist a
+            # tautology, not a confirmation (found in the 2026-08-25
+            # audit — proven with zero counterexamples across synthetic
+            # crossovers). Real confirmation instead checks whether the
+            # histogram was ALREADY trending up going into this candle
+            # (prev_hist > prev2_hist) — momentum building before the
+            # cross confirmed, not a restatement of the cross itself.
+            hist_rising = prev2_hist is not None and prev_hist > prev2_hist
             strength = "STRONG" if (macd < 0 and hist_rising) else "MODERATE"
             reason = (
                 f"MACD Bullish Crossover: MACD ({round(macd,4)}) crossed "
@@ -514,7 +549,8 @@ class MACDStrategy(BaseStrategy):
             return SignalResult("BUY", strength, reason, indicators, self.name)
 
         if bearish_cross:
-            hist_falling = hist < prev_hist
+            # Mirror of the bullish-side fix above — see that comment.
+            hist_falling = prev2_hist is not None and prev_hist < prev2_hist
             strength = "STRONG" if (macd > 0 and hist_falling) else "MODERATE"
             reason = (
                 f"MACD Bearish Crossover: MACD ({round(macd,4)}) crossed "

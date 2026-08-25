@@ -2296,7 +2296,15 @@ def render_reports():
     with r2:
         period_label = st.selectbox("Period", ["Daily", "Weekly", "Monthly", "Yearly", "Custom"], key="rpt_period")
     with r3:
-        strategy_choice = st.selectbox("Strategy", ALL_STRATEGY_NAMES, key="rpt_strategy")
+        # "Cash-Futures Arbitrage" never has paper_positions rows -- it's a
+        # paired spot+futures trade, scanned via a separate path
+        # (run_arbitrage_scan) that never calls _run_paper_trading(). Only
+        # offer it for Signal History, where it genuinely has data; showing
+        # it as a Paper Trading filter option is a guaranteed 0-trade
+        # dead end that reads as "report generation failed" (2026-08-25 audit).
+        strategy_options = ALL_STRATEGY_NAMES if report_type == "Signal History" \
+            else [s for s in ALL_STRATEGY_NAMES if s != "Cash-Futures Arbitrage"]
+        strategy_choice = st.selectbox("Strategy", strategy_options, key="rpt_strategy")
     with r4:
         timeframe_choice = st.selectbox("Timeframe", ["All Timeframes"] + list(TIMEFRAMES.keys()), key="rpt_timeframe")
 
@@ -2312,6 +2320,14 @@ def render_reports():
     timeframe_filter = None if timeframe_choice == "All Timeframes" else timeframe_choice
     period_key = period_label.lower()
 
+    # Signature of everything that would change the generated file --
+    # used below to detect "filters changed since last Generate click"
+    # (found 2026-08-25 audit: changing a filter without re-clicking
+    # Generate silently kept serving the PREVIOUS selection's file via
+    # Download, with no indication it was stale).
+    current_filters = (report_type, period_key, strategy_filter, timeframe_filter,
+                       str(custom_start), str(custom_end))
+
     if st.button("Generate Report", type="primary", key="rpt_generate"):
         try:
             builder = build_paper_trading_report if report_type == "Paper Trading" else build_signal_history_report
@@ -2322,6 +2338,7 @@ def render_reports():
             st.session_state["rpt_file_bytes"] = file_bytes
             st.session_state["rpt_filename"]   = filename
             st.session_state["rpt_caption"]    = stats_caption
+            st.session_state["rpt_filters"]    = current_filters
         except ValueError as e:
             st.warning(str(e))
             st.session_state.pop("rpt_file_bytes", None)
@@ -2330,14 +2347,17 @@ def render_reports():
             st.session_state.pop("rpt_file_bytes", None)
 
     if st.session_state.get("rpt_file_bytes"):
-        st.caption(st.session_state["rpt_caption"])
-        st.download_button(
-            "⬇ Download Excel Report",
-            data=st.session_state["rpt_file_bytes"],
-            file_name=st.session_state["rpt_filename"],
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="rpt_download",
-        )
+        if st.session_state.get("rpt_filters") != current_filters:
+            st.info("Filters changed since this report was generated — click **Generate Report** to refresh it.")
+        else:
+            st.caption(st.session_state["rpt_caption"])
+            st.download_button(
+                "⬇ Download Excel Report",
+                data=st.session_state["rpt_file_bytes"],
+                file_name=st.session_state["rpt_filename"],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="rpt_download",
+            )
 
 
 with tab_reports:
