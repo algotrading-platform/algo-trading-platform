@@ -983,41 +983,99 @@ STRATEGIES["Experiment 3 Bar Play"] = ThreeBarPlayStrategy()
 STRATEGY_NAMES = list(STRATEGIES.keys())
 
 # ============================================================
-# 3 BAR PLAY (v2) — volatility-contraction breakout
+# 3 BAR PLAY (v2) — flag/pennant continuation
 #
-# Distinct from the (now "Experiment 3 Bar Play") pullback-
-# continuation pattern above. This is a 3-bar volatility "coil":
-#   Bar 1, Bar 2, Bar 3 — each bar's range <= the previous bar's
-#     range (a contraction/squeeze, NR3-style).
-#   Trigger — next bar breaks above the 3-bar range's high (long)
-#     or below its low (short), confirmed by volume on the
-#     breakout bar itself (not just the coil bars).
-# Stop is the opposite side of the (naturally tight) 3-bar range.
-# Target is a fixed reward multiple (1.5R — tighter than the 2R
-# used by the continuation pattern, since a breakout-from-
-# compression setup is a higher-probability/lower-magnitude trade
-# than a continuation).
+# REPLACES the earlier volatility-contraction ("coil") reading of
+# "3 Bar Play" — that was a different pattern family (NR3-style
+# squeeze) that had ended up under this name by mistake. This is
+# the pattern Jwala actually walked through live (call recording,
+# Aug 25) using three chart references (ETHUSD, IDEA, AAPL) as
+# examples — a classic bull/bear flag:
+#
+#   Bar 1 (explosive) — a big, wide-range directional candle. The
+#     flagpole.
+#   Bar 2, optionally Bar 3 (consolidation) — one OR two small
+#     candles that hover near bar 1's head: must not retrace deep
+#     back into bar 1 (RETRACE_LIMIT of bar 1's range, the low
+#     side), and must not already push far past bar 1's high
+#     either (OVERSHOOT_LIMIT — "a few points above at most"; if
+#     it already broke out convincingly here, it isn't a pause).
+#     Jwala: "if this candle had become a big red candle, it would
+#     have moved downwards" — a deep give-back invalidates the
+#     pattern, it isn't just a bigger discount entry.
+#   Trigger — the very next candle (3rd or 4th, never later —
+#     "not in 5th or 6th candle") crosses BAR 1's high (long) or
+#     low (short). That's the key correction vs. the continuation
+#     logic in ThreeBarPlayStrategy above, which triggers off the
+#     pullback bar's extreme instead of bar 1's.
+#
+# Stop: the far side of the consolidation bar(s) — judgment call
+# (not stated on the call), consistent with how flags are stopped
+# out in practice (below/above the base of the flag, not the full
+# flagpole). Target: Jwala's own words — "near to this length, this
+# length of the first candle" — i.e. bar 1's range projected from
+# the breakout (a measured-move flagpole target), exposed here as
+# "Pattern_Target" for reference. Per strategy_engine.py's
+# _run_paper_trading(), the REAL stop/target RMS uses come from
+# rms.py's evaluate(custom_stop=...), which takes this pattern's
+# stop directly but always recomputes target as reward_ratio x the
+# ACTUAL stop distance (see RISK_REWARD_BY_STRATEGY in rms.py) — so
+# "Pattern_Target" below is informational only, same convention as
+# the Experiment strategy.
+#
+# Volume: this call didn't restate a volume rule, but Jwala's
+# earlier written spec (used for the Experiment strategy) requires
+# the explosive bar's volume above its 20-period average — kept
+# here for consistency across his own "3 bar play" family. Added on
+# top, per how this pattern is traded professionally: consolidation
+# volume should be lower than the explosive bar's (a real pause
+# shows volume drying up, not fresh selling/buying) — this is the
+# standard "flag" tell that distinguishes a pause from a reversal.
 # ============================================================
 
-class ThreeBarContractionStrategy(BaseStrategy):
+class ThreeBarFlagStrategy(BaseStrategy):
     """
-    3-bar volatility-contraction breakout: three consecutive bars of
-    non-increasing range (a coil), entry on the following bar
-    breaking the coil's high/low, confirmed by above-average volume
-    on the breakout bar. Stop at the opposite side of the coil range,
-    target at REWARD_MULTIPLE x risk.
+    Flag/pennant continuation: an explosive bar (the flagpole)
+    followed by 1-2 small consolidation bars hovering near its high
+    (long) or low (short), triggered when the next bar breaks the
+    EXPLOSIVE bar's own extreme (not the consolidation bar's).
+    Stop is the far side of the consolidation; target is a measured
+    move off the explosive bar's range.
     """
     name = "3 Bar Play"
     description = (
-        "Detects a 3-bar volatility contraction (each bar's range <= "
-        "the last) followed by a volume-confirmed breakout beyond the "
-        "coil's high/low. A tighter, higher-probability alternative to "
-        "the continuation-style 'Experiment 3 Bar Play'."
+        "Detects an explosive (flagpole) candle, a 1-2 candle "
+        "consolidation hovering near its high/low, and a breakout of "
+        "the explosive candle's own extreme within the next 1-2 "
+        "candles — a flag/pennant continuation, per Jwala's Aug 25 "
+        "walkthrough."
     )
 
-    VOLUME_LOOKBACK   = 20   # 20-period average for the breakout bar's volume filter
-    REWARD_MULTIPLE   = 1.5  # tighter target than the continuation pattern's 2.0
+    VOLUME_LOOKBACK    = 20    # 20-period average, per spec
+    RETRACE_LIMIT      = 0.5   # consolidation low can't dig >50% back into bar1's range
+    OVERSHOOT_LIMIT    = 0.1   # consolidation high can't clear bar1's high by >10% of bar1's range
+    REWARD_MULTIPLE    = 3.0   # approximates a flagpole-length target given a typically-shallow
+                               # consolidation depth (see module note — RMS recomputes the real
+                               # target from the actual stop distance, this doesn't hit bar1's
+                               # exact range every time)
     STRONG_VOLUME_MULTIPLE = 2.0
+
+    def _consolidation_ok(self, bar1_high, bar1_low, bar1_range, bar1_volume, bars, bullish: bool):
+        """All of `bars` must hover near bar1's head (bullish) or floor (bearish)."""
+        for b in bars:
+            if float(b["Volume"]) > bar1_volume:
+                return False  # a real pause shows volume drying up, not fresh participation
+            if bullish:
+                if (bar1_high - b["Low"]) > self.RETRACE_LIMIT * bar1_range:
+                    return False
+                if (b["High"] - bar1_high) > self.OVERSHOOT_LIMIT * bar1_range:
+                    return False
+            else:
+                if (b["High"] - bar1_low) > self.RETRACE_LIMIT * bar1_range:
+                    return False
+                if (bar1_low - b["Low"]) > self.OVERSHOOT_LIMIT * bar1_range:
+                    return False
+        return True
 
     def generate_signal(self, df: pd.DataFrame) -> SignalResult:
         need = self.VOLUME_LOOKBACK + 4
@@ -1034,89 +1092,82 @@ class ThreeBarContractionStrategy(BaseStrategy):
             if len(df) < need:
                 return SignalResult("HOLD", "WEAK", "Insufficient volume data", strategy=self.name)
 
-            bar1 = df.iloc[-4]   # coil start
-            bar2 = df.iloc[-3]   # coil middle
-            bar3 = df.iloc[-2]   # coil end
-            brk  = df.iloc[-1]   # breakout bar
+            brk = df.iloc[-1]  # breakout candidate is always the latest candle
 
-            range1 = float(bar1["High"] - bar1["Low"])
-            range2 = float(bar2["High"] - bar2["Low"])
-            range3 = float(bar3["High"] - bar3["Low"])
-            if range1 <= 0 or range2 <= 0 or range3 <= 0:
-                return SignalResult("HOLD", "WEAK", "Zero-range bar in coil", strategy=self.name)
+            # Try the tighter (3-bar: 1 consolidation candle) reading first,
+            # then the 4-bar (2 consolidation candles) reading — "3rd or 4th
+            # candle at max", never further out.
+            for n_consol, bar1_idx in ((1, -3), (2, -4)):
+                bar1 = df.iloc[bar1_idx]
+                consol = [df.iloc[i] for i in range(bar1_idx + 1, -1)]
 
-            is_coil = range2 <= range1 and range3 <= range2
-            if not is_coil:
-                return SignalResult("HOLD", "WEAK", "No 3-bar contraction on the latest bars", strategy=self.name)
+                bar1_range = float(bar1["High"] - bar1["Low"])
+                if bar1_range <= 0:
+                    continue
 
-            coil_high = max(bar1["High"], bar2["High"], bar3["High"])
-            coil_low  = min(bar1["Low"],  bar2["Low"],  bar3["Low"])
-            coil_range = coil_high - coil_low
-            if coil_range <= 0:
-                return SignalResult("HOLD", "WEAK", "Zero-range coil", strategy=self.name)
+                baseline_window = df["Volume"].iloc[bar1_idx - self.VOLUME_LOOKBACK: bar1_idx]
+                if len(baseline_window) < self.VOLUME_LOOKBACK:
+                    continue
+                avg_volume  = float(baseline_window.mean())
+                bar1_volume = float(bar1["Volume"])
+                volume_ratio = bar1_volume / avg_volume if avg_volume > 0 else 0.0
+                if volume_ratio <= 1.0:
+                    continue  # explosive bar must show above-average volume
 
-            # Volume filter on the BREAKOUT bar (not the coil bars —
-            # a genuine breakout should show a volume pickup relative
-            # to the quiet coil that preceded it).
-            baseline_window = df["Volume"].iloc[-(self.VOLUME_LOOKBACK + 4):-4]
-            if len(baseline_window) < self.VOLUME_LOOKBACK:
-                return SignalResult("HOLD", "WEAK", "Insufficient volume baseline", strategy=self.name)
+                indicators = {
+                    "Bar1_Range":    round(bar1_range, 2),
+                    "Bar1_Volume":   int(bar1_volume),
+                    "Avg_Volume_20": int(avg_volume),
+                    "Volume_Ratio":  round(volume_ratio, 2),
+                    "Consolidation_Bars": n_consol,
+                }
 
-            avg_volume    = float(baseline_window.mean())
-            breakout_volume = float(brk["Volume"])
-            volume_ratio  = breakout_volume / avg_volume if avg_volume > 0 else 0.0
+                is_bullish_ignite = bar1["Close"] > bar1["Open"]
+                is_bearish_ignite = bar1["Close"] < bar1["Open"]
+                bar1_high, bar1_low = float(bar1["High"]), float(bar1["Low"])
 
-            indicators = {
-                "Coil_Range":    round(coil_range, 2),
-                "Coil_High":     round(float(coil_high), 2),
-                "Coil_Low":      round(float(coil_low), 2),
-                "Breakout_Volume": int(breakout_volume),
-                "Avg_Volume_20": int(avg_volume),
-                "Volume_Ratio":  round(volume_ratio, 2),
-            }
+                if is_bullish_ignite and self._consolidation_ok(bar1_high, bar1_low, bar1_range, bar1_volume, consol, bullish=True):
+                    if brk["High"] > bar1_high:
+                        entry = bar1_high
+                        stop  = min(float(b["Low"]) for b in consol)
+                        risk  = abs(entry - stop)
+                        if risk <= 0:
+                            continue
+                        target = entry + self.REWARD_MULTIPLE * risk
+                        strength = "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE"
+                        indicators.update({"Pattern_Entry": round(entry, 2), "Pattern_Stop": round(stop, 2),
+                                            "Pattern_Target": round(target, 2)})
+                        reason = (
+                            f"3-Bar Play LONG: explosive candle at {volume_ratio:.1f}x avg volume, "
+                            f"{n_consol}-candle consolidation held near its high, breakout above "
+                            f"explosive candle's high (₹{bar1_high:.2f})."
+                        )
+                        return SignalResult("BUY", strength, reason, indicators, self.name)
 
-            if volume_ratio <= 1.0:
-                return SignalResult(
-                    "HOLD", "WEAK",
-                    f"Breakout bar volume ({int(breakout_volume):,}) not above its 20-period "
-                    f"average ({int(avg_volume):,}) — volume filter not met",
-                    indicators, self.name,
-                )
+                if is_bearish_ignite and self._consolidation_ok(bar1_high, bar1_low, bar1_range, bar1_volume, consol, bullish=False):
+                    if brk["Low"] < bar1_low:
+                        entry = bar1_low
+                        stop  = max(float(b["High"]) for b in consol)
+                        risk  = abs(entry - stop)
+                        if risk <= 0:
+                            continue
+                        target = entry - self.REWARD_MULTIPLE * risk
+                        strength = "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE"
+                        indicators.update({"Pattern_Entry": round(entry, 2), "Pattern_Stop": round(stop, 2),
+                                            "Pattern_Target": round(target, 2)})
+                        reason = (
+                            f"3-Bar Play SHORT: explosive candle at {volume_ratio:.1f}x avg volume, "
+                            f"{n_consol}-candle consolidation held near its low, breakout below "
+                            f"explosive candle's low (₹{bar1_low:.2f})."
+                        )
+                        return SignalResult("SELL", strength, reason, indicators, self.name)
 
-            if brk["High"] > coil_high:
-                entry, stop = float(coil_high), float(coil_low)
-                risk = abs(entry - stop)
-                target = entry + self.REWARD_MULTIPLE * risk
-                strength = "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE"
-                indicators.update({"Pattern_Entry": round(entry, 2), "Pattern_Stop": round(stop, 2),
-                                    "Pattern_Target": round(target, 2)})
-                reason = (
-                    f"3-Bar Play LONG: 3-bar contraction (ranges {range1:.2f} -> {range2:.2f} -> "
-                    f"{range3:.2f}), breakout above coil high (₹{coil_high:.2f}) at "
-                    f"{volume_ratio:.1f}x avg volume."
-                )
-                return SignalResult("BUY", strength, reason, indicators, self.name)
-
-            if brk["Low"] < coil_low:
-                entry, stop = float(coil_low), float(coil_high)
-                risk = abs(entry - stop)
-                target = entry - self.REWARD_MULTIPLE * risk
-                strength = "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE"
-                indicators.update({"Pattern_Entry": round(entry, 2), "Pattern_Stop": round(stop, 2),
-                                    "Pattern_Target": round(target, 2)})
-                reason = (
-                    f"3-Bar Play SHORT: 3-bar contraction (ranges {range1:.2f} -> {range2:.2f} -> "
-                    f"{range3:.2f}), breakout below coil low (₹{coil_low:.2f}) at "
-                    f"{volume_ratio:.1f}x avg volume."
-                )
-                return SignalResult("SELL", strength, reason, indicators, self.name)
-
-            return SignalResult("HOLD", "WEAK", "Coil formed but no breakout on the latest bar",
-                                 indicators, self.name)
+            return SignalResult("HOLD", "WEAK", "No qualifying 3-bar flag pattern on the latest bars",
+                                 strategy=self.name)
 
         except Exception as e:
             return SignalResult("HOLD", "WEAK", f"3-Bar Play calculation error: {e}", strategy=self.name)
 
 
-STRATEGIES["3 Bar Play"] = ThreeBarContractionStrategy()
+STRATEGIES["3 Bar Play"] = ThreeBarFlagStrategy()
 STRATEGY_NAMES = list(STRATEGIES.keys())

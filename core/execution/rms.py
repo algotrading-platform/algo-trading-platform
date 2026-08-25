@@ -79,10 +79,15 @@ class RMSConfig:
                                          # (reward_multiple=2); spec said "2x-3x,
                                          # configurable" with no single number chosen —
                                          # this is the conservative end, easy to bump.
-        "3 Bar Play":              1.5,  # new volatility-contraction strategy —
-                                         # tighter target than the continuation
-                                         # pattern above, fits a breakout-from-
-                                         # compression setup.
+        "3 Bar Play":              3.0,  # flag/pennant continuation (Aug 25 rebuild) —
+                                         # stop is the consolidation's near edge, which
+                                         # sits close to the flagpole (bar1) high/low, so
+                                         # a wide multiple is needed to approximate Jwala's
+                                         # actual target ("length of the first candle",
+                                         # i.e. bar1's own range) off that tight stop
+                                         # distance. Approximation, not exact — see
+                                         # ThreeBarFlagStrategy's module note in
+                                         # strategies.py.
     }
 
     # Grade-based position sizing (Jwala, Jul 14, 4:19-5:22): "If the
