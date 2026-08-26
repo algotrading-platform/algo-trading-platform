@@ -90,7 +90,17 @@ def _run_paper_trading(provider, results):
             # indicators — generic extraction, not gated on strategy
             # name, so any future pattern strategy gets the same
             # treatment automatically just by including this key.
-            custom_stop = (r.get("indicators") or {}).get("Pattern_Stop")
+            # "Pattern_Target_Exact" (Aug 26) is the same idea for an
+            # exact target level, e.g. 3 Bar Play's 70%-of-flagpole
+            # target. Deliberately a DIFFERENT key from the pre-existing
+            # "Pattern_Target" that Experiment 3 Bar Play also sets —
+            # that one is explicitly documented as reference/display
+            # only (see ThreeBarPlayStrategy's docstring), and must stay
+            # untouched rather than suddenly become enforced just
+            # because this generic extraction exists.
+            indicators    = r.get("indicators") or {}
+            custom_stop   = indicators.get("Pattern_Stop")
+            custom_target = indicators.get("Pattern_Target_Exact")
 
             outcome = pt.on_signal(
                 symbol=r["symbol"],
@@ -100,6 +110,7 @@ def _run_paper_trading(provider, results):
                 timeframe=r.get("timeframe", ""),
                 strength=r.get("strength"),  # drives unit-based sizing in RMS
                 custom_stop=custom_stop,
+                custom_target=custom_target,
             )
             action = outcome.get("action")
             if action == "opened":

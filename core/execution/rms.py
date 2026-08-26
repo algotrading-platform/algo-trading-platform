@@ -237,6 +237,20 @@ class RMS:
                                          # supplies a custom_stop gets this treatment, not just
                                          # "3 Bar Play" specifically — keeps this reusable for
                                          # whatever pattern-based strategy comes next.
+        custom_target:    float = None, # strategy-supplied target level (Jwala, Aug 26: 3 Bar
+                                         # Play's target should be an exact 70% of the flagpole
+                                         # candle's range, not a generic reward-ratio multiple of
+                                         # risk — the two don't coincide, since the ratio between
+                                         # bar1's range and the actual stop distance varies per
+                                         # trade). Used as an absolute price level exactly like
+                                         # custom_stop above — NOT re-derived from entry_price —
+                                         # since it's computed by the strategy from bar1's real
+                                         # prices, independent of the exact fill price, the same
+                                         # way custom_stop's consolidation-extreme level is.
+                                         # When omitted, target still falls back to
+                                         # reward_ratio × stop_dist as before — fully backward
+                                         # compatible for strategies that don't supply one.
+                                         # Generic, same reuse philosophy as custom_stop.
     ) -> RMSDecision:
 
         self._roll_day_if_needed()
@@ -268,25 +282,36 @@ class RMS:
 
         if custom_stop is not None:
             # Strategy-native stop (e.g. 3 Bar Play's pullback-bar
-            # extreme) — use it directly instead of the %-based calc,
-            # but still recompute target from the ACTUAL entry price
-            # so the reward ratio stays meaningful (see param note above).
+            # extreme) — use it directly instead of the %-based calc.
             stop_loss = round(float(custom_stop), 2)
             stop_dist = abs(entry_price - stop_loss)
             if stop_dist <= 0:
                 return reject(f"Invalid custom stop (no distance from entry): {custom_stop}")
-            if side == "BUY":
-                target = round(entry_price + stop_dist * reward_ratio, 2)
-            else:  # SELL (short)
-                target = round(entry_price - stop_dist * reward_ratio, 2)
+            if custom_target is None:
+                # No exact target supplied — fall back to reward_ratio
+                # × the ACTUAL distance between entry_price and
+                # custom_stop, so risk:reward stays meaningful relative
+                # to whatever price the trade actually fills at, not
+                # the strategy's own theoretical entry (which may
+                # differ slightly — see custom_stop's param note above).
+                if side == "BUY":
+                    target = round(entry_price + stop_dist * reward_ratio, 2)
+                else:  # SELL (short)
+                    target = round(entry_price - stop_dist * reward_ratio, 2)
         else:
             stop_dist = entry_price * self.cfg.STOP_LOSS_PCT
             if side == "BUY":
                 stop_loss = round(entry_price - stop_dist, 2)
-                target    = round(entry_price + stop_dist * reward_ratio, 2)
             else:  # SELL (short)
                 stop_loss = round(entry_price + stop_dist, 2)
-                target    = round(entry_price - stop_dist * reward_ratio, 2)
+            if custom_target is None:
+                if side == "BUY":
+                    target = round(entry_price + stop_dist * reward_ratio, 2)
+                else:  # SELL (short)
+                    target = round(entry_price - stop_dist * reward_ratio, 2)
+
+        if custom_target is not None:
+            target = round(float(custom_target), 2)
 
         # 4. Position size — CAPITAL-BASED (Jwala, Jul 9), now scaled by
         # signal grade (Jwala, Jul 14): base unit = this strategy's own
@@ -328,7 +353,8 @@ class RMS:
                 f"₹{desired_capital:,.0f}, but only ₹{available:,.0f} available)"
             )
 
-        actual_risk = round(quantity * stop_dist, 2)
+        actual_risk   = round(quantity * stop_dist, 2)
+        actual_reward = round(quantity * abs(target - entry_price), 2)
 
         return RMSDecision(
             approved=True,
@@ -347,7 +373,10 @@ class RMS:
                 "capital_used":      round(quantity * entry_price, 2),
                 "per_share_risk":    round(stop_dist, 2),
                 "position_value":    round(quantity * entry_price, 2),
-                "reward_if_target":  round(quantity * stop_dist * reward_ratio, 2),
+                # Computed from the ACTUAL target (not blindly stop_dist ×
+                # reward_ratio) since custom_target can override the
+                # ratio-based target entirely — see param note above.
+                "reward_if_target":  actual_reward,
                 "reward_ratio":      reward_ratio,
                 "daily_pnl_before":  round(self._realized_pnl_today, 2),
             },

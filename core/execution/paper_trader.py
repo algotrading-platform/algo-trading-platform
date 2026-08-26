@@ -164,6 +164,11 @@ class PaperTrader:
                                     # straight through to RMS.evaluate(); see
                                     # that function's docstring for how target
                                     # gets recomputed around it.
+        custom_target: float = None,  # strategy-native target level (Jwala,
+                                    # Aug 26: 3 Bar Play's target is an exact
+                                    # 70% of the flagpole candle's range, not
+                                    # a reward-ratio multiple of risk) —
+                                    # passed straight through to RMS.evaluate().
     ) -> dict:
         """
         Full pipeline for one signal. Returns a result dict describing
@@ -223,6 +228,7 @@ class PaperTrader:
             strategy=strategy, strength=strength,
             capital_deployed=capital_deployed,
             custom_stop=custom_stop,
+            custom_target=custom_target,
         )
         if not decision.approved:
             return {"action": "reject", "reason": f"RMS: {decision.reason}"}

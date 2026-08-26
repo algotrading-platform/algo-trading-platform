@@ -12,7 +12,7 @@
 import pandas as pd
 import numpy as np
 from ta.momentum import RSIIndicator as TA_RSI
-from ta.volatility import BollingerBands as TA_BB
+from ta.volatility import BollingerBands as TA_BB, AverageTrueRange as TA_ATR
 from ta.trend import MACD as TA_MACD, EMAIndicator as TA_EMA
 
 
@@ -25,6 +25,23 @@ def add_rsi(df: pd.DataFrame, window: int = 14) -> pd.DataFrame:
     df = df.copy()
     indicator = TA_RSI(close=df["Close"], window=window)
     df["RSI"] = indicator.rsi()
+    return df
+
+
+# ============================================================
+# ATR (Average True Range) — Jwala, Aug call: "a measure of how
+# much a stock normally moves... one of the most useful indicators
+# for setting stop losses." Standard 14-period window (matching
+# his own RSI-14 analogy on the same call, and this codebase's
+# existing RSI(14) convention — he floated 15/30 earlier but didn't
+# land on either before naming the standard ATR indicator itself).
+# ============================================================
+
+def add_atr(df: pd.DataFrame, window: int = 14) -> pd.DataFrame:
+    """Add ATR column to DataFrame (Wilder's Average True Range)."""
+    df = df.copy()
+    indicator = TA_ATR(high=df["High"], low=df["Low"], close=df["Close"], window=window)
+    df["ATR"] = indicator.average_true_range()
     return df
 
 
