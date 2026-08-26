@@ -13,6 +13,12 @@
 #   - Reduces Upstox API calls from 2000+/day to ~1000/day
 #   - Prevents 429 rate limiting on futures search API
 #   - Jobs complete cleanly without hanging
+#
+# CADENCE FLIP (2026-08-26, Jwala): the above was superseded — this was
+# already drifted to a 30-min cadence by the time of this change, and
+# is now reversed again. Arbitrage runs every 5 minutes; every other
+# strategy (previously every timeframe) now runs ONLY hourly. See
+# HOURLY_STRATEGIES / run_arbitrage_scan() below for the current rule.
 # ============================================================
 
 import os
@@ -185,41 +191,34 @@ fno_instruments  = [i for i in instruments if i["symbol"] in _fno_symbols]
 # Arbitrage engine — always fixed
 _arb_engine = StrategyEngine("Cash-Futures Arbitrage")
 
-# ── Parallel strategies that run on EVERY scan ───────────────
-# RSI Reversal + Volume Spike both run on the same single fetch
-# per instrument (Volume Spike is stock-only, enforced in engine).
-# Add more names here to run them in parallel too.
-# ALWAYS_ON_STRATEGIES run on every timeframe, unchanged from before.
-# 3 Bar Play is restricted to the higher timeframes only (Om, Jul 28:
-# "run 3barplay only on 1 hour/1day/1week/1month and rest volume and
-# RSI + MA remain same") — the pattern needs a wide-range igniting
-# candle + a real pullback, which is a lot less meaningful to detect
-# on 5m/15m noise than on slower charts. RSI + MA and Volume Spike are
-# untouched, still scan every timeframe exactly as before.
-#
-# "3 Bar Play" was relabeled "Experiment 3 Bar Play" (unchanged logic,
-# client feedback: unproven calibration, keep running but mark
-# experimental) and the freed-up "3 Bar Play" name now belongs to a
-# new, distinct volatility-contraction strategy. Both share the same
-# higher-timeframe-only gating as the original for now.
-ALWAYS_ON_STRATEGIES     = ["RSI + MA", "Volume Spike"]
-THREE_BAR_PLAY_TIMEFRAMES = ["1 Hour", "1 Day", "1 Week", "1 Month"]
+# ── Cadence (Jwala, Aug 26): exactly two cadences now — Cash-Futures
+# Arbitrage scans every 5 minutes (matching the Container Job's own
+# trigger; see run_arbitrage_scan()'s "tf_name != '5 Minutes'" gate
+# below), and EVERY OTHER strategy (RSI + MA, Volume Spike, both 3 Bar
+# Play variants) scans ONLY on the 1 Hour pass. Previously RSI + MA/
+# Volume Spike ran on every timeframe (5m/15m/1h/1d/1w/1mo) and 3 Bar
+# Play additionally ran on 1 Day/Week/Month (Om, Jul 28) — this
+# collapses all of that to a single hourly cadence for signals AND
+# paper trading. 5 Minutes/15 Minutes/1 Day/1 Week/1 Month no longer
+# run ANY non-arbitrage strategy; run_scan() still loops every
+# configured timeframe each cycle (run_single_scan.py), it's just a
+# no-op for those now via _strategies_for_timeframe() returning [].
+ALWAYS_ON_STRATEGIES  = ["RSI + MA", "Volume Spike"]
+HOURLY_STRATEGIES     = ALWAYS_ON_STRATEGIES + ["Experiment 3 Bar Play", "3 Bar Play"]
 
 # Kept for anything else that still reads PARALLEL_STRATEGIES directly
 # (e.g. the startup banner log below) — represents the FULL possible
 # set, not what runs on every single timeframe. Use
 # _strategies_for_timeframe(tf_name) wherever the actual per-scan
 # strategy list is needed.
-PARALLEL_STRATEGIES = ALWAYS_ON_STRATEGIES + ["Experiment 3 Bar Play", "3 Bar Play"]
+PARALLEL_STRATEGIES = HOURLY_STRATEGIES
 
 
 def _strategies_for_timeframe(tf_name: str) -> list:
     """Which strategies actually run on a given timeframe's scan."""
-    strategies = list(ALWAYS_ON_STRATEGIES)
-    if tf_name in THREE_BAR_PLAY_TIMEFRAMES:
-        strategies.append("Experiment 3 Bar Play")
-        strategies.append("3 Bar Play")
-    return strategies
+    if tf_name == "1 Hour":
+        return list(HOURLY_STRATEGIES)
+    return []
 
 # A single engine drives the multi-strategy scan. The label passed
 # here is cosmetic — run_multi_scan() takes the real strategy list.
@@ -362,11 +361,15 @@ def run_primary_scan(tf_name: str, now: datetime = None) -> None:
     """
     Parallel multi-strategy scan on all instruments.
 
-    Runs RSI + MA and Volume Spike on every timeframe; 3 Bar Play only
-    on 1 Hour/1 Day/1 Week/1 Month (see THREE_BAR_PLAY_TIMEFRAMES) —
-    on a SINGLE data fetch per instrument. Each signal is logged and
-    alerted tagged with its own strategy name, so the dashboard 'All
-    Strategies' view and per-strategy filter both work.
+    Runs RSI + MA, Volume Spike, and both 3 Bar Play variants — but
+    ONLY on the "1 Hour" pass (Jwala, Aug 26 — see HOURLY_STRATEGIES
+    above). Every other timeframe's _strategies_for_timeframe() returns
+    [], so this becomes a no-op call for 5 Minutes/15 Minutes/1 Day/
+    1 Week/1 Month; run_multi_scan() exits early on an empty strategy
+    list rather than fetching data for nothing. On the 1 Hour pass,
+    everything runs on a SINGLE data fetch per instrument. Each signal
+    is logged and alerted tagged with its own strategy name, so the
+    dashboard 'All Strategies' view and per-strategy filter both work.
 
     The dashboard strategy dropdown now only changes the VIEW (filter)
     — it no longer switches which strategies are scanned. All parallel
@@ -407,34 +410,30 @@ def run_arbitrage_scan(tf_name: str, now: datetime = None) -> None:
     """
     Arbitrage scan on F&O stocks only.
 
-    Cadence: every 30 minutes (per Jwala — arbitrage spread moves
-    slowly, and the futures-search API is the rate-limit-sensitive one).
+    Cadence (Jwala, Aug 26): every 5 minutes, matching the Container
+    Job's own trigger — replaces the previous 30-minute-gated cadence
+    piggybacked on the "15 Minutes" pass. Every other strategy moved
+    the OPPOSITE direction on this same call (from every-timeframe down
+    to hourly-only, see HOURLY_STRATEGIES above); arbitrage is the one
+    exception that runs MORE often, not less, since spread opportunities
+    can close quickly and Jwala wanted it checked every cycle.
 
-    Implementation: only runs on the "15 Minutes" timeframe pass, and
-    only when the current IST minute is at the top/bottom of the hour
-    (minute < 5 or 30–34). With the Container Job firing every 5 min,
-    this yields ~2 arbitrage scans/hour instead of 4 (was 15-min).
+    Implementation: piggybacks on the "5 Minutes" pass, which
+    _is_scan_due() already fires on every single Job execution — no
+    additional internal cadence gate needed (the old 30-minute gate here
+    is gone; "5 Minutes" being due IS the cadence now).
 
     Futures contracts are cached in PostgreSQL (fetched once/day), so
     only the futures PRICE is fetched each run — keeps API calls low.
 
-    `now`: shared snapshot from run_scan() — see _is_scan_due(). Reading
-    a fresh datetime.now(IST) here (after the primary scan for this
-    same timeframe has already run) is exactly the drift bug that
-    starved "15 Minutes"/"1 Hour" — this cadence check is just as
-    exact-minute-sensitive, so it needs the same shared snapshot.
+    `now`: shared snapshot from run_scan() — see _is_scan_due().
     """
-    # Only piggyback on the 15-minute pass (avoids running on every tf)
-    if tf_name != "15 Minutes":
+    # Only piggyback on the 5-minute pass — that's the new cadence itself.
+    if tf_name != "5 Minutes":
         return
 
     if now is None:
         now = datetime.now(IST)
-
-    # 30-minute cadence: fire near :00 and :30 only
-    minute = now.minute
-    if not (minute < 5 or 30 <= minute <= 34):
-        return
 
     if not is_market_hours():
         return
@@ -447,7 +446,7 @@ def run_arbitrage_scan(tf_name: str, now: datetime = None) -> None:
     interval = TIMEFRAMES[tf_name]
     period   = PERIOD_MAP[tf_name]
 
-    log.info(f"Running arbitrage scan (30-min cadence) — {len(fno_instruments)} F&O stocks")
+    log.info(f"Running arbitrage scan (5-min cadence) — {len(fno_instruments)} F&O stocks")
 
     _arb_engine.run_scan(
         provider=provider,
@@ -460,7 +459,11 @@ def run_arbitrage_scan(tf_name: str, now: datetime = None) -> None:
 
 def run_scan(tf_name: str, mode: str = "all", now: datetime = None) -> None:
     """
-    Runs primary strategy then Arbitrage (hourly only).
+    Runs the primary multi-strategy scan (1 Hour only, see
+    HOURLY_STRATEGIES) then Arbitrage (5 Minutes only, see
+    run_arbitrage_scan) — inverted cadences, both gated internally by
+    tf_name so calling this for every configured timeframe each cycle
+    is a no-op except on the one pass each is actually due on.
     Updates LAST_SCAN_TIME after every scan.
 
     `now`: pass the single timestamp snapshotted once at the top of
@@ -664,7 +667,8 @@ def start() -> None:
     log.info("Algo Trading Signal Scheduler")
     log.info(f"Instruments : {len(instruments)} total | {len(fno_instruments)} F&O")
     log.info(f"Timeframes  : {list(TIMEFRAMES.keys())}")
-    log.info(f"Strategies  : {PARALLEL_STRATEGIES} (parallel, every scan)")
+    log.info(f"Strategies  : {PARALLEL_STRATEGIES} (parallel, 1 Hour only) "
+             f"+ Cash-Futures Arbitrage (every 5 Minutes)")
     log.info(f"Arbitrage   : Every 30 mins (F&O stocks only)")
     log.info(f"Dashboard   : strategy dropdown filters the VIEW only")
     log.info("Data source : Upstox API (primary) + yfinance (fallback)")
