@@ -358,6 +358,8 @@ if "selected_tf"      not in st.session_state: st.session_state.selected_tf     
 if "selected_strategy"not in st.session_state: st.session_state.selected_strategy= "RSI + MA"  # was "RSI Reversal"
 if "chart_symbol"     not in st.session_state: st.session_state.chart_symbol      = None
 if "chart_name"       not in st.session_state: st.session_state.chart_name        = None
+if "chart_strategy"   not in st.session_state: st.session_state.chart_strategy    = None
+if "chart_timeframe"  not in st.session_state: st.session_state.chart_timeframe   = None
 
 if "provider" not in st.session_state:
     st.session_state.provider      = UpstoxProvider()
@@ -788,6 +790,23 @@ _STRATEGY_STYLE = {
 }
 _DEFAULT_STRATEGY_STYLE = ("rgba(74,144,226,0.12)", "rgba(74,144,226,0.35)", "var(--blue)")
 
+# Literal hex fallbacks for the CSS custom properties _STRATEGY_STYLE's fg
+# color uses -- needed anywhere a strategy pill has to render standalone
+# (e.g. inside build_tv_chart's iframe HTML, which has no access to the
+# main page's :root variables).
+_STRATEGY_FG_HEX = {
+    "var(--blue)":   ("#4a90e2", "#1a6fd4"),
+    "var(--amber)":  ("#f7a800", "#c47e00"),
+    "var(--teal)":   ("#14b8a6", "#0d9488"),
+    "var(--purple)": ("#9b6dff", "#6040cc"),
+}
+
+def _strategy_chip_colors(strategy: str, is_dark: bool) -> tuple[str, str, str]:
+    bg, border, fg_var = _STRATEGY_STYLE.get(strategy, _DEFAULT_STRATEGY_STYLE)
+    dark_hex, light_hex = _STRATEGY_FG_HEX.get(fg_var, _STRATEGY_FG_HEX["var(--blue)"])
+    return bg, border, (dark_hex if is_dark else light_hex)
+
+
 def strategy_pill_html(strategy: str, timeframe: str = "") -> str:
     bg, border, fg = _STRATEGY_STYLE.get(strategy, _DEFAULT_STRATEGY_STYLE)
     label = f"{strategy} · {timeframe}" if timeframe else strategy
@@ -834,6 +853,8 @@ def build_tv_chart(
     tf_name:  str,
     is_dark:  bool,
     signals:  list[dict] = None,
+    strategy: str = None,
+    strategy_timeframe: str = None,
 ) -> str:
     """
     Fetch OHLCV data and build TradingView Lightweight Charts HTML.
@@ -975,6 +996,16 @@ def build_tv_chart(
         markers_json = json.dumps(markers)
         pivots_json  = json.dumps(pivots)
 
+        strategy_chip_html = ""
+        if strategy:
+            chip_bg, chip_border, chip_fg = _strategy_chip_colors(strategy, is_dark)
+            chip_label = f"{strategy} · {strategy_timeframe}" if strategy_timeframe else strategy
+            strategy_chip_html = (
+                f"<span style='display:inline-block;background:{chip_bg};border:1px solid {chip_border};"
+                f"color:{chip_fg};font-family:JetBrains Mono,monospace;font-size:10px;font-weight:600;"
+                f"padding:3px 10px;border-radius:20px;letter-spacing:0.5px;'>{chip_label}</span>"
+            )
+
         html = f"""
 <!DOCTYPE html>
 <html>
@@ -995,11 +1026,13 @@ body {{ background:{bg}; font-family:'IBM Plex Sans',sans-serif; overflow:hidden
 </head>
 <body>
 <div id="chart-header">
-  <div id="chart-title">{name}</div>
-  <div style="display:flex;align-items:center;gap:8px;">
-    <div id="tf-buttons" style="display:flex;gap:4px;">
-    </div>
-    <div id="chart-tf" style="font-size:10px;color:{text};font-family:JetBrains Mono,monospace;margin-left:8px;">TradingView Lightweight Charts™</div>
+  <div style="display:flex;align-items:center;gap:10px;">
+    <div id="chart-title">{name}</div>
+    {strategy_chip_html}
+  </div>
+  <div style="display:flex;align-items:center;gap:10px;">
+    <div id="chart-tf" style="font-size:11px;color:{text};font-family:'JetBrains Mono',monospace;font-weight:600;">{tf_name}</div>
+    <div style="font-size:10px;color:{text};font-family:'JetBrains Mono',monospace;opacity:0.6;">TradingView Lightweight Charts™</div>
   </div>
 </div>
 <div id="price-chart"></div>
@@ -1514,14 +1547,18 @@ def show_chart_panel():
         tf_name=selected_tf,
         is_dark=st.session_state.dark_mode,
         signals=sym_signals,
+        strategy=st.session_state.chart_strategy,
+        strategy_timeframe=st.session_state.chart_timeframe,
     )
 
     # Close button
     close_col, _ = st.columns([1, 5])
     with close_col:
         if st.button("✕ Close Chart", key="close_chart"):
-            st.session_state.chart_symbol = None
-            st.session_state.chart_name   = None
+            st.session_state.chart_symbol    = None
+            st.session_state.chart_name      = None
+            st.session_state.chart_strategy  = None
+            st.session_state.chart_timeframe = None
             st.rerun()
 
     st.components.v1.html(chart_html, height=510, scrolling=False)
@@ -1719,11 +1756,18 @@ def _render_action_rows(action):
         with c[8]:
             if st.button("📈", key=f"chart_{row['sym']}", help=f"View chart for {row['name']}"):
                 if st.session_state.chart_symbol == row["sym"]:
-                    st.session_state.chart_symbol = None
-                    st.session_state.chart_name   = None
+                    st.session_state.chart_symbol   = None
+                    st.session_state.chart_name     = None
+                    st.session_state.chart_strategy = None
+                    st.session_state.chart_timeframe = None
                 else:
-                    st.session_state.chart_symbol = row["sym"]
-                    st.session_state.chart_name   = row["name"]
+                    st.session_state.chart_symbol   = row["sym"]
+                    st.session_state.chart_name     = row["name"]
+                    # This table is already scoped to the sidebar's own
+                    # strategy/timeframe filter, so that's what this row
+                    # represents -- "All Strategies" has no single pill.
+                    st.session_state.chart_strategy = selected_strategy if selected_strategy != "All Strategies" else None
+                    st.session_state.chart_timeframe = selected_tf
                 st.rerun()
 
         st.markdown("<div class='row-div'></div>", unsafe_allow_html=True)
@@ -1855,11 +1899,15 @@ def _render_open_positions_table(df, cmp_map, key_prefix: str):
             with chcol:
                 if st.button("📈", key=f"{key_prefix}_chart_{pid}", help=f"View chart for {stock_display(sym)}"):
                     if st.session_state.chart_symbol == sym:
-                        st.session_state.chart_symbol = None
-                        st.session_state.chart_name   = None
+                        st.session_state.chart_symbol    = None
+                        st.session_state.chart_name      = None
+                        st.session_state.chart_strategy  = None
+                        st.session_state.chart_timeframe = None
                     else:
-                        st.session_state.chart_symbol = sym
-                        st.session_state.chart_name   = stock_display(sym)
+                        st.session_state.chart_symbol    = sym
+                        st.session_state.chart_name      = stock_display(sym)
+                        st.session_state.chart_strategy  = r.get("strategy")
+                        st.session_state.chart_timeframe = r.get("timeframe")
                     st.rerun()
             with bcol:
                 if st.button("Close", key=f"{key_prefix}_close_{pid}", help=f"Book P&L now for {stock_display(sym)}", type="primary"):
@@ -1971,11 +2019,15 @@ def _render_closed_trades_table(df, key_prefix: str):
             _ct_key = f"{key_prefix}_closed_chart_{int(r['id'])}"
             if st.button("📈", key=_ct_key, help=f"View chart for {stock_display(ct_sym)}"):
                 if st.session_state.chart_symbol == ct_sym:
-                    st.session_state.chart_symbol = None
-                    st.session_state.chart_name   = None
+                    st.session_state.chart_symbol    = None
+                    st.session_state.chart_name      = None
+                    st.session_state.chart_strategy  = None
+                    st.session_state.chart_timeframe = None
                 else:
-                    st.session_state.chart_symbol = ct_sym
-                    st.session_state.chart_name   = stock_display(ct_sym)
+                    st.session_state.chart_symbol    = ct_sym
+                    st.session_state.chart_name      = stock_display(ct_sym)
+                    st.session_state.chart_strategy  = r.get("strategy")
+                    st.session_state.chart_timeframe = r.get("timeframe")
                 st.rerun()
 
         st.markdown("<div class='row-div'></div>", unsafe_allow_html=True)
