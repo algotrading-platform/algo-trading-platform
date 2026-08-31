@@ -185,7 +185,9 @@ class AlertManager:
         # Price, Future Price, Basis (Future - Spot), Basis %
         # (Basis/Spot*100). The strategy already computes all of these
         # (Spot_Price/Futures_Price/Spread_Abs/Spread_Pct in indicators)
-        # — this just surfaces them, labeled, in the message.
+        # — this just surfaces them, labeled, in the message. Lot size
+        # added per Jwala's request (Aug 31) — also already computed by
+        # the strategy (Lot_Size in indicators), just wasn't surfaced.
         if strategy == "Cash-Futures Arbitrage":
             indicators = result.indicators if result else {}
             spot       = indicators.get("Spot_Price", alert.get("price"))
@@ -196,15 +198,18 @@ class AlertManager:
             net        = indicators.get("Net_Profit_Est", 0)
             expiry     = indicators.get("Expiry", "")
             fut_sym    = indicators.get("Futures_Symbol", "")
+            lot_size   = indicators.get("Lot_Size")
 
             spot_str   = f"₹{spot:,.2f}"   if spot   is not None else "N/A"
             future_str = f"₹{future:,.2f}" if future is not None else "N/A"
             basis_str  = f"₹{basis:,.2f}"  if basis  is not None else "N/A"
+            lot_str    = str(lot_size) if lot_size is not None else "N/A"
 
             return (
                 f"🔵 *{name}  ARB  {price_str}  {ist_now}*\n"
                 f"Spot `{spot_str}`  Future `{future_str}`\n"
                 f"Basis `{basis_str}`  ({spread}%)  Futures: `{fut_sym}`  Exp: `{expiry}`\n"
+                f"Lot Size `{lot_str}`\n"
                 f"Gross `₹{gross:,.0f}`  Net `₹{net:,.0f}`\n"
                 f"_Buy spot + Sell futures simultaneously_"
             )
