@@ -1085,30 +1085,43 @@ STRATEGY_NAMES = list(STRATEGIES.keys())
 class ThreeBarFlagStrategy(BaseStrategy):
     """
     Flag/pennant continuation: an explosive bar (the flagpole, its
-    range required to be >= 3x the 14-period ATR) followed by 1-2
-    small consolidation bars hovering near its high (long) or low
-    (short), triggered when the next bar breaks the EXPLOSIVE bar's
-    own extreme (not the consolidation bar's). Stop is the far side
-    of the consolidation; target is an EXACT 70% of the flagpole's
-    range, projected from the breakout.
+    range required to be >= 4x the 30-period ATR, with a solid body --
+    see BODY_RATIO_MIN) followed by 1-2 small consolidation bars
+    hovering near its high (long) or low (short), triggered when the
+    next bar breaks the EXPLOSIVE bar's own extreme (not the
+    consolidation bar's). Stop is the far side of the consolidation;
+    target is an EXACT 100% of the flagpole's range, projected from
+    the breakout.
     """
     name = "3 Bar Play"
     description = (
-        "Detects an explosive (flagpole) candle -- range >= 3x ATR(14) "
-        "and volume above its 20-period average -- a 1-2 candle "
-        "consolidation hovering near its high/low, and a breakout of "
-        "the explosive candle's own extreme within the next 1-2 "
-        "candles. Target is 70% of the flagpole's range. Per Jwala's "
-        "Aug 25 walkthrough and Aug 26 follow-up refinements."
+        "Detects an explosive (flagpole) candle -- range >= 4x ATR(30), "
+        "a solid (non-wicky) body, and volume above its 20-period "
+        "average -- a 1-2 candle consolidation hovering near its "
+        "high/low, and a breakout of the explosive candle's own "
+        "extreme within the next 1-2 candles. Target is 100% of the "
+        "flagpole's range. Per Jwala's Aug 25 walkthrough, Aug 26 and "
+        "Aug 31 follow-up refinements."
     )
 
     VOLUME_LOOKBACK    = 20    # 20-period average, per spec
     RETRACE_LIMIT      = 0.5   # consolidation low can't dig >50% back into bar1's range
     OVERSHOOT_LIMIT    = 0.1   # consolidation high can't clear bar1's high by >10% of bar1's range
-    ATR_PERIOD         = 14    # standard ATR window (see module note)
-    ATR_MULTIPLE       = 3.0   # bar1's range must be >= this many ATRs (Jwala, Aug 26: "three times")
-    TARGET_PCT_OF_RANGE = 0.7  # exact target = 70% of bar1's range (Jwala, Aug 26)
+    ATR_PERIOD         = 30    # widened from 14 (Jwala, Aug 31 walkthrough call: 14 wasn't
+                                # a long enough baseline on 5-min bars to judge "unusual")
+    ATR_MULTIPLE       = 4.0   # bar1's range must be >= this many ATRs (Jwala, Aug 31: raised
+                                # from 3x to "four times" after reviewing missed/failed setups)
+    TARGET_PCT_OF_RANGE = 1.0  # exact target = 100% of bar1's range (Jwala, Aug 31: raised from
+                                # 70% -- reviewed trades showed room for a bigger target, e.g. VMM
+                                # would still have hit even a target 2x the flagpole's range)
     STRONG_VOLUME_MULTIPLE = 2.0
+    BODY_RATIO_MIN     = 0.6   # (Close-Open)/(High-Low) floor for bar1 -- filters out
+                                # wicky/doji flagpole candles in favor of a solid green body
+                                # (Jwala, Aug 31). No exact ratio was agreed on the call; 0.6
+                                # is a middle-of-the-road choice (a Marubozu-like solid-body
+                                # candle), loose enough that it shouldn't reject genuine
+                                # flagpoles -- revisit if it turns out too strict/loose in
+                                # practice.
 
     def _consolidation_ok(self, bar1_high, bar1_low, bar1_range, bar1_volume, bars, bullish: bool):
         """All of `bars` must hover near bar1's head (bullish) or floor (bearish)."""
@@ -1146,6 +1159,15 @@ class ThreeBarFlagStrategy(BaseStrategy):
 
             brk = df.iloc[-1]  # breakout candidate is always the latest candle
 
+            # First valid flagpole+consolidation setup found whose breakout
+            # hasn't happened yet (Sep 2 — fast breakout watch): surfaced on
+            # the final HOLD below so the caller can register it for the
+            # per-minute watch instead of waiting up to 5 more minutes for
+            # the next scan to notice the breakout. Whichever n_consol finds
+            # a valid setup first "wins" — same priority order the loop
+            # already uses for an actual breakout.
+            watch_candidate = None
+
             # Try the tighter (3-bar: 1 consolidation candle) reading first,
             # then the 4-bar (2 consolidation candles) reading — "3rd or 4th
             # candle at max", never further out.
@@ -1170,6 +1192,15 @@ class ThreeBarFlagStrategy(BaseStrategy):
                 if bar1_range < self.ATR_MULTIPLE * atr_value:
                     continue  # flagpole not big enough vs normal volatility
 
+                # Body-ratio filter (Jwala, Aug 31): the flagpole should be a
+                # solid green/red body, not a candle whose range is mostly
+                # wick. Uses the real body (|Close-Open|), not High-Low, so a
+                # long-wicked candle with a small real move no longer
+                # qualifies just because ATR_MULTIPLE passed on wick range.
+                bar1_body = abs(float(bar1["Close"]) - float(bar1["Open"]))
+                if bar1_body < self.BODY_RATIO_MIN * bar1_range:
+                    continue
+
                 baseline_window = df["Volume"].iloc[bar1_idx - self.VOLUME_LOOKBACK: bar1_idx]
                 if len(baseline_window) < self.VOLUME_LOOKBACK:
                     continue
@@ -1181,11 +1212,12 @@ class ThreeBarFlagStrategy(BaseStrategy):
 
                 indicators = {
                     "Bar1_Range":    round(bar1_range, 2),
+                    "Bar1_Body_Ratio": round(bar1_body / bar1_range, 2),
                     "Bar1_Volume":   int(bar1_volume),
                     "Avg_Volume_20": int(avg_volume),
                     "Volume_Ratio":  round(volume_ratio, 2),
                     "Consolidation_Bars": n_consol,
-                    "ATR_14":        round(float(atr_value), 2),
+                    f"ATR_{self.ATR_PERIOD}": round(float(atr_value), 2),
                     "ATR_Multiple":  round(bar1_range / atr_value, 2),
                 }
 
@@ -1214,6 +1246,19 @@ class ThreeBarFlagStrategy(BaseStrategy):
                         )
                         return SignalResult("BUY", strength, reason, indicators, self.name)
 
+                    elif watch_candidate is None:
+                        stop = min(float(b["Low"]) for b in consol)
+                        risk = abs(bar1_high - stop)
+                        if risk > 0:
+                            target = bar1_high + self.TARGET_PCT_OF_RANGE * bar1_range
+                            watch_candidate = {
+                                "Watch_Side":     "BUY",
+                                "Watch_Entry":    round(bar1_high, 2),
+                                "Watch_Stop":     round(stop, 2),
+                                "Watch_Target":   round(target, 2),
+                                "Watch_Strength": "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE",
+                            }
+
                 if is_bearish_ignite and self._consolidation_ok(bar1_high, bar1_low, bar1_range, bar1_volume, consol, bullish=False):
                     if brk["Low"] < bar1_low:
                         entry = bar1_low
@@ -1234,6 +1279,27 @@ class ThreeBarFlagStrategy(BaseStrategy):
                             f"{self.TARGET_PCT_OF_RANGE*100:.0f}% of flagpole range."
                         )
                         return SignalResult("SELL", strength, reason, indicators, self.name)
+
+                    elif watch_candidate is None:
+                        stop = max(float(b["High"]) for b in consol)
+                        risk = abs(bar1_low - stop)
+                        if risk > 0:
+                            target = bar1_low - self.TARGET_PCT_OF_RANGE * bar1_range
+                            watch_candidate = {
+                                "Watch_Side":     "SELL",
+                                "Watch_Entry":    round(bar1_low, 2),
+                                "Watch_Stop":     round(stop, 2),
+                                "Watch_Target":   round(target, 2),
+                                "Watch_Strength": "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE",
+                            }
+
+            if watch_candidate is not None:
+                return SignalResult(
+                    "HOLD", "WEAK",
+                    f"3-Bar Play watching for breakout: setup found, no breakout yet "
+                    f"(entry {watch_candidate['Watch_Entry']})",
+                    indicators=watch_candidate, strategy=self.name,
+                )
 
             return SignalResult("HOLD", "WEAK", "No qualifying 3-bar flag pattern on the latest bars",
                                  strategy=self.name)

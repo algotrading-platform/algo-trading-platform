@@ -47,6 +47,8 @@ FLUSH_INTERVAL_SEC = 5
 SUPERVISOR_TICK_SEC = 30
 RECONNECT_RETRY_COUNT = 100
 RECONNECT_INTERVAL_SEC = 5
+BREAKOUT_WATCH_INTERVAL_SEC = 60  # fast breakout watch cadence (Sep 2) --
+                                  # see WSListener._breakout_watch_loop
 
 
 def build_subscription_universe() -> list[dict]:
@@ -76,10 +78,12 @@ class WSListener:
 
     def __init__(self):
         self._key_to_symbol: dict[str, str] = {}
+        self._symbol_to_key: dict[str, str] = {}
         self._pending: dict[str, dict] = {}
         self._lock = threading.Lock()
         self._streamer = None
         self._need_restart = False
+        self._paper_trader = None  # lazy, see _get_paper_trader()
 
     # --------------------------------------------------------
     # connection
@@ -230,6 +234,127 @@ class WSListener:
             else:
                 log.warning(f"flush failed for {len(rows)} rows — will retry next cycle")
 
+    # --------------------------------------------------------
+    # fast breakout watch (main-process thread, Sep 2)
+    # --------------------------------------------------------
+    # A pattern strategy (currently "3 Bar Play") can find a valid
+    # flagpole+consolidation setup on the normal 5-min scan whose
+    # breakout hasn't happened yet -- surfaced as Watch_* indicators
+    # and upserted into `pending_breakouts` by strategy_engine.py.
+    # This loop watches just those symbols (usually none, sometimes a
+    # handful) every BREAKOUT_WATCH_INTERVAL_SEC, using the same live
+    # in-memory candle data _flush_loop persists, instead of waiting
+    # up to 5 more minutes for the next full-market scan to notice.
+    def _get_paper_trader(self):
+        """
+        Lazy singleton, mirrors signal_scheduler.py's _get_paper_monitor()
+        -- only caches on SUCCESS, retries construction every call if it
+        previously failed, so one transient failure doesn't permanently
+        disable the fast breakout watch for the rest of the day.
+        """
+        if self._paper_trader is None:
+            try:
+                from core.execution.paper_trader import PaperTrader
+                from data.providers.upstox_provider import UpstoxProvider
+                self._paper_trader = PaperTrader(provider=UpstoxProvider())
+            except Exception as e:
+                log.warning(f"breakout-watch PaperTrader construction failed "
+                            f"(will retry next cycle): {e}")
+                return None
+        return self._paper_trader
+
+    def _breakout_watch_loop(self) -> None:
+        while True:
+            time.sleep(BREAKOUT_WATCH_INTERVAL_SEC)
+            try:
+                self._check_pending_breakouts()
+            except Exception as e:
+                log.warning(f"breakout-watch cycle failed: {e}")
+
+    def _check_pending_breakouts(self) -> None:
+        db.expire_stale_pending_breakouts()
+        pending = db.get_active_pending_breakouts()
+        if not pending:
+            return
+
+        for row in pending:
+            instrument_key = self._symbol_to_key.get(row["symbol"])
+            if not instrument_key:
+                continue  # not in this listener's subscription universe
+
+            with self._lock:
+                live = self._pending.get(instrument_key)
+            if not live:
+                continue  # no live tick for this symbol yet this session
+
+            side    = row["side"]
+            trigger = float(row["trigger_price"])
+            crossed = (side == "BUY"  and float(live["high"]) >= trigger) or \
+                      (side == "SELL" and float(live["low"])  <= trigger)
+            if not crossed:
+                continue
+
+            # Claim it first -- UPDATE ... WHERE status='PENDING' is the
+            # atomic gate against acting on the same row twice.
+            if db.mark_pending_breakout(row["id"], "TRIGGERED"):
+                self._act_on_breakout(row)
+
+    def _act_on_breakout(self, row: dict) -> None:
+        symbol, strategy = row["symbol"], row["strategy"]
+        timeframe, side  = row["timeframe"], row["side"]
+        trigger = float(row["trigger_price"])
+
+        pt = self._get_paper_trader()
+        if pt is None:
+            log.warning(f"breakout-watch: {symbol} crossed but PaperTrader unavailable — skipped")
+            return
+
+        # Fills at the actual trigger level (the flagpole's own high/low),
+        # not whatever the live price has drifted to by the time this
+        # cycle runs -- that's the entire point of this fast watch: catch
+        # the breakout close to where it actually happened, not wherever
+        # a 5-minute candle later happens to close.
+        outcome = pt.on_signal(
+            symbol=symbol, side=side, price=trigger,
+            strategy=strategy, timeframe=timeframe,
+            strength=row.get("strength"),
+            custom_stop=float(row["stop_loss"]),
+            custom_target=float(row["target"]),
+        )
+        log.info(f"BREAKOUT-WATCH  {symbol}  [{strategy}]  {side} @ {trigger}  -> {outcome}")
+
+        if outcome.get("action") != "opened":
+            return  # rejected/skipped/error — nothing further to log/alert
+
+        from core.logger.signal_logger import SignalLogger
+        from core.alerts.alert_manager import AlertManager
+        from core.strategies.base_strategy import SignalResult
+
+        SignalLogger().log_signal(
+            stock=symbol, timeframe=timeframe, signal=side,
+            rsi=0.0, price=trigger, strategy=strategy,
+        )
+
+        # Same alert_states table the normal 5-min scan's check_alert()
+        # reads/writes -- recording the transition here means the next
+        # scan sees "no change" for this exact signal and won't
+        # redundantly re-fire on_signal() for a breakout this thread
+        # already acted on. Also sends the Telegram alert. No trend/RSI
+        # enrichment here (that's a normal-scan-only step) -- the
+        # message renders with neutral trend arrows, which is an
+        # accepted simplification for this fast path.
+        signal_result = SignalResult(
+            side, row.get("strength") or "MODERATE",
+            f"3-Bar Play fast breakout watch: price crossed {trigger:.2f} "
+            f"within ~1 min of the flagpole breakout level.",
+            {}, strategy,
+        )
+        AlertManager().check_alert(
+            timeframe=timeframe, stock=symbol, current_signal=side,
+            rsi=0.0, price=trigger, strategy=strategy,
+            signal_result=signal_result, data_source="upstox_ws",
+        )
+
     def run_forever(self) -> None:
         universe = build_subscription_universe()
         if not universe:
@@ -237,9 +362,11 @@ class WSListener:
             return
 
         self._key_to_symbol = {u["instrument_key"]: u["symbol"] for u in universe}
+        self._symbol_to_key = {u["symbol"]: u["instrument_key"] for u in universe}
         instrument_keys = list(self._key_to_symbol.keys())
 
         threading.Thread(target=self._flush_loop, daemon=True, name="ws-listener-flush").start()
+        threading.Thread(target=self._breakout_watch_loop, daemon=True, name="ws-listener-breakout-watch").start()
         self._connect_once(instrument_keys)
 
         while True:

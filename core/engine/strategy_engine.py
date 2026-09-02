@@ -601,6 +601,39 @@ class StrategyEngine:
 
                     signal = result.signal
 
+                    # Fast breakout watch (Sep 2): a pattern strategy (3 Bar
+                    # Play) can find a valid flagpole+consolidation setup
+                    # whose breakout hasn't happened yet -- surfaced via
+                    # Watch_* indicators on an otherwise-plain HOLD (see
+                    # ThreeBarFlagStrategy.generate_signal). Register it so
+                    # ws_listener.py's per-minute checker can watch just
+                    # this symbol instead of waiting up to 5 more minutes
+                    # for the next scan to notice the breakout. Best-effort
+                    # -- never let a DB hiccup here affect the main scan.
+                    #
+                    # Every OTHER outcome for this symbol+strategy+timeframe
+                    # (a plain HOLD with no watch candidate, or a BUY/SELL
+                    # that already broke out through the normal path)
+                    # actively cancels any existing PENDING row instead of
+                    # leaving it to time out on its own -- otherwise a
+                    # setup the strategy no longer endorses (or already
+                    # acted on) could keep being watched for its full TTL.
+                    try:
+                        from core.database import db
+                        if signal == "HOLD" and result.indicators.get("Watch_Entry") is not None:
+                            db.upsert_pending_breakout(
+                                symbol=symbol, strategy=strat_name, timeframe=tf_name,
+                                side=result.indicators["Watch_Side"],
+                                trigger_price=result.indicators["Watch_Entry"],
+                                stop_loss=result.indicators["Watch_Stop"],
+                                target=result.indicators["Watch_Target"],
+                                strength=result.indicators.get("Watch_Strength"),
+                            )
+                        else:
+                            db.cancel_pending_breakout(symbol, strat_name, tf_name)
+                    except Exception as e:
+                        log.warning(f"pending_breakout upsert/cancel failed for {symbol} [{strat_name}]: {e}")
+
                     if signal in ("BUY", "SELL"):
                         # Enrich ONCE for this instrument, reuse for every strategy
                         if enrich is None:

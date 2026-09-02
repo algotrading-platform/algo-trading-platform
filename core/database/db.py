@@ -790,9 +790,10 @@ def open_paper_position_if_capacity(
     order_id:      str   = "",
 ) -> dict:
     """
-    Atomically re-check the per-strategy open-position cap and insert
-    in the same transaction, so concurrent scan jobs can't each read a
-    stale count and jointly overshoot the cap.
+    Atomically re-check the per-strategy open-position cap AND the
+    per-symbol already-open state, then insert -- all in the same
+    transaction, so concurrent callers can't each read a stale count/
+    state and jointly overshoot the cap or double-open the same symbol.
 
     Postgres's pg_advisory_xact_lock(hashtext(...)) is replaced with
     T-SQL's sp_getapplock, using @LockOwner='Transaction' so it
@@ -800,8 +801,9 @@ def open_paper_position_if_capacity(
     no explicit unlock needed, and no hashing required since
     sp_getapplock takes the resource name directly as a string.
 
-    Returns {"opened": True} on success, or {"opened": False, "reason": ...}
-    if the cap was already full (checked fresh, under the lock).
+    Returns {"opened": True} on success, or {"opened": False, "cause": ...,
+    "reason": ...} if the cap was full or the symbol was already open
+    (both checked fresh, under their respective locks).
     """
     try:
         initial_stop_distance = round(abs(float(entry_price) - float(stop_loss)), 2)
@@ -817,6 +819,26 @@ def open_paper_position_if_capacity(
             if int(cur.fetchone()["n"]) >= max_positions:
                 return {"opened": False, "cause": "cap",
                         "reason": f"max {max_positions} open positions for {strategy}"}
+
+            # Symbol-scoped lock + atomic re-check (Sep 2) — closes a
+            # cross-process double-open race that opened up once more than
+            # one process can call this for the same symbol (the fast
+            # breakout-watch thread in ws_listener.py, alongside the normal
+            # scanner job). PaperTrader.on_signal()'s own `existing = ...`
+            # check is a plain read with no lock, so two processes racing
+            # for the same symbol could both see "flat" and both insert.
+            # This mirrors the cap lock above but scoped to the symbol.
+            cur.execute(
+                "EXEC sp_getapplock @Resource = ?, @LockMode = 'Exclusive', @LockOwner = 'Transaction'",
+                (f"paper_pos_symbol:{symbol}",)
+            )
+            cur.execute("""
+                SELECT COUNT(*) AS n FROM paper_positions
+                WHERE status = 'OPEN' AND symbol = ?
+            """, (symbol,))
+            if int(cur.fetchone()["n"]) > 0:
+                return {"opened": False, "cause": "already_open",
+                        "reason": f"{symbol} already has an open position"}
 
             cur.execute("""
                 INSERT INTO paper_positions
@@ -1571,6 +1593,134 @@ def get_latest_live_price(symbol: str, max_age_minutes: int = 2) -> float | None
     except Exception as e:
         print(f"[DB] get_latest_live_price error for {symbol}: {e}")
         return None
+
+
+# ============================================================
+# PENDING BREAKOUTS (fast breakout watch, Sep 2)
+# ============================================================
+#
+# A pattern strategy (currently "3 Bar Play") can find a valid setup on
+# the normal 5-min scan whose breakout hasn't happened yet. Upserted
+# here so ws_listener.py's per-minute watcher can check just this
+# handful of symbols instead of waiting up to 5 more minutes for the
+# next full-market scan to notice the breakout -- see
+# ThreeBarFlagStrategy's "Watch_*" indicators (strategies.py) for where
+# these values come from.
+
+def upsert_pending_breakout(
+    symbol:        str,
+    strategy:      str,
+    timeframe:     str,
+    side:          str,
+    trigger_price: float,
+    stop_loss:     float,
+    target:        float,
+    strength:      str = None,
+    ttl_seconds:   int = 900,
+) -> bool:
+    """
+    Insert or refresh a pending-breakout watch row. Re-detecting the
+    same setup on a later scan (e.g. the 2-consolidation-bar reading
+    after the 1-bar reading already registered it) just refreshes the
+    row via the (symbol, strategy, timeframe) unique constraint rather
+    than creating a duplicate -- also resets status back to PENDING in
+    case a stale TRIGGERED/EXPIRED row for this exact symbol+strategy+
+    timeframe combo is still sitting here from an earlier setup.
+    """
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                MERGE INTO pending_breakouts AS target
+                USING (SELECT ? AS symbol, ? AS strategy, ? AS timeframe) AS source
+                ON (target.symbol = source.symbol
+                    AND target.strategy = source.strategy
+                    AND target.timeframe = source.timeframe)
+                WHEN MATCHED THEN
+                    UPDATE SET side = ?, trigger_price = ?, stop_loss = ?, target = ?,
+                               strength = ?, status = 'PENDING',
+                               detected_at = SYSDATETIMEOFFSET(),
+                               expires_at = DATEADD(second, ?, SYSDATETIMEOFFSET()),
+                               updated_at = SYSDATETIMEOFFSET()
+                WHEN NOT MATCHED THEN
+                    INSERT (symbol, strategy, timeframe, side, trigger_price, stop_loss,
+                            target, strength, status, detected_at, expires_at, updated_at)
+                    VALUES (source.symbol, source.strategy, source.timeframe, ?, ?, ?, ?, ?,
+                            'PENDING', SYSDATETIMEOFFSET(),
+                            DATEADD(second, ?, SYSDATETIMEOFFSET()), SYSDATETIMEOFFSET());
+            """, (
+                symbol, strategy, timeframe,
+                side, round(float(trigger_price), 2), round(float(stop_loss), 2),
+                round(float(target), 2), strength, ttl_seconds,
+                side, round(float(trigger_price), 2), round(float(stop_loss), 2),
+                round(float(target), 2), strength, ttl_seconds,
+            ))
+        return True
+    except Exception as e:
+        print(f"[DB] upsert_pending_breakout error: {e}")
+        return False
+
+
+def get_active_pending_breakouts() -> list[dict]:
+    """PENDING rows that haven't expired yet, for the per-minute watcher."""
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                SELECT * FROM pending_breakouts
+                WHERE status = 'PENDING' AND expires_at > SYSDATETIMEOFFSET()
+            """)
+            return cur.fetchall() or []
+    except Exception as e:
+        print(f"[DB] get_active_pending_breakouts error: {e}")
+        return []
+
+
+def mark_pending_breakout(id_: int, status: str) -> bool:
+    """status: 'TRIGGERED' (breakout acted on) or 'EXPIRED' (window passed)."""
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                UPDATE pending_breakouts SET status = ?, updated_at = SYSDATETIMEOFFSET()
+                WHERE id = ? AND status = 'PENDING'
+            """, (status, id_))
+            return cur.rowcount > 0
+    except Exception as e:
+        print(f"[DB] mark_pending_breakout error: {e}")
+        return False
+
+
+def expire_stale_pending_breakouts() -> int:
+    """Sweep PENDING rows whose window has passed. Returns rows affected."""
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                UPDATE pending_breakouts SET status = 'EXPIRED', updated_at = SYSDATETIMEOFFSET()
+                WHERE status = 'PENDING' AND expires_at <= SYSDATETIMEOFFSET()
+            """)
+            return cur.rowcount
+    except Exception as e:
+        print(f"[DB] expire_stale_pending_breakouts error: {e}")
+        return 0
+
+
+def cancel_pending_breakout(symbol: str, strategy: str, timeframe: str) -> bool:
+    """
+    Mark any PENDING row for this exact key as CANCELLED -- called
+    whenever a later scan re-evaluates this symbol and the setup no
+    longer qualifies as a watch candidate (consolidation broke down)
+    or the breakout already fired through the normal path. Without
+    this, a stale row could keep watching a price level from a setup
+    the strategy itself no longer endorses, for up to its full TTL.
+    """
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                UPDATE pending_breakouts SET status = 'CANCELLED', updated_at = SYSDATETIMEOFFSET()
+                WHERE symbol = ? AND strategy = ? AND timeframe = ? AND status = 'PENDING'
+            """, (symbol, strategy, timeframe))
+            return cur.rowcount > 0
+    except Exception as e:
+        print(f"[DB] cancel_pending_breakout error: {e}")
+        return False
 
 
 # ============================================================
