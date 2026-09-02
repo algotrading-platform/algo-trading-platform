@@ -8,7 +8,15 @@ import json
 import time
 import bisect
 import contextlib
+import logging
 import urllib.parse
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("dashboard")
 
 _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 sys.path.append(_project_root)
@@ -206,6 +214,22 @@ if not st.session_state.get("user"):
             qp.clear()
             st.error("This account is not authorized to access this dashboard.")
             st.stop()
+
+        # MFA safety-net check (Om, Sep 2) — LOG-ONLY for now, does not block.
+        # Today MFA is enforced entirely by whatever Conditional Access is
+        # doing; the app has never independently verified it. This inspects
+        # the standard OIDC "amr" (authentication methods reference) claim
+        # and logs when "mfa" is absent, so real sign-ins can be observed
+        # before this is ever turned into a hard block — flipping it to
+        # st.error()/st.stop() blind risked locking everyone out if MFA
+        # wasn't actually being enforced for some account via any path.
+        # Once logs confirm "mfa" is present on every real sign-in, promote
+        # this to an actual block the same way the UPN check above works.
+        _amr = _claims.get("amr") or []
+        if "mfa" not in _amr:
+            log.warning(f"Sign-in WITHOUT mfa in amr claim — upn={_upn} amr={_amr}")
+        else:
+            log.info(f"Sign-in with mfa confirmed in amr claim — upn={_upn}")
 
         st.session_state["user"] = _claims
         qp.clear()
