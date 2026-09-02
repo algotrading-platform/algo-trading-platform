@@ -1851,6 +1851,8 @@ def _render_open_positions_table(df, cmp_map, key_prefix: str):
     slice of open_df. key_prefix keeps widget keys unique across the
     RSI/Volume Spike tables (position id alone is already globally
     unique, so this is just cheap insurance)."""
+    from core.database.db import close_paper_position, update_paper_position_stop
+
     if df is None or df.empty:
         st.markdown('<div class="no-sig">No open positions</div>', unsafe_allow_html=True)
         return
