@@ -76,7 +76,7 @@ param entraRedirectUri string = 'https://algo-dashboard.lemonglacier-23c89c18.we
 @secure()
 param entraClientSecret string
 
-@description('Comma-separated allow-list of UPNs permitted to use the dashboard after a successful Entra sign-in - app-level defense in depth on top of the app registration''s "assignment required" toggle, which is otherwise the ONLY thing enforcing this. Not secret, safe to default here.')
+@description('Comma-separated allow-list of UPNs permitted to use the dashboard after a successful Entra sign-in - app-level defense in depth on top of the app registration\'s "assignment required" toggle, which is otherwise the ONLY thing enforcing this. Not secret, safe to default here.')
 param entraAllowedUpns string = 'cgummunur@ariqt.com,rkumar@ariqt.com,algotrading@ariqt.com'
 
 var uniqueSuffix = uniqueString(resourceGroup().id)
@@ -342,6 +342,14 @@ resource wsListenerApp 'Microsoft.App/containerApps@2023-05-01' = {
           name: 'db-password'
           value: sqlAdminPassword
         }
+        {
+          name: 'telegram-bot-token'
+          value: telegramBotToken
+        }
+        {
+          name: 'telegram-chat-id'
+          value: telegramChatId
+        }
       ]
     }
     template: {
@@ -373,6 +381,19 @@ resource wsListenerApp 'Microsoft.App/containerApps@2023-05-01' = {
             {
               name: 'AZURE_DB_PASSWORD'
               secretRef: 'db-password'
+            }
+            {
+              // Sep 6: ws_listener.py's ops alert (token expiry / connect
+              // failure) had no way to actually send until these were
+              // added here -- it was silently logging "Telegram not
+              // configured" in production the whole time, exactly the
+              // kind of silent failure this alert exists to catch.
+              name: 'TELEGRAM_BOT_TOKEN'
+              secretRef: 'telegram-bot-token'
+            }
+            {
+              name: 'TELEGRAM_CHAT_ID'
+              secretRef: 'telegram-chat-id'
             }
           ]
           resources: {
