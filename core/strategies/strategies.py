@@ -1153,7 +1153,24 @@ class ThreeBarFlagStrategy(BaseStrategy):
                     return False
         return True
 
-    def generate_signal(self, df: pd.DataFrame) -> SignalResult:
+    def generate_signal(self, df: pd.DataFrame, check_last_n: int = 1) -> SignalResult:
+        """
+        check_last_n (Sep 6 — candle catch-up): how many trailing candles
+        to check as potential BREAKOUT points, not just the single latest
+        one. Defaults to 1 (today's original, unchanged behavior). The
+        caller (strategy_engine.py) raises this when it detects the scan
+        skipped one or more real candles since it last checked this
+        symbol (a slow cycle causing the run-lock to skip the next
+        trigger, or a data-source outage) -- without this, a genuinely
+        valid breakout that fell inside that gap is silently lost
+        forever, since the pattern was only ever evaluated against
+        whichever candle happened to be "latest" at the moment of each
+        scan (see the Sep 3 AFCONS/CUB debugging). The most recent
+        candle is always checked first (k=1) -- identical priority to
+        the original single-candle behavior -- and older candles are
+        only checked if nothing fresher matches, so live operation is
+        unaffected; catch-up only activates on an actual gap.
+        """
         need = self.VOLUME_LOOKBACK + 4
         if df is None or df.empty or len(df) < need:
             return SignalResult("HOLD", "WEAK", f"Insufficient data (need {need}+ candles)", strategy=self.name)
@@ -1170,134 +1187,147 @@ class ThreeBarFlagStrategy(BaseStrategy):
 
             df_atr = add_atr(df, window=self.ATR_PERIOD)
 
-            brk = df.iloc[-1]  # breakout candidate is always the latest candle
-
             # First valid flagpole+consolidation setup found whose breakout
             # hasn't happened yet (Sep 2 — fast breakout watch): surfaced on
             # the final HOLD below so the caller can register it for the
             # per-minute watch instead of waiting up to 5 more minutes for
             # the next scan to notice the breakout. Whichever n_consol finds
             # a valid setup first "wins" — same priority order the loop
-            # already uses for an actual breakout.
+            # already uses for an actual breakout. Only recorded for the
+            # freshest candle (k=1) -- an older, not-yet-broken-out setup
+            # from a catch-up pass isn't "currently forming", it either
+            # already broke out (checked below) or is stale.
             watch_candidate = None
 
-            # Try the tighter (3-bar: 1 consolidation candle) reading first,
-            # then the 4-bar (2 consolidation candles) reading — "3rd or 4th
-            # candle at max", never further out.
-            for n_consol, bar1_idx in ((1, -3), (2, -4)):
-                bar1 = df.iloc[bar1_idx]
-                consol = [df.iloc[i] for i in range(bar1_idx + 1, -1)]
+            for k in range(1, max(1, check_last_n) + 1):
+                brk_idx = -k
+                brk = df.iloc[brk_idx]
 
-                bar1_range = float(bar1["High"] - bar1["Low"])
-                if bar1_range <= 0:
-                    continue
+                # Try the tighter (3-bar: 1 consolidation candle) reading
+                # first, then the 4-bar (2 consolidation candles) reading —
+                # "3rd or 4th candle before the breakout candidate, never
+                # further out" -- same rule as always, just anchored to
+                # candle `k` back instead of always the absolute latest.
+                for n_consol, extra in ((1, 0), (2, 0)):
+                    bar1_idx = brk_idx - (n_consol + 1)
+                    consol = [df.iloc[i] for i in range(bar1_idx + 1, brk_idx)]
+                    bar1 = df.iloc[bar1_idx]
 
-                # ATR computed on the bar strictly BEFORE bar1 -- excludes
-                # bar1 itself, same "exclude current" principle as the
-                # volume baseline below, so the flagpole's own abnormal
-                # range can't inflate the very average it's compared against.
-                atr_idx = bar1_idx - 1
-                if abs(atr_idx) > len(df_atr):
-                    continue
-                atr_value = df_atr["ATR"].iloc[atr_idx]
-                if pd.isna(atr_value) or atr_value <= 0:
-                    continue
-                if bar1_range < self.ATR_MULTIPLE * atr_value:
-                    continue  # flagpole not big enough vs normal volatility
+                    bar1_range = float(bar1["High"] - bar1["Low"])
+                    if bar1_range <= 0:
+                        continue
 
-                # Body-ratio filter (Jwala, Aug 31): the flagpole should be a
-                # solid green/red body, not a candle whose range is mostly
-                # wick. Uses the real body (|Close-Open|), not High-Low, so a
-                # long-wicked candle with a small real move no longer
-                # qualifies just because ATR_MULTIPLE passed on wick range.
-                bar1_body = abs(float(bar1["Close"]) - float(bar1["Open"]))
-                if bar1_body < self.BODY_RATIO_MIN * bar1_range:
-                    continue
+                    # ATR computed on the bar strictly BEFORE bar1 -- excludes
+                    # bar1 itself, same "exclude current" principle as the
+                    # volume baseline below, so the flagpole's own abnormal
+                    # range can't inflate the very average it's compared against.
+                    atr_idx = bar1_idx - 1
+                    if abs(atr_idx) > len(df_atr):
+                        continue
+                    atr_value = df_atr["ATR"].iloc[atr_idx]
+                    if pd.isna(atr_value) or atr_value <= 0:
+                        continue
+                    if bar1_range < self.ATR_MULTIPLE * atr_value:
+                        continue  # flagpole not big enough vs normal volatility
 
-                baseline_window = df["Volume"].iloc[bar1_idx - self.VOLUME_LOOKBACK: bar1_idx]
-                if len(baseline_window) < self.VOLUME_LOOKBACK:
-                    continue
-                avg_volume  = float(baseline_window.mean())
-                bar1_volume = float(bar1["Volume"])
-                volume_ratio = bar1_volume / avg_volume if avg_volume > 0 else 0.0
-                if volume_ratio <= 1.0:
-                    continue  # explosive bar must show above-average volume
+                    # Body-ratio filter (Jwala, Aug 31): the flagpole should be a
+                    # solid green/red body, not a candle whose range is mostly
+                    # wick. Uses the real body (|Close-Open|), not High-Low, so a
+                    # long-wicked candle with a small real move no longer
+                    # qualifies just because ATR_MULTIPLE passed on wick range.
+                    bar1_body = abs(float(bar1["Close"]) - float(bar1["Open"]))
+                    if bar1_body < self.BODY_RATIO_MIN * bar1_range:
+                        continue
 
-                indicators = {
-                    "Bar1_Range":    round(bar1_range, 2),
-                    "Bar1_Body_Ratio": round(bar1_body / bar1_range, 2),
-                    "Bar1_Volume":   int(bar1_volume),
-                    "Avg_Volume_20": int(avg_volume),
-                    "Volume_Ratio":  round(volume_ratio, 2),
-                    "Consolidation_Bars": n_consol,
-                    f"ATR_{self.ATR_PERIOD}": round(float(atr_value), 2),
-                    "ATR_Multiple":  round(bar1_range / atr_value, 2),
-                }
+                    baseline_window = df["Volume"].iloc[bar1_idx - self.VOLUME_LOOKBACK: bar1_idx]
+                    if len(baseline_window) < self.VOLUME_LOOKBACK:
+                        continue
+                    avg_volume  = float(baseline_window.mean())
+                    bar1_volume = float(bar1["Volume"])
+                    volume_ratio = bar1_volume / avg_volume if avg_volume > 0 else 0.0
+                    if volume_ratio <= 1.0:
+                        continue  # explosive bar must show above-average volume
 
-                is_bullish_ignite = bar1["Close"] > bar1["Open"]
-                is_bearish_ignite = bar1["Close"] < bar1["Open"]
-                bar1_high, bar1_low = float(bar1["High"]), float(bar1["Low"])
+                    indicators = {
+                        "Bar1_Range":    round(bar1_range, 2),
+                        "Bar1_Body_Ratio": round(bar1_body / bar1_range, 2),
+                        "Bar1_Volume":   int(bar1_volume),
+                        "Avg_Volume_20": int(avg_volume),
+                        "Volume_Ratio":  round(volume_ratio, 2),
+                        "Consolidation_Bars": n_consol,
+                        "Candles_Back":  k,  # >1 means this only fired via catch-up
+                        f"ATR_{self.ATR_PERIOD}": round(float(atr_value), 2),
+                        "ATR_Multiple":  round(bar1_range / atr_value, 2),
+                    }
 
-                if is_bullish_ignite and self._consolidation_ok(bar1_high, bar1_low, bar1_range, bar1_volume, consol, bullish=True):
-                    # Stop = flagpole's own midpoint (50% of its full range back
-                    # from the breakout side) -- Jwala, Sep 3: no longer tied to
-                    # the consolidation candle at all. Target = 70% of the
-                    # flagpole's BODY (not full range) -- a deliberately
-                    # different, smaller reference than the stop's.
-                    stop   = bar1_high - self.STOP_PCT_OF_RANGE * bar1_range
-                    target = bar1_high + self.TARGET_PCT_OF_BODY * bar1_body
+                    is_bullish_ignite = bar1["Close"] > bar1["Open"]
+                    is_bearish_ignite = bar1["Close"] < bar1["Open"]
+                    bar1_high, bar1_low = float(bar1["High"]), float(bar1["Low"])
 
-                    if brk["High"] > bar1_high:
-                        entry = bar1_high
-                        strength = "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE"
-                        indicators.update({"Pattern_Entry": round(entry, 2), "Pattern_Stop": round(stop, 2),
-                                            "Pattern_Target": round(target, 2),
-                                            "Pattern_Target_Exact": round(target, 2)})
-                        reason = (
-                            f"3-Bar Play LONG: explosive candle at {volume_ratio:.1f}x avg volume "
-                            f"and {round(bar1_range/atr_value,1)}x ATR({self.ATR_PERIOD}), "
-                            f"{n_consol}-candle consolidation held near its high, breakout above "
-                            f"explosive candle's high (₹{bar1_high:.2f}). Stop = flagpole midpoint, "
-                            f"target = {self.TARGET_PCT_OF_BODY*100:.0f}% of flagpole body."
-                        )
-                        return SignalResult("BUY", strength, reason, indicators, self.name)
+                    if is_bullish_ignite and self._consolidation_ok(bar1_high, bar1_low, bar1_range, bar1_volume, consol, bullish=True):
+                        # Stop = flagpole's own midpoint (50% of its full range back
+                        # from the breakout side) -- Jwala, Sep 3: no longer tied to
+                        # the consolidation candle at all. Target = 70% of the
+                        # flagpole's BODY (not full range) -- a deliberately
+                        # different, smaller reference than the stop's.
+                        stop   = bar1_high - self.STOP_PCT_OF_RANGE * bar1_range
+                        target = bar1_high + self.TARGET_PCT_OF_BODY * bar1_body
 
-                    elif watch_candidate is None:
-                        watch_candidate = {
-                            "Watch_Side":     "BUY",
-                            "Watch_Entry":    round(bar1_high, 2),
-                            "Watch_Stop":     round(stop, 2),
-                            "Watch_Target":   round(target, 2),
-                            "Watch_Strength": "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE",
-                        }
+                        if brk["High"] > bar1_high:
+                            entry = bar1_high
+                            strength = "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE"
+                            indicators.update({"Pattern_Entry": round(entry, 2), "Pattern_Stop": round(stop, 2),
+                                                "Pattern_Target": round(target, 2),
+                                                "Pattern_Target_Exact": round(target, 2)})
+                            reason = (
+                                f"3-Bar Play LONG: explosive candle at {volume_ratio:.1f}x avg volume "
+                                f"and {round(bar1_range/atr_value,1)}x ATR({self.ATR_PERIOD}), "
+                                f"{n_consol}-candle consolidation held near its high, breakout above "
+                                f"explosive candle's high (₹{bar1_high:.2f})"
+                                + (f" [caught {k} candles back via catch-up]" if k > 1 else "") +
+                                f". Stop = flagpole midpoint, "
+                                f"target = {self.TARGET_PCT_OF_BODY*100:.0f}% of flagpole body."
+                            )
+                            return SignalResult("BUY", strength, reason, indicators, self.name)
 
-                if is_bearish_ignite and self._consolidation_ok(bar1_high, bar1_low, bar1_range, bar1_volume, consol, bullish=False):
-                    stop   = bar1_low + self.STOP_PCT_OF_RANGE * bar1_range
-                    target = bar1_low - self.TARGET_PCT_OF_BODY * bar1_body
+                        elif k == 1 and watch_candidate is None:
+                            watch_candidate = {
+                                "Watch_Side":     "BUY",
+                                "Watch_Entry":    round(bar1_high, 2),
+                                "Watch_Stop":     round(stop, 2),
+                                "Watch_Target":   round(target, 2),
+                                "Watch_Strength": "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE",
+                            }
 
-                    if brk["Low"] < bar1_low:
-                        entry = bar1_low
-                        strength = "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE"
-                        indicators.update({"Pattern_Entry": round(entry, 2), "Pattern_Stop": round(stop, 2),
-                                            "Pattern_Target": round(target, 2),
-                                            "Pattern_Target_Exact": round(target, 2)})
-                        reason = (
-                            f"3-Bar Play SHORT: explosive candle at {volume_ratio:.1f}x avg volume "
-                            f"and {round(bar1_range/atr_value,1)}x ATR({self.ATR_PERIOD}), "
-                            f"{n_consol}-candle consolidation held near its low, breakout below "
-                            f"explosive candle's low (₹{bar1_low:.2f}). Stop = flagpole midpoint, "
-                            f"target = {self.TARGET_PCT_OF_BODY*100:.0f}% of flagpole body."
-                        )
-                        return SignalResult("SELL", strength, reason, indicators, self.name)
+                    if is_bearish_ignite and self._consolidation_ok(bar1_high, bar1_low, bar1_range, bar1_volume, consol, bullish=False):
+                        stop   = bar1_low + self.STOP_PCT_OF_RANGE * bar1_range
+                        target = bar1_low - self.TARGET_PCT_OF_BODY * bar1_body
 
-                    elif watch_candidate is None:
-                        watch_candidate = {
-                            "Watch_Side":     "SELL",
-                            "Watch_Entry":    round(bar1_low, 2),
-                            "Watch_Stop":     round(stop, 2),
-                            "Watch_Target":   round(target, 2),
-                            "Watch_Strength": "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE",
-                        }
+                        if brk["Low"] < bar1_low:
+                            entry = bar1_low
+                            strength = "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE"
+                            indicators.update({"Pattern_Entry": round(entry, 2), "Pattern_Stop": round(stop, 2),
+                                                "Pattern_Target": round(target, 2),
+                                                "Pattern_Target_Exact": round(target, 2)})
+                            reason = (
+                                f"3-Bar Play SHORT: explosive candle at {volume_ratio:.1f}x avg volume "
+                                f"and {round(bar1_range/atr_value,1)}x ATR({self.ATR_PERIOD}), "
+                                f"{n_consol}-candle consolidation held near its low, breakout below "
+                                f"explosive candle's low (₹{bar1_low:.2f})"
+                                + (f" [caught {k} candles back via catch-up]" if k > 1 else "") +
+                                f". Stop = flagpole midpoint, "
+                                f"target = {self.TARGET_PCT_OF_BODY*100:.0f}% of flagpole body."
+                            )
+                            return SignalResult("SELL", strength, reason, indicators, self.name)
+
+                        elif k == 1 and watch_candidate is None:
+                            watch_candidate = {
+                                "Watch_Side":     "SELL",
+                                "Watch_Entry":    round(bar1_low, 2),
+                                "Watch_Stop":     round(stop, 2),
+                                "Watch_Target":   round(target, 2),
+                                "Watch_Strength": "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE",
+                            }
 
             if watch_candidate is not None:
                 return SignalResult(

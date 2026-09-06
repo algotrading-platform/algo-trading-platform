@@ -30,11 +30,13 @@
 # ============================================================
 
 import logging
+import os
 import threading
 import time
 from datetime import datetime
 
 import pytz
+import requests
 
 from configs.universe import get_all_instruments_extended
 from core.database import db
@@ -42,6 +44,40 @@ from data.providers.upstox_provider import _load_instruments, get_instrument_key
 
 log = logging.getLogger("ws_listener")
 IST = pytz.timezone("Asia/Kolkata")
+
+# ── Ops alert (Sep 6) — a WS connect failure used to only ever show up
+# in container logs, which nobody watches proactively. That's exactly
+# what let the Sep 3 token expiry run silently all day: the listener
+# was stuck retrying with a dead token from ~5 AM IST, and it took a
+# post-mortem hours later to notice. This sends a direct Telegram alert
+# the moment reconnection genuinely fails, instead of only logging it.
+# Deliberately a plain standalone notifier, not routed through
+# AlertManager (that class formats trading-signal messages, not ops
+# alerts). Rate-limited so a stuck retry loop can't spam the chat.
+_OPS_ALERT_COOLDOWN_SEC = 1800  # at most one alert per 30 min per reason
+_last_ops_alert: dict[str, float] = {}
+
+
+def _send_ops_alert(reason: str, message: str) -> None:
+    now = time.time()
+    last = _last_ops_alert.get(reason, 0.0)
+    if now - last < _OPS_ALERT_COOLDOWN_SEC:
+        return
+    _last_ops_alert[reason] = now
+
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat_id   = os.getenv("TELEGRAM_CHAT_ID", "")
+    if not bot_token or not chat_id:
+        log.warning(f"ops alert suppressed (Telegram not configured): {message}")
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={"chat_id": chat_id, "text": f"⚠️ *WS Listener*: {message}", "parse_mode": "Markdown"},
+            timeout=10,
+        )
+    except Exception as e:
+        log.warning(f"ops alert send failed: {e}")
 
 FLUSH_INTERVAL_SEC = 5
 SUPERVISOR_TICK_SEC = 30
@@ -93,6 +129,11 @@ class WSListener:
 
         token = get_token()
         if not token:
+            _send_ops_alert(
+                "no_token",
+                "No valid Upstox token — live market data is down. "
+                "Run scripts/upstox_login.py (tokens expire daily at 3:30 AM IST).",
+            )
             raise RuntimeError(
                 "no valid Upstox token — run scripts/upstox_login.py "
                 "(tokens expire daily at 3:30 AM IST)"
@@ -121,6 +162,7 @@ class WSListener:
                 self._streamer.connect()  # may block this thread indefinitely — that's fine
             except Exception as e:
                 log.error(f"WS connect thread crashed: {e}")
+                _send_ops_alert("connect_crashed", f"Connect attempt crashed: {e}")
                 self._need_restart = True
 
         threading.Thread(target=_run, daemon=True, name="ws-listener-connect").start()
@@ -145,6 +187,11 @@ class WSListener:
         # A fresh MarketDataStreamerV3 (new token) is needed — the
         # SDK's own auto_reconnect can't fix an expired token.
         log.error("WS auto-reconnect exhausted — will rebuild with a fresh token")
+        _send_ops_alert(
+            "reconnect_exhausted",
+            "Auto-reconnect exhausted — live market data has stopped. Most likely "
+            "the Upstox token expired; run scripts/upstox_login.py to restore it.",
+        )
         self._need_restart = True
 
     def _handle_feed(self, message) -> None:

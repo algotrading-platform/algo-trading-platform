@@ -109,6 +109,63 @@ def _open_arbitrage_position(symbol: str, tf_name: str, result) -> None:
         log.warning(f"[Arbitrage] paper trading hook error for {symbol} (non-fatal): {e}")
 
 
+CATCHUP_MAX_CANDLES = 12  # Sep 6: don't try to resurrect setups older than this
+                          # many candles even if scan_progress shows a bigger gap
+                          # (a long outage/holiday shouldn't fire a burst of stale
+                          # breakouts) -- see _compute_catchup_n and
+                          # ThreeBarFlagStrategy.generate_signal's check_last_n.
+
+
+def _compute_catchup_n(df, symbol: str, strategy: str, timeframe: str) -> int:
+    """
+    How many trailing candles ThreeBarFlagStrategy should check as
+    potential breakout points this cycle, based on how many real
+    candles have actually arrived since this (symbol, strategy,
+    timeframe) was last evaluated (core.database.db's scan_progress
+    table). A slow scan cycle (the run-lock skips the next trigger
+    outright rather than queuing it) or a data-source outage can let
+    more than one real candle pass between two successful scans --
+    without this, a setup that fell inside that gap is silently lost
+    forever (see the Sep 3 AFCONS/CUB debugging). Always >= 1; capped
+    at CATCHUP_MAX_CANDLES. Best-effort -- any failure just falls back
+    to 1 (today's original behavior), never blocks scanning.
+    """
+    try:
+        if df is None or "Datetime" not in df.columns or df.empty:
+            return 1
+        from core.database import db
+        last_seen = db.get_scan_progress(symbol, strategy, timeframe)
+        if last_seen is None:
+            return 1  # never scanned before -- nothing to catch up on
+
+        latest_ts = pd.Timestamp(df["Datetime"].iloc[-1]).tz_localize(None) \
+            if pd.Timestamp(df["Datetime"].iloc[-1]).tzinfo else pd.Timestamp(df["Datetime"].iloc[-1])
+        last_seen_ts = pd.Timestamp(last_seen)
+        if last_seen_ts.tzinfo is not None:
+            last_seen_ts = last_seen_ts.tz_localize(None)
+
+        new_candles = int((df["Datetime"].apply(
+            lambda t: pd.Timestamp(t).tz_localize(None) if pd.Timestamp(t).tzinfo else pd.Timestamp(t)
+        ) > last_seen_ts).sum())
+        return max(1, min(new_candles, CATCHUP_MAX_CANDLES))
+    except Exception as e:
+        log.warning(f"catch-up calc failed for {symbol}/{strategy}/{timeframe}: {e}")
+        return 1
+
+
+def _record_scan_progress(df, symbol: str, strategy: str, timeframe: str) -> None:
+    """Best-effort -- a failed write here just means the next cycle's
+    catch-up window may be wrong, never worth breaking the scan for."""
+    try:
+        if df is None or "Datetime" not in df.columns or df.empty:
+            return
+        from core.database import db
+        latest_ts = pd.Timestamp(df["Datetime"].iloc[-1])
+        db.upsert_scan_progress(symbol, strategy, timeframe, latest_ts.to_pydatetime())
+    except Exception as e:
+        log.warning(f"scan_progress write failed for {symbol}/{strategy}/{timeframe}: {e}")
+
+
 # ── Paper trading integration (lazy singleton) ───────────────
 _paper_trader = None
 
@@ -662,7 +719,15 @@ class StrategyEngine:
 
                 for strat_name, strat in strategies.items():
                     try:
-                        result = strat.generate_signal(df.copy())
+                        # Candle catch-up (Sep 6) -- only 3 Bar Play's
+                        # generate_signal() understands check_last_n; every
+                        # other strategy keeps its original single-candle call.
+                        if strat_name == "3 Bar Play":
+                            check_n = _compute_catchup_n(df, symbol, strat_name, tf_name)
+                            result = strat.generate_signal(df.copy(), check_last_n=check_n)
+                            _record_scan_progress(df, symbol, strat_name, tf_name)
+                        else:
+                            result = strat.generate_signal(df.copy())
                     except Exception as e:
                         log.warning(f"{strat_name} failed on {symbol}: {e}")
                         continue

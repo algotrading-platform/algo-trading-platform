@@ -1724,6 +1724,61 @@ def cancel_pending_breakout(symbol: str, strategy: str, timeframe: str) -> bool:
 
 
 # ============================================================
+# SCAN PROGRESS (candle catch-up, Sep 6)
+# ============================================================
+#
+# The Container Apps Job's run-lock skips an entire cycle outright if
+# the previous one is still running (rather than queuing/delaying it),
+# and a slow REST/yfinance fallback fetch (e.g. during a WS outage) can
+# make a cycle overrun -- either way, more than one real candle can
+# pass between two successful scans. A pattern strategy that only ever
+# checks "is the single latest candle a breakout" silently loses any
+# setup that fell inside a skipped gap, forever (see the Sep 3
+# AFCONS/CUB debugging -- a clean breakout that was never re-checked
+# once the scan moved past it). This table tracks the last candle
+# actually evaluated per (symbol, strategy, timeframe) so the caller
+# can tell the strategy exactly how many trailing candles to re-check
+# as potential breakout points, catching up on whatever was actually
+# missed instead of guessing a fixed window.
+
+def get_scan_progress(symbol: str, strategy: str, timeframe: str):
+    """Last candle timestamp actually evaluated for this key, or None."""
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                SELECT TOP 1 last_evaluated_ts FROM scan_progress
+                WHERE symbol = ? AND strategy = ? AND timeframe = ?
+            """, (symbol, strategy, timeframe))
+            row = cur.fetchone()
+        return row["last_evaluated_ts"] if row else None
+    except Exception as e:
+        print(f"[DB] get_scan_progress error: {e}")
+        return None
+
+
+def upsert_scan_progress(symbol: str, strategy: str, timeframe: str, last_evaluated_ts) -> bool:
+    """Record the newest candle timestamp this (symbol, strategy, timeframe) has now seen."""
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                MERGE INTO scan_progress AS target
+                USING (SELECT ? AS symbol, ? AS strategy, ? AS timeframe) AS source
+                ON (target.symbol = source.symbol
+                    AND target.strategy = source.strategy
+                    AND target.timeframe = source.timeframe)
+                WHEN MATCHED THEN
+                    UPDATE SET last_evaluated_ts = ?, updated_at = SYSDATETIMEOFFSET()
+                WHEN NOT MATCHED THEN
+                    INSERT (symbol, strategy, timeframe, last_evaluated_ts, updated_at)
+                    VALUES (source.symbol, source.strategy, source.timeframe, ?, SYSDATETIMEOFFSET());
+            """, (symbol, strategy, timeframe, last_evaluated_ts, last_evaluated_ts))
+        return True
+    except Exception as e:
+        print(f"[DB] upsert_scan_progress error: {e}")
+        return False
+
+
+# ============================================================
 # SCAN RUN-LOCK (prevents overlapping Container Apps Job executions)
 # ============================================================
 #
