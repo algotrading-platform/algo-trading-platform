@@ -41,6 +41,74 @@ from core.backtesting.backtest_store import write_result
 log = logging.getLogger("strategy_engine")
 IST = pytz.timezone("Asia/Kolkata")
 
+# ── Cash-Futures Arbitrage paper trading (Jwala, Sep 3) ──────
+# "Can we do paper trading of this also... this would run for the whole
+# month." Unlike equity strategies, an arbitrage trade is a two-leg
+# spread (buy spot + sell 1 futures lot) whose profit locks in AT ENTRY
+# (the captured basis) and is realized automatically at expiry
+# regardless of where spot moves afterward -- so it never goes through
+# RMS/OrderManager (built for %-risk equity position sizing) and is
+# never subject to the normal stop/target monitor (see
+# paper_trader.py's monitor_open(), which explicitly skips this
+# strategy). Quantity is the REAL exchange lot size, not a
+# capital-derived share count.
+ARBITRAGE_MAX_POSITIONS = 2            # Jwala, Sep 3: down from the generic 5 -- a
+                                        # real lot needs ~7-10L, a 5-way split of 20L
+                                        # can't afford even one ("I'll cancel it for
+                                        # two trades")
+ARBITRAGE_CAPITAL       = 2_000_000.0  # Jwala, Sep 3: "we can keep 20 lakhs"
+
+
+def _open_arbitrage_position(symbol: str, tf_name: str, result) -> None:
+    """
+    Open a paper position for a fresh Cash-Futures Arbitrage BUY alert.
+    Best-effort -- never let a paper-trading hiccup affect signal
+    generation. See the module-level ARBITRAGE_* constants' docstring
+    for why this bypasses PaperTrader/RMS entirely.
+    """
+    try:
+        ind        = result.indicators or {}
+        spot_price = ind.get("Spot_Price")
+        lot_size   = ind.get("Lot_Size")
+        spread_abs = ind.get("Spread_Abs")
+        if not spot_price or not lot_size:
+            log.warning(f"[Arbitrage] {symbol}: missing Spot_Price/Lot_Size in "
+                        f"indicators -- skipping paper trade")
+            return
+
+        from core.database import db
+        deployed       = db.get_capital_deployed(strategy=ARBITRAGE_STRATEGY_NAME)
+        capital_needed = float(spot_price) * int(lot_size)
+        if deployed + capital_needed > ARBITRAGE_CAPITAL:
+            log.info(f"[Arbitrage] {symbol}: skipping paper trade -- "
+                      f"needs ~₹{capital_needed:,.0f}, only "
+                      f"~₹{ARBITRAGE_CAPITAL - deployed:,.0f} left in the pool")
+            return
+
+        # stop_loss/target are informational only, not exit triggers --
+        # target = the theoretical spot level where the captured basis
+        # would be fully realized if it converged right now; stop_loss
+        # has no independent meaning here (schema requires a value).
+        insert = db.open_paper_position_if_capacity(
+            symbol=symbol,
+            side="BUY",
+            quantity=int(lot_size),
+            entry_price=float(spot_price),
+            stop_loss=float(spot_price),
+            target=float(spot_price) + float(spread_abs or 0),
+            strategy=ARBITRAGE_STRATEGY_NAME,
+            timeframe=tf_name,
+            max_positions=ARBITRAGE_MAX_POSITIONS,
+            risk_amount=0.0,
+        )
+        if insert.get("opened"):
+            log.info(f"[Arbitrage] Paper trade opened: {symbol} {lot_size} units @ ₹{spot_price:,.2f}")
+        else:
+            log.info(f"[Arbitrage] {symbol}: paper trade not opened -- {insert.get('reason')}")
+    except Exception as e:
+        log.warning(f"[Arbitrage] paper trading hook error for {symbol} (non-fatal): {e}")
+
+
 # ── Paper trading integration (lazy singleton) ───────────────
 _paper_trader = None
 
@@ -788,6 +856,9 @@ class StrategyEngine:
                     strategy=self.strategy_name,
                     signal_result=result,
                 )
+
+                if alert is not None and signal == "BUY":
+                    _open_arbitrage_position(symbol, tf_name, result)
 
                 return {
                     "symbol":      symbol,

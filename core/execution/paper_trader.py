@@ -312,6 +312,32 @@ class PaperTrader:
             side   = pos["side"]
             pid    = int(pos["id"])
 
+            # ── Cash-Futures Arbitrage — its own exit rule entirely
+            # (Jwala, Sep 3: "this would run for the whole month").
+            # Profit is the basis captured AT ENTRY, realized at expiry
+            # regardless of where spot moves afterward -- never subject
+            # to the stop/target/square-off checks below (see
+            # strategy_engine.py's ARBITRAGE_* constants docstring).
+            # Closed at `target` (= entry + captured basis), not a live
+            # spot price: close_paper_position()'s own (exit-entry)*qty
+            # formula then computes the real captured-basis profit,
+            # matching the strategy's Gross_Profit calc at entry time,
+            # without needing that function to special-case arbitrage.
+            if pos["strategy"] == "Cash-Futures Arbitrage":
+                from core.scheduler.signal_scheduler import is_last_trading_day_of_month
+                if is_last_trading_day_of_month():
+                    entry  = float(pos["entry_price"])
+                    target = float(pos["target"])
+                    qty    = int(pos["quantity"])
+                    if db.close_paper_position(pid, target, exit_reason="expiry"):
+                        pnl = (target - entry) * qty
+                        self.rms.record_realized_pnl(pnl)
+                        closed.append({
+                            "symbol": symbol, "reason": "expiry",
+                            "exit": target, "pnl": round(pnl, 2),
+                        })
+                continue
+
             # ── Start-of-day catch-up sweep — SHORT ONLY (reverted
             # Jul 24: "short should be closed once market closes, long
             # can be carried forward"). This REVERSES the Jul 11/14

@@ -33,10 +33,12 @@ IST = pytz.timezone("Asia/Kolkata")
 # 1.5% (Om, Aug 31 morning), then brought back down to 1% same day
 # (Jwala, Aug 31 walkthrough call: 1.5% choked off too many signals —
 # "let us keep it at one, let's get some signals" — 1% was judged the
-# better balance; can revisit to ~1% only in the last 1-2 weeks of the
-# month when expiry-driven spreads tend to widen).
-NORMAL_BASIS_PCT  = 1.0
-EXPIRY_BASIS_PCT  = 1.0
+# better balance). Raised again to 1.2% (Jwala, Sep 3 walkthrough —
+# now that arbitrage is actually being paper-traded, not just alerted,
+# 1.2% is needed to recover the real per-trade cost of a spot+futures
+# lot: "so that we are able to recover the cost part").
+NORMAL_BASIS_PCT  = 1.2
+EXPIRY_BASIS_PCT  = 1.2
 EXPIRY_WEEK_DAYS  = 7
 MAX_BASIS_PCT     = 10.0
 
@@ -261,7 +263,7 @@ class ArbitrageStrategy(BaseStrategy):
 
     Entry conditions:
         1. Futures price > Spot price (contango)
-        2. Basis >= NORMAL_BASIS_PCT / EXPIRY_BASIS_PCT (currently 1%)
+        2. Basis >= NORMAL_BASIS_PCT / EXPIRY_BASIS_PCT (currently 1.2%)
 
     Entry action:
         BUY spot shares + SELL futures contract simultaneously
@@ -273,8 +275,8 @@ class ArbitrageStrategy(BaseStrategy):
     name = "Cash-Futures Arbitrage"
     description = (
         "Captures risk-free spread between NSE spot and futures price. "
-        "Normal days: enters when basis >= 1%. "
-        "Expiry week (last 7 days): enters when basis >= 1%. "
+        "Normal days: enters when basis >= 1.2%. "
+        "Expiry week (last 7 days): enters when basis >= 1.2%. "
         "Action: Buy spot + Sell futures. Profit locked at entry."
     )
 

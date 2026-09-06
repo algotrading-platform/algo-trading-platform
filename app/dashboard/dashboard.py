@@ -1977,9 +1977,9 @@ def _render_closed_trades_table(df, key_prefix: str):
 
     page_df = df.iloc[pg*PAGE : (pg+1)*PAGE]
 
-    ct_widths = [1.2, 0.5, 0.5, 1.0, 1.0, 0.85, 0.85, 0.85, 0.7, 0.55]
+    ct_widths = [1.2, 0.5, 0.5, 1.0, 1.0, 0.85, 0.85, 0.85, 0.85, 0.7, 0.55]
     ct_h = st.columns(ct_widths)
-    for col, lbl in zip(ct_h, ["Stock", "Side", "Qty", "Entry", "Exit", "Gross P&L", "Net P&L",
+    for col, lbl in zip(ct_h, ["Stock", "Side", "Qty", "Entry", "Exit", "Target", "Gross P&L", "Net P&L",
                                  "Exit Reason", "Duration", "Chart"]):
         col.markdown(f'<div class="col-hdr">{lbl}</div>', unsafe_allow_html=True)
 
@@ -2030,18 +2030,20 @@ def _render_closed_trades_table(df, key_prefix: str):
                 f"<div style='font-size:10px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{closed}</div>"
                 f"</div>", unsafe_allow_html=True)
         with cc[5]:
-            st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:{pnl_c};font-weight:700;'>{'+' if pnl>=0 else '-'}₹{abs(pnl):,.0f}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--amber);'>₹{float(r['target']):,.2f}</div>", unsafe_allow_html=True)
         with cc[6]:
+            st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:{pnl_c};font-weight:700;'>{'+' if pnl>=0 else '-'}₹{abs(pnl):,.0f}</div>", unsafe_allow_html=True)
+        with cc[7]:
             if net_pnl_val is not None:
                 net_c = "var(--green)" if net_pnl_val >= 0 else "var(--red)"
                 st.markdown(f"<div style='padding:9px 0;font-family:JetBrains Mono,monospace;font-size:12px;color:{net_c};font-weight:700;'>{'+' if net_pnl_val>=0 else '-'}₹{abs(net_pnl_val):,.0f}</div>", unsafe_allow_html=True)
             else:
                 st.markdown("<div style='padding:9px 0;'><span class='badge-pending'>–</span></div>", unsafe_allow_html=True)
-        with cc[7]:
-            st.markdown(f"<div style='padding:9px 0;font-size:11px;color:{rc};font-family:JetBrains Mono,monospace;text-transform:uppercase;'>{reason}</div>", unsafe_allow_html=True)
         with cc[8]:
-            st.markdown(f"<div style='padding:9px 0;font-size:11px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{duration}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div style='padding:9px 0;font-size:11px;color:{rc};font-family:JetBrains Mono,monospace;text-transform:uppercase;'>{reason}</div>", unsafe_allow_html=True)
         with cc[9]:
+            st.markdown(f"<div style='padding:9px 0;font-size:11px;color:var(--t3);font-family:JetBrains Mono,monospace;'>{duration}</div>", unsafe_allow_html=True)
+        with cc[10]:
             _ct_key = f"{key_prefix}_closed_chart_{int(r['id'])}"
             if st.button("📈", key=_ct_key, help=f"View chart for {stock_display(ct_sym)}"):
                 if st.session_state.chart_symbol == ct_sym:
