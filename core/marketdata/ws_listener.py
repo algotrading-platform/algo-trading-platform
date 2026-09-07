@@ -86,6 +86,39 @@ RECONNECT_INTERVAL_SEC = 5
 BREAKOUT_WATCH_INTERVAL_SEC = 60  # fast breakout watch cadence (Sep 2) --
                                   # see WSListener._breakout_watch_loop
 
+# ── Full-universe pattern scan (Sep 7) ────────────────────────
+# Why this exists: the fast breakout watch above only starts once the
+# 5-min scanner has ALREADY seen "flagpole + pause, no breakout yet"
+# and written a pending_breakouts row. If a whole setup (flagpole ->
+# consolidation -> breakout) completes inside one 5-minute gap between
+# scans, that intermediate moment is never observed by anything, and
+# the trade only fires later via the slower normal-scan path, at a
+# worse price (confirmed live, Sep 7: BOSCHLTD.NS -- correct pattern,
+# correct stop/target, but no pending_breakouts row was ever written
+# because the pause and breakout candles were 5 minutes apart -- the
+# same 5-min gap the scanner checks at).
+#
+# The fix: run the SAME pattern check (ThreeBarFlagStrategy, including
+# its own candle catch-up) once a minute against every symbol in this
+# listener's universe, not just symbols the scanner already flagged.
+# This costs ZERO extra Upstox API calls -- the tick data is already
+# arriving via the WebSocket subscription this process already pays
+# for -- the only added cost is DB read + CPU inside this container.
+# Kept cheap deliberately: each symbol keeps a rolling in-memory 1-min
+# candle buffer, refreshed via a genuinely incremental DB read (only
+# rows newer than what's already buffered), not a full re-fetch every
+# cycle -- see _get_5min_candles(). A naive "re-resample the whole
+# day from scratch every minute for 500 symbols" version was
+# considered and rejected: on this project's Basic-tier (5 DTU) Azure
+# SQL database, that read volume risked forcing a costly tier upgrade
+# just to avoid timeouts. This design keeps the per-cycle DB read down
+# to whatever's genuinely new (usually 0-1 rows per symbol per pass).
+PATTERN_SCAN_INTERVAL_SEC = 60
+CANDLE_BUFFER_MAX_1MIN_ROWS = 400  # ~6.5h of 1-min data -- comfortably covers
+                                    # ATR(30) + VOLUME_LOOKBACK(20) + the
+                                    # pattern's own lookback + catch-up
+                                    # headroom, once resampled to 5-min bars
+
 
 def build_subscription_universe() -> list[dict]:
     """
@@ -120,6 +153,8 @@ class WSListener:
         self._streamer = None
         self._need_restart = False
         self._paper_trader = None  # lazy, see _get_paper_trader()
+        self._candle_buffers: dict = {}    # symbol -> 1-min OHLCV DataFrame (rolling)
+        self._buffer_last_ts: dict = {}    # symbol -> timestamp of that buffer's newest row
 
     # --------------------------------------------------------
     # connection
@@ -347,28 +382,44 @@ class WSListener:
                 self._act_on_breakout(row)
 
     def _act_on_breakout(self, row: dict) -> None:
-        symbol, strategy = row["symbol"], row["strategy"]
-        timeframe, side  = row["timeframe"], row["side"]
-        trigger = float(row["trigger_price"])
+        self._execute_trade(
+            symbol=row["symbol"], strategy=row["strategy"], timeframe=row["timeframe"],
+            side=row["side"], price=float(row["trigger_price"]),
+            stop=float(row["stop_loss"]), target=float(row["target"]),
+            strength=row.get("strength"),
+            reason=f"3-Bar Play fast breakout watch: price crossed {float(row['trigger_price']):.2f} "
+                   f"within ~1 min of the flagpole breakout level.",
+            source_label="BREAKOUT-WATCH",
+        )
 
+    def _execute_trade(
+        self, symbol: str, strategy: str, timeframe: str, side: str,
+        price: float, stop: float, target: float, strength: str | None,
+        reason: str, source_label: str,
+    ) -> None:
+        """
+        Shared trade-execution path for both the price-level watch
+        (_act_on_breakout, driven by pending_breakouts rows the normal
+        5-min scan wrote) and the full-universe pattern scan
+        (_pattern_scan_loop, Sep 7 -- detects AND confirms breakouts
+        itself every ~1 min, for setups that complete faster than the
+        5-min scan can ever see an intermediate "watching" state).
+        Fills at the given price (the strategy's own computed level),
+        logs the signal, and sends the Telegram alert via the same
+        alert_states table the normal scan uses, so whichever path
+        acts first naturally suppresses the other from re-firing.
+        """
         pt = self._get_paper_trader()
         if pt is None:
-            log.warning(f"breakout-watch: {symbol} crossed but PaperTrader unavailable — skipped")
+            log.warning(f"{source_label}: {symbol} crossed but PaperTrader unavailable — skipped")
             return
 
-        # Fills at the actual trigger level (the flagpole's own high/low),
-        # not whatever the live price has drifted to by the time this
-        # cycle runs -- that's the entire point of this fast watch: catch
-        # the breakout close to where it actually happened, not wherever
-        # a 5-minute candle later happens to close.
         outcome = pt.on_signal(
-            symbol=symbol, side=side, price=trigger,
+            symbol=symbol, side=side, price=price,
             strategy=strategy, timeframe=timeframe,
-            strength=row.get("strength"),
-            custom_stop=float(row["stop_loss"]),
-            custom_target=float(row["target"]),
+            strength=strength, custom_stop=stop, custom_target=target,
         )
-        log.info(f"BREAKOUT-WATCH  {symbol}  [{strategy}]  {side} @ {trigger}  -> {outcome}")
+        log.info(f"{source_label}  {symbol}  [{strategy}]  {side} @ {price}  -> {outcome}")
 
         if outcome.get("action") != "opened":
             return  # rejected/skipped/error — nothing further to log/alert
@@ -379,7 +430,7 @@ class WSListener:
 
         SignalLogger().log_signal(
             stock=symbol, timeframe=timeframe, signal=side,
-            rsi=0.0, price=trigger, strategy=strategy,
+            rsi=0.0, price=price, strategy=strategy,
         )
 
         # Same alert_states table the normal 5-min scan's check_alert()
@@ -390,17 +441,97 @@ class WSListener:
         # enrichment here (that's a normal-scan-only step) -- the
         # message renders with neutral trend arrows, which is an
         # accepted simplification for this fast path.
-        signal_result = SignalResult(
-            side, row.get("strength") or "MODERATE",
-            f"3-Bar Play fast breakout watch: price crossed {trigger:.2f} "
-            f"within ~1 min of the flagpole breakout level.",
-            {}, strategy,
-        )
+        signal_result = SignalResult(side, strength or "MODERATE", reason, {}, strategy)
         AlertManager().check_alert(
             timeframe=timeframe, stock=symbol, current_signal=side,
-            rsi=0.0, price=trigger, strategy=strategy,
+            rsi=0.0, price=price, strategy=strategy,
             signal_result=signal_result, data_source="upstox_ws",
         )
+
+    # --------------------------------------------------------
+    # full-universe pattern scan (Sep 7) -- see PATTERN_SCAN_INTERVAL_SEC's
+    # docstring above for why this exists.
+    # --------------------------------------------------------
+    def _get_5min_candles(self, symbol: str):
+        """
+        Rolling per-symbol 1-min candle buffer, refreshed via a cheap
+        incremental DB read, resampled to 5-min on return -- the shape
+        ThreeBarFlagStrategy needs. Returns None if there's not yet
+        enough history (e.g. early in the trading day, or right after
+        this process started) -- the strategy itself already handles
+        "insufficient data" gracefully, so callers can just skip.
+        """
+        import pandas as pd
+        from data.providers.upstox_provider import resample_ohlc
+
+        buf = self._candle_buffers.get(symbol)
+        if buf is None:
+            buf = db.get_live_candles_today(symbol)
+            if buf.empty:
+                return None
+        else:
+            last_ts = self._buffer_last_ts.get(symbol)
+            new_rows = db.get_live_candles_since(symbol, last_ts) if last_ts is not None else pd.DataFrame()
+            if not new_rows.empty:
+                buf = pd.concat([buf, new_rows], ignore_index=True)
+
+        if len(buf) > CANDLE_BUFFER_MAX_1MIN_ROWS:
+            buf = buf.iloc[-CANDLE_BUFFER_MAX_1MIN_ROWS:].reset_index(drop=True)
+
+        self._candle_buffers[symbol] = buf
+        self._buffer_last_ts[symbol] = buf["Datetime"].iloc[-1]
+
+        resampled = resample_ohlc(buf.copy(), "5min")
+        return resampled if resampled is not None and not resampled.empty else None
+
+    def _pattern_scan_loop(self) -> None:
+        while True:
+            time.sleep(PATTERN_SCAN_INTERVAL_SEC)
+            try:
+                self._scan_universe_for_patterns()
+            except Exception as e:
+                log.warning(f"pattern-scan cycle failed: {e}")
+
+    def _scan_universe_for_patterns(self) -> None:
+        from core.strategies.strategies import ThreeBarFlagStrategy
+        from core.engine.strategy_engine import _compute_catchup_n, _record_scan_progress
+
+        strat = ThreeBarFlagStrategy()
+        strategy_name, timeframe = strat.name, "5 Minutes"
+
+        for symbol in list(self._symbol_to_key.keys()):
+            try:
+                df = self._get_5min_candles(symbol)
+                if df is None:
+                    continue
+
+                check_n = _compute_catchup_n(df, symbol, strategy_name, timeframe)
+                result = strat.generate_signal(df.copy(), check_last_n=check_n)
+                _record_scan_progress(df, symbol, strategy_name, timeframe)
+
+                if result.signal in ("BUY", "SELL"):
+                    self._execute_trade(
+                        symbol=symbol, strategy=strategy_name, timeframe=timeframe,
+                        side=result.signal,
+                        price=result.indicators.get("Pattern_Entry"),
+                        stop=result.indicators.get("Pattern_Stop"),
+                        target=result.indicators.get("Pattern_Target_Exact"),
+                        strength=result.strength, reason=result.reason,
+                        source_label="PATTERN-SCAN",
+                    )
+                elif result.indicators.get("Watch_Entry") is not None:
+                    db.upsert_pending_breakout(
+                        symbol=symbol, strategy=strategy_name, timeframe=timeframe,
+                        side=result.indicators["Watch_Side"],
+                        trigger_price=result.indicators["Watch_Entry"],
+                        stop_loss=result.indicators["Watch_Stop"],
+                        target=result.indicators["Watch_Target"],
+                        strength=result.indicators.get("Watch_Strength"),
+                    )
+                else:
+                    db.cancel_pending_breakout(symbol, strategy_name, timeframe)
+            except Exception as e:
+                log.warning(f"pattern-scan failed for {symbol}: {e}")
 
     def run_forever(self) -> None:
         universe = build_subscription_universe()
@@ -414,6 +545,7 @@ class WSListener:
 
         threading.Thread(target=self._flush_loop, daemon=True, name="ws-listener-flush").start()
         threading.Thread(target=self._breakout_watch_loop, daemon=True, name="ws-listener-breakout-watch").start()
+        threading.Thread(target=self._pattern_scan_loop, daemon=True, name="ws-listener-pattern-scan").start()
         self._connect_once(instrument_keys)
 
         while True:

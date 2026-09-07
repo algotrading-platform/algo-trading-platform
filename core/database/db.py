@@ -1556,6 +1556,38 @@ def get_live_candles_today(symbol: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def get_live_candles_since(symbol: str, since_ts) -> pd.DataFrame:
+    """
+    1-minute candles for a symbol strictly AFTER since_ts, oldest first.
+    Unlike get_live_candles_today() (always re-reads the whole day),
+    this is the true incremental read: pass the timestamp of the last
+    row you already have, get back only what's new (Sep 7 --
+    ws_listener.py's per-minute pattern scan needs this to check ~500
+    symbols every minute without re-reading each one's full day of
+    history every single cycle, which would be the same DB load as
+    scanning fresh from scratch).
+    """
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                SELECT ts AS [Datetime], [open] AS [Open], high AS [High],
+                       low AS [Low], [close] AS [Close], volume AS [Volume]
+                FROM live_candles_1min
+                WHERE symbol = ? AND ts > ?
+                ORDER BY ts ASC
+            """, (symbol, since_ts))
+            rows = cur.fetchall()
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        for col in ("Open", "High", "Low", "Close"):
+            df[col] = df[col].astype(float)
+        return df
+    except Exception as e:
+        print(f"[DB] get_live_candles_since error for {symbol}: {e}")
+        return pd.DataFrame()
+
+
 def get_latest_live_price(symbol: str, max_age_minutes: int = 2) -> float | None:
     """
     Latest close for a symbol from the live feed. Returns None (not a
