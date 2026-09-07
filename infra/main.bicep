@@ -350,6 +350,10 @@ resource wsListenerApp 'Microsoft.App/containerApps@2023-05-01' = {
           name: 'telegram-chat-id'
           value: telegramChatId
         }
+        {
+          name: 'upstox-sandbox-token'
+          value: upstoxSandboxAccessToken
+        }
       ]
     }
     template: {
@@ -394,6 +398,19 @@ resource wsListenerApp 'Microsoft.App/containerApps@2023-05-01' = {
             {
               name: 'TELEGRAM_CHAT_ID'
               secretRef: 'telegram-chat-id'
+            }
+            {
+              // Sep 7: the fast breakout-watch thread (see
+              // strategy_engine.py's ARBITRAGE_* docstring / ws_listener.py's
+              // _act_on_breakout) opens paper trades via its OWN PaperTrader
+              // instance in THIS container -- it needs its own sandbox token,
+              // separate from the scanner job's. Missing here caused a real,
+              // observed miss: a PNB.NS breakout was correctly detected and
+              // triggered live by the fast watch, but silently failed to
+              // open (empty/expired token), and only opened ~5 min later
+              // through the slower normal-scan fallback at a worse price.
+              name: 'UPSTOX_SANDBOX_ACCESS_TOKEN'
+              secretRef: 'upstox-sandbox-token'
             }
           ]
           resources: {
