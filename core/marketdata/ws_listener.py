@@ -119,6 +119,21 @@ CANDLE_BUFFER_MAX_1MIN_ROWS = 400  # ~6.5h of 1-min data -- comfortably covers
                                     # pattern's own lookback + catch-up
                                     # headroom, once resampled to 5-min bars
 
+# ── Tick-staleness watchdog (Sep 8) ───────────────────────────
+# Confirmed live, Sep 8: the daily token expired ~5 AM IST, the WS
+# handshake failed with 401, and the Upstox SDK's own auto_reconnect
+# never called autoReconnectStopped -- it just went silent. Nothing
+# in this file noticed, because _need_restart is ONLY ever set from
+# that callback (or a crash in the connect thread itself). The
+# listener sat "Healthy" (the container's liveness probe only checks
+# the process is alive, not the socket) with a dead feed for the
+# entire trading day, even though a fresh token was saved to Azure
+# SQL at ~9:00 AM once the day's login ran -- this process never got
+# as far as looking for it. This watchdog is independent of any SDK
+# callback: if the market is open and no tick has arrived for
+# WS_STALE_THRESHOLD_SEC, force a reconnect ourselves.
+WS_STALE_THRESHOLD_SEC = 180
+
 
 def build_subscription_universe() -> list[dict]:
     """
@@ -155,6 +170,7 @@ class WSListener:
         self._paper_trader = None  # lazy, see _get_paper_trader()
         self._candle_buffers: dict = {}    # symbol -> 1-min OHLCV DataFrame (rolling)
         self._buffer_last_ts: dict = {}    # symbol -> timestamp of that buffer's newest row
+        self._last_tick_ts: float = time.time()  # last time ANY WS message arrived
 
     # --------------------------------------------------------
     # connection
@@ -190,6 +206,18 @@ class WSListener:
         return streamer
 
     def _connect_once(self, instrument_keys: list[str]) -> None:
+        # Best-effort cleanup of whatever connection (if any) is being
+        # replaced -- prevents a hung old streamer/thread from lingering
+        # forever across repeated forced reconnects (see the watchdog).
+        old_streamer = self._streamer
+        if old_streamer is not None:
+            try:
+                old_streamer.disconnect()
+            except Exception:
+                pass
+
+        self._last_tick_ts = time.time()
+
         def _run():
             try:
                 log.info(f"connecting WS — {len(instrument_keys)} instruments, mode=full")
@@ -206,6 +234,7 @@ class WSListener:
     # event handlers (called from the SDK's own thread(s))
     # --------------------------------------------------------
     def _on_message(self, message) -> None:
+        self._last_tick_ts = time.time()
         try:
             self._handle_feed(message)
         except Exception as e:
@@ -495,6 +524,20 @@ class WSListener:
     def _scan_universe_for_patterns(self) -> None:
         from core.strategies.strategies import ThreeBarFlagStrategy
         from core.engine.strategy_engine import _compute_catchup_n, _record_scan_progress
+        from core.scheduler.signal_scheduler import is_market_hours
+
+        # Confirmed live, Sep 7: right after a post-market deploy, this
+        # loop's bootstrap read (get_live_candles_today, a full day of
+        # already-closed candles) found BLUEJET.NS's pattern already
+        # complete on the last (stale, hours-old) candle and tried to
+        # act on it immediately -- only harmless because the sandbox
+        # token happened to be invalid at that moment. Gate the whole
+        # scan to the same trading window the real scanner uses, so a
+        # stale end-of-day candle from before this process started (or
+        # simply overnight/weekend idling) can never be mistaken for a
+        # live breakout.
+        if not is_market_hours():
+            return
 
         strat = ThreeBarFlagStrategy()
         strategy_name, timeframe = strat.name, "5 Minutes"
@@ -548,9 +591,23 @@ class WSListener:
         threading.Thread(target=self._pattern_scan_loop, daemon=True, name="ws-listener-pattern-scan").start()
         self._connect_once(instrument_keys)
 
+        from core.scheduler.signal_scheduler import is_market_hours
+
         while True:
             time.sleep(SUPERVISOR_TICK_SEC)
             if self._need_restart:
                 log.info("rebuilding WS connection with a fresh token")
                 self._need_restart = False
+                self._connect_once(instrument_keys)
+                continue
+
+            stale_for = time.time() - self._last_tick_ts
+            if is_market_hours() and stale_for > WS_STALE_THRESHOLD_SEC:
+                log.error(f"no WS ticks for {stale_for:.0f}s during market hours — "
+                          f"forcing reconnect (SDK gave no callback)")
+                _send_ops_alert(
+                    "stale_no_ticks",
+                    f"No live ticks received for over {WS_STALE_THRESHOLD_SEC // 60} min "
+                    f"during market hours — forcing a reconnect with a fresh token.",
+                )
                 self._connect_once(instrument_keys)
