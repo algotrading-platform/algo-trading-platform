@@ -18,6 +18,7 @@ from core.database.db import (
     get_paper_summary_by_strategy,
     get_signals_for_report,
     get_signal_summary_by_strategy,
+    get_trade_anatomy,
 )
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -126,6 +127,44 @@ def build_strategy_performance_table(trades: pd.DataFrame, by_strategy: pd.DataF
         "avg_win", "avg_loss", "profit_factor",
         "best_trade", "worst_trade", "avg_hold_minutes",
     ]]
+
+
+def build_trade_anatomy_table(trades: pd.DataFrame) -> pd.DataFrame:
+    """
+    One row per FLAGPOLE/CONSOLIDATION/BREAKOUT/ENTRY candle for every
+    "3 Bar Play" trade in `trades` (Sep 9) -- the flagpole/consolidation/
+    breakout rows come from trade_anatomy (persisted at signal-detection
+    time, see ThreeBarFlagStrategy._anatomy_indicators); the ENTRY row is
+    built from the trade's own entry_price/opened_at, so the sheet shows
+    the full "what the strategy saw" -> "what actually filled" story in
+    one place, matching the debugging table format used this session.
+    """
+    if trades is None or trades.empty:
+        return pd.DataFrame()
+
+    three_bar = trades[trades["strategy"] == "3 Bar Play"]
+    if three_bar.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for _, trade in three_bar.iterrows():
+        anatomy_rows = get_trade_anatomy(int(trade["id"]))
+        for a in anatomy_rows:
+            rows.append({
+                "Symbol": trade["symbol"], "Position ID": int(trade["id"]),
+                "Role": a["role"].capitalize(), "Candle Time": a["candle_ts"],
+                "Open": float(a["open"]), "High": float(a["high"]),
+                "Low": float(a["low"]), "Close": float(a["close"]),
+                "Price Used": float(trade["stop_loss"]) if a["role"] == "FLAGPOLE" else None,
+            })
+        rows.append({
+            "Symbol": trade["symbol"], "Position ID": int(trade["id"]),
+            "Role": "Entry", "Candle Time": trade["opened_at"],
+            "Open": None, "High": None, "Low": None, "Close": None,
+            "Price Used": float(trade["entry_price"]),
+        })
+
+    return pd.DataFrame(rows)
 
 
 def build_signal_history_dataset(start_utc, end_utc, strategy=None, timeframe=None) -> dict:

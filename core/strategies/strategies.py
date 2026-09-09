@@ -1153,6 +1153,29 @@ class ThreeBarFlagStrategy(BaseStrategy):
                     return False
         return True
 
+    @staticmethod
+    def _anatomy_indicators(bar1, consol: list, brk, bar1_volume: float) -> dict:
+        """
+        Raw OHLC+timestamp for the flagpole/consolidation/breakout
+        candles actually used for this signal (Sep 9) -- persisted
+        verbatim to the trade_anatomy table so reports/charts can show
+        exactly what the strategy saw, without needing to reconstruct
+        it after the fact from raw ticks. Uses the SAME bar1/consol/brk
+        objects already used for stop/target math above -- no re-derivation.
+        """
+        def _candle(row, volume=None) -> dict:
+            return {
+                "ts": row["Datetime"], "open": float(row["Open"]), "high": float(row["High"]),
+                "low": float(row["Low"]), "close": float(row["Close"]),
+                "volume": int(volume if volume is not None else row.get("Volume", 0)),
+            }
+
+        return {
+            "Anatomy_Flagpole": _candle(bar1, bar1_volume),
+            "Anatomy_Consolidation": [_candle(c) for c in consol],
+            "Anatomy_Breakout": _candle(brk),
+        }
+
     def generate_signal(self, df: pd.DataFrame, check_last_n: int = 1) -> SignalResult:
         """
         check_last_n (Sep 6 — candle catch-up): how many trailing candles
@@ -1279,6 +1302,7 @@ class ThreeBarFlagStrategy(BaseStrategy):
                             indicators.update({"Pattern_Entry": round(entry, 2), "Pattern_Stop": round(stop, 2),
                                                 "Pattern_Target": round(target, 2),
                                                 "Pattern_Target_Exact": round(target, 2)})
+                            indicators.update(self._anatomy_indicators(bar1, consol, brk, bar1_volume))
                             reason = (
                                 f"3-Bar Play LONG: explosive candle at {volume_ratio:.1f}x avg volume "
                                 f"and {round(bar1_range/atr_value,1)}x ATR({self.ATR_PERIOD}), "
@@ -1309,6 +1333,7 @@ class ThreeBarFlagStrategy(BaseStrategy):
                             indicators.update({"Pattern_Entry": round(entry, 2), "Pattern_Stop": round(stop, 2),
                                                 "Pattern_Target": round(target, 2),
                                                 "Pattern_Target_Exact": round(target, 2)})
+                            indicators.update(self._anatomy_indicators(bar1, consol, brk, bar1_volume))
                             reason = (
                                 f"3-Bar Play SHORT: explosive candle at {volume_ratio:.1f}x avg volume "
                                 f"and {round(bar1_range/atr_value,1)}x ATR({self.ATR_PERIOD}), "

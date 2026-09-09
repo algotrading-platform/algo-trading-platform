@@ -313,6 +313,24 @@ class RMS:
         if custom_target is not None:
             target = round(float(custom_target), 2)
 
+        # 3b. Sanity check target/stop are still on the correct side of the
+        # ACTUAL fill price (Sep 9 -- confirmed live on ADANIPOWER.NS: a
+        # custom_target computed from an earlier flagpole candle can end up
+        # behind a fast-moving price by the time the trade actually executes,
+        # producing a "profit target" that's really already a loss). Applies
+        # to both the custom-target path and the reward-ratio fallback --
+        # a corrupted stop_dist could theoretically misfire the fallback too.
+        if side == "BUY":
+            if target <= entry_price:
+                return reject(f"Invalid target: {target} not above entry {entry_price} for BUY (stale/late fill?)")
+            if stop_loss >= entry_price:
+                return reject(f"Invalid stop: {stop_loss} not below entry {entry_price} for BUY")
+        else:  # SELL
+            if target >= entry_price:
+                return reject(f"Invalid target: {target} not below entry {entry_price} for SELL (stale/late fill?)")
+            if stop_loss <= entry_price:
+                return reject(f"Invalid stop: {stop_loss} not above entry {entry_price} for SELL")
+
         # 4. Position size — CAPITAL-BASED (Jwala, Jul 9), now scaled by
         # signal grade (Jwala, Jul 14): base unit = this strategy's own
         # CAPITAL_PER_STRATEGY / MAX_OPEN_POSITIONS_PER_STRATEGY; a

@@ -144,6 +144,11 @@ def _compute_catchup_n(df, symbol: str, strategy: str, timeframe: str) -> int:
         if last_seen_ts.tzinfo is not None:
             last_seen_ts = last_seen_ts.tz_localize(None)
 
+        if last_seen_ts.date() < latest_ts.date():
+            return 1  # last scan was a prior calendar day -- never reach across the boundary
+            # (confirmed live, Sep 9: NEULANDLAB.NS's catch-up reached back ~22h
+            # overnight and fired a stale breakout from the previous session)
+
         new_candles = int((df["Datetime"].apply(
             lambda t: pd.Timestamp(t).tz_localize(None) if pd.Timestamp(t).tzinfo else pd.Timestamp(t)
         ) > last_seen_ts).sum())

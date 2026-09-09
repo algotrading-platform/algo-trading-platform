@@ -21,6 +21,7 @@ from core.reporting.excel_builder import (
 from core.reporting.periods import count_trading_days, get_period_bounds
 from core.reporting.report_data import (
     build_paper_trading_dataset, build_strategy_performance_table, compute_signal_conversion,
+    build_trade_anatomy_table,
 )
 
 try:
@@ -155,6 +156,21 @@ def build_paper_trading_report(
         ws7, trades, pnl_columns=("pnl", "net_pnl"),
         currency_columns=("entry_price", "exit_price", "stop_loss", "target", "pnl", "net_pnl", "charges", "risk_amount"),
         freeze_col=4, autofilter=True,
+    )
+
+    # ── Sheet 8: Trade Anatomy (Sep 9) ──
+    # Flagpole/consolidation/breakout candles + actual entry, per 3 Bar
+    # Play trade -- shows exactly what the strategy saw vs. what filled,
+    # matching the debugging table format used to diagnose ADANIPOWER.NS/
+    # NEULANDLAB.NS. Empty (sheet just gets a header row) if no 3 Bar Play
+    # trades are in this period, or if they predate this feature's
+    # deploy -- trade_anatomy is only populated going forward.
+    ws8 = wb.create_sheet("Trade Anatomy")
+    anatomy_df = build_trade_anatomy_table(trades)
+    write_dataframe(
+        ws8, anatomy_df,
+        currency_columns=("Open", "High", "Low", "Close", "Price Used"),
+        freeze_col=2, autofilter=True,
     )
 
     file_bytes = workbook_to_bytes(wb)

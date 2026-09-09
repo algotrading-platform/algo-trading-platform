@@ -841,13 +841,15 @@ def open_paper_position_if_capacity(
                         "reason": f"{symbol} already has an open position"}
 
             cur.execute("""
+                SET NOCOUNT ON;
                 INSERT INTO paper_positions
                     (symbol, side, quantity, entry_price, stop_loss, target,
                      strategy, timeframe, risk_amount, order_id,
                      peak_price, initial_stop_distance,
                      status, opened_at)
                 VALUES
-                    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', SYSDATETIMEOFFSET())
+                    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', SYSDATETIMEOFFSET());
+                SELECT SCOPE_IDENTITY() AS id;
             """, (
                 symbol, side, int(quantity),
                 round(float(entry_price), 2),
@@ -859,7 +861,8 @@ def open_paper_position_if_capacity(
                 round(float(entry_price), 2),  # peak_price starts at entry
                 initial_stop_distance,
             ))
-        return {"opened": True}
+            new_id = int(cur.fetchone()["id"])
+        return {"opened": True, "position_id": new_id}
     except Exception as e:
         print(f"[DB] open_paper_position_if_capacity error: {e}")
         return {"opened": False, "cause": "error", "reason": f"db error: {e}"}
@@ -1753,6 +1756,68 @@ def cancel_pending_breakout(symbol: str, strategy: str, timeframe: str) -> bool:
     except Exception as e:
         print(f"[DB] cancel_pending_breakout error: {e}")
         return False
+
+
+def insert_trade_anatomy(position_id: int, anatomy: dict) -> bool:
+    """
+    Persist the flagpole/consolidation/breakout candles a pattern
+    strategy used for this trade (Sep 9) -- `anatomy` is the dict
+    ThreeBarFlagStrategy._anatomy_indicators() builds, shaped
+    {"flagpole": {...}, "consolidation": [...], "breakout": {...}},
+    each candle dict having ts/open/high/low/close/volume.
+
+    Best-effort by design -- called from PaperTrader.on_signal() right
+    after a real trade opens; a failure here must never be allowed to
+    look like the trade itself failed, so callers should not treat a
+    False return as fatal (same posture as upsert_pending_breakout).
+    """
+    if not anatomy:
+        return False
+    try:
+        rows = []
+        flagpole = anatomy.get("flagpole")
+        if flagpole:
+            rows.append(("FLAGPOLE", 0, flagpole))
+        for i, c in enumerate(anatomy.get("consolidation") or []):
+            rows.append(("CONSOLIDATION", i, c))
+        breakout = anatomy.get("breakout")
+        if breakout:
+            rows.append(("BREAKOUT", 0, breakout))
+        if not rows:
+            return False
+
+        with _get_cursor() as cur:
+            for role, seq, c in rows:
+                cur.execute("""
+                    INSERT INTO trade_anatomy
+                        (position_id, role, seq, candle_ts, [open], high, low, [close], volume)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    position_id, role, seq, c["ts"],
+                    round(float(c["open"]), 2), round(float(c["high"]), 2),
+                    round(float(c["low"]), 2), round(float(c["close"]), 2),
+                    int(c.get("volume", 0)),
+                ))
+        return True
+    except Exception as e:
+        print(f"[DB] insert_trade_anatomy error for position {position_id}: {e}")
+        return False
+
+
+def get_trade_anatomy(position_id: int) -> list[dict]:
+    """All anatomy rows for one position, ordered flagpole -> consolidation -> breakout."""
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                SELECT role, seq, candle_ts, [open], high, low, [close], volume
+                FROM trade_anatomy
+                WHERE position_id = ?
+                ORDER BY CASE role WHEN 'FLAGPOLE' THEN 0 WHEN 'CONSOLIDATION' THEN 1 ELSE 2 END, seq
+            """, (position_id,))
+            return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[DB] get_trade_anatomy error for position {position_id}: {e}")
+        return []
 
 
 # ============================================================

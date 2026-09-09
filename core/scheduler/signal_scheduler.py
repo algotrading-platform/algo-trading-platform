@@ -224,9 +224,22 @@ PARALLEL_STRATEGIES = THREE_BAR_PLAY_STRATEGIES
 
 
 def _strategies_for_timeframe(tf_name: str) -> list:
-    """Which strategies actually run on a given timeframe's scan."""
-    if tf_name in THREE_BAR_PLAY_TIMEFRAMES:
-        return list(THREE_BAR_PLAY_STRATEGIES)
+    """
+    Which strategies actually run on a given timeframe's REST scan.
+
+    3 Bar Play retired from here Sep 9 -- it now runs SOLELY through
+    ws_listener.py's WebSocket-fed pattern-scan (all three timeframes,
+    every ~60s, from live tick data instead of a per-symbol REST call).
+    Running both in parallel meant two independently-clocked loops
+    wrote to the same scan_progress/pending_breakouts rows from
+    different candle sources -- a real source of missed/overlapping
+    catch-up windows. The REST scanner was also the actual cause of
+    the 15-25 min entry delays Jwala flagged: fetching ~500 symbols
+    individually over the network, bounded by a 300s deadline, versus
+    the WS path's cheap local DB reads with no such ceiling.
+    Always returns [] now -- kept as a function (not deleted outright)
+    in case a future non-pattern strategy needs REST-based scanning.
+    """
     return []
 
 # A single engine drives the multi-strategy scan. The label passed
@@ -370,15 +383,15 @@ def run_primary_scan(tf_name: str, now: datetime = None) -> None:
     """
     Parallel multi-strategy scan on all instruments.
 
-    Runs only "3 Bar Play" — on every intraday pass (5 Minutes/15
-    Minutes/1 Hour, Om, Aug 31 — see THREE_BAR_PLAY_TIMEFRAMES above;
-    RSI + MA, Volume Spike, and Experiment 3 Bar Play are muted
-    entirely). The EOD timeframes' _strategies_for_timeframe() returns
-    [], so this becomes a no-op call for 1 Day/1 Week/1 Month;
+    As of Sep 9, _strategies_for_timeframe() always returns [] here —
+    3 Bar Play was retired from this REST-based path entirely (it now
+    runs solely through ws_listener.py's WebSocket pattern-scan; see
+    that function's docstring for why), and every other strategy is
+    still muted. This function is effectively a no-op call now;
     run_multi_scan() exits early on an empty strategy list rather than
-    fetching data for nothing. Each signal is logged and alerted tagged
-    with its own strategy name, so the dashboard 'All Strategies' view
-    and per-strategy filter both work.
+    fetching data for nothing. Left in place (not deleted) so a future
+    non-pattern strategy has a ready-made REST scan path to route
+    through _strategies_for_timeframe().
 
     The dashboard strategy dropdown now only changes the VIEW (filter)
     — it no longer switches which strategies are scanned. All parallel

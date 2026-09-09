@@ -144,18 +144,19 @@ def build_subscription_universe() -> list[dict]:
     """
     _load_instruments()
     instruments = get_all_instruments_extended()
-    resolved: dict[str, str] = {}
+    resolved: dict[str, dict] = {}
     for inst in instruments:
         symbol = inst.get("symbol")
         if not symbol or symbol in resolved:
             continue
         key = get_instrument_key(symbol)
         if key:
-            resolved[symbol] = key
+            resolved[symbol] = {"instrument_key": key, "category": inst.get("category", "STOCK")}
 
     log.info(f"WS universe resolved: {len(resolved)} of "
              f"{len(instruments)} instruments have an Upstox key")
-    return [{"symbol": s, "instrument_key": k} for s, k in resolved.items()]
+    return [{"symbol": s, "instrument_key": v["instrument_key"], "category": v["category"]}
+            for s, v in resolved.items()]
 
 
 class WSListener:
@@ -171,6 +172,8 @@ class WSListener:
         self._candle_buffers: dict = {}    # symbol -> 1-min OHLCV DataFrame (rolling)
         self._buffer_last_ts: dict = {}    # symbol -> timestamp of that buffer's newest row
         self._last_tick_ts: float = time.time()  # last time ANY WS message arrived
+        self._symbol_to_category: dict[str, str] = {}
+        self._trend_engine = None  # lazy StrategyEngine("3 Bar Play"), see _get_trend_engine()
 
     # --------------------------------------------------------
     # connection
@@ -424,7 +427,7 @@ class WSListener:
     def _execute_trade(
         self, symbol: str, strategy: str, timeframe: str, side: str,
         price: float, stop: float, target: float, strength: str | None,
-        reason: str, source_label: str,
+        reason: str, source_label: str, anatomy: dict | None = None,
     ) -> None:
         """
         Shared trade-execution path for both the price-level watch
@@ -437,6 +440,14 @@ class WSListener:
         logs the signal, and sends the Telegram alert via the same
         alert_states table the normal scan uses, so whichever path
         acts first naturally suppresses the other from re-firing.
+
+        `anatomy` (Sep 9) -- the flagpole/consolidation/breakout candle
+        dict from ThreeBarFlagStrategy's indicators, passed through to
+        PaperTrader.on_signal() for persistence (see trade_anatomy
+        table). Only the pattern-scan path has this available (it just
+        ran generate_signal() itself); the pending-breakouts watch path
+        doesn't carry raw candle data, so it's None there -- acceptable
+        since that path is the exception now, not the primary one.
         """
         pt = self._get_paper_trader()
         if pt is None:
@@ -447,6 +458,7 @@ class WSListener:
             symbol=symbol, side=side, price=price,
             strategy=strategy, timeframe=timeframe,
             strength=strength, custom_stop=stop, custom_target=target,
+            anatomy=anatomy,
         )
         log.info(f"{source_label}  {symbol}  [{strategy}]  {side} @ {price}  -> {outcome}")
 
@@ -481,14 +493,26 @@ class WSListener:
     # full-universe pattern scan (Sep 7) -- see PATTERN_SCAN_INTERVAL_SEC's
     # docstring above for why this exists.
     # --------------------------------------------------------
-    def _get_5min_candles(self, symbol: str):
+    # 3 Bar Play's active timeframes (must match signal_scheduler.py's
+    # THREE_BAR_PLAY_TIMEFRAMES) and their resample rules. Sep 9 -- this
+    # loop used to only check "5 Minutes"; 15-min/1-hour breakouts still
+    # depended entirely on the slow REST scanner, with no fast safety
+    # net at all (confirmed: NEULANDLAB.NS's 1-Hour trade sat 22 hours
+    # stale for exactly this reason). Now the sole path for all three.
+    PATTERN_SCAN_TIMEFRAMES = [("5 Minutes", "5min"), ("15 Minutes", "15min"), ("1 Hour", "1h")]
+
+    def _get_candles(self, symbol: str, rule: str):
         """
         Rolling per-symbol 1-min candle buffer, refreshed via a cheap
-        incremental DB read, resampled to 5-min on return -- the shape
-        ThreeBarFlagStrategy needs. Returns None if there's not yet
-        enough history (e.g. early in the trading day, or right after
-        this process started) -- the strategy itself already handles
-        "insufficient data" gracefully, so callers can just skip.
+        incremental DB read, resampled to `rule` on return (e.g.
+        "5min"/"15min"/"1h") -- the shape ThreeBarFlagStrategy needs.
+        The buffer itself is fetched/maintained ONCE per symbol per
+        cycle regardless of how many timeframes are checked -- callers
+        looping over PATTERN_SCAN_TIMEFRAMES just resample the same
+        buffer three ways, no extra DB reads. Returns None if there's
+        not yet enough history (e.g. early in the trading day, or right
+        after this process started) -- the strategy itself already
+        handles "insufficient data" gracefully, so callers can just skip.
         """
         import pandas as pd
         from data.providers.upstox_provider import resample_ohlc
@@ -510,8 +534,68 @@ class WSListener:
         self._candle_buffers[symbol] = buf
         self._buffer_last_ts[symbol] = buf["Datetime"].iloc[-1]
 
-        resampled = resample_ohlc(buf.copy(), "5min")
+        resampled = resample_ohlc(buf.copy(), rule)
         return resampled if resampled is not None and not resampled.empty else None
+
+    def _get_trend_engine(self):
+        """
+        Lazy singleton, mirrors _get_paper_trader() -- only caches on
+        success. Used solely to reuse StrategyEngine._enrich_once()'s
+        stock trend/RSI fetch (see _apply_trend_grading below), so the
+        WS pattern-scan grades signals with the same nifty/stock-trend
+        context the REST scanner used to, now that it's this strategy's
+        sole detection path (Sep 9).
+        """
+        if self._trend_engine is None:
+            try:
+                from core.engine.strategy_engine import StrategyEngine
+                self._trend_engine = StrategyEngine("3 Bar Play")
+            except Exception as e:
+                log.warning(f"trend engine construction failed (will retry next cycle): {e}")
+                return None
+        return self._trend_engine
+
+    def _apply_trend_grading(self, symbol: str, timeframe: str, df, result):
+        """
+        Ports the REST scanner's suppression/grading step (see
+        strategy_engine.py's _scan_multi, ~line 770-808) into this path
+        -- only called when a signal actually fires (rare), so it adds
+        no per-symbol-per-cycle REST cost despite using REST-backed
+        trend/RSI fetches. Mutates `result` in place (strength) and
+        returns False if the signal should be suppressed entirely.
+        """
+        from core.indicators.indicators import add_rsi, should_suppress_signal, calculate_signal_strength
+        from core.engine.strategy_engine import get_nifty_all_trends
+        from data.providers.upstox_provider import UpstoxProvider
+
+        engine = self._get_trend_engine()
+        if engine is None:
+            return True  # best-effort -- don't block a real trade on this failing
+
+        provider = UpstoxProvider()
+        category = self._symbol_to_category.get(symbol, "STOCK")
+        nifty_trends = get_nifty_all_trends(provider)  # cached per calendar day -- cheap
+        nifty_trend = nifty_trends.get("daily", "NEUTRAL")
+        stock_trends = engine._get_stock_all_trends(provider, symbol)
+        stock_trend = stock_trends.get("daily", "NEUTRAL")
+
+        if should_suppress_signal(result.signal, nifty_trend, stock_trend):
+            return False
+
+        try:
+            df_with_rsi = add_rsi(df.copy())
+            rsi_val = round(float(df_with_rsi["RSI"].iloc[-1]), 2)
+        except Exception:
+            rsi_val = 50.0
+
+        result.strength = calculate_signal_strength(
+            signal=result.signal, nifty_trend=nifty_trend, stock_trend=stock_trend,
+            volume_ratio=result.indicators.get("Volume_Ratio", 0.0), tf_name=timeframe,
+            nifty_hourly=nifty_trends.get("hourly", "NEUTRAL"), nifty_5min=nifty_trends.get("5min", "NEUTRAL"),
+            stock_hourly=stock_trends.get("hourly", "NEUTRAL"), stock_5min=stock_trends.get("5min", "NEUTRAL"),
+            rsi_val=rsi_val,
+        )
+        return True
 
     def _pattern_scan_loop(self) -> None:
         while True:
@@ -540,41 +624,49 @@ class WSListener:
             return
 
         strat = ThreeBarFlagStrategy()
-        strategy_name, timeframe = strat.name, "5 Minutes"
+        strategy_name = strat.name
 
         for symbol in list(self._symbol_to_key.keys()):
-            try:
-                df = self._get_5min_candles(symbol)
-                if df is None:
-                    continue
+            for timeframe, rule in self.PATTERN_SCAN_TIMEFRAMES:
+                try:
+                    df = self._get_candles(symbol, rule)
+                    if df is None:
+                        continue
 
-                check_n = _compute_catchup_n(df, symbol, strategy_name, timeframe)
-                result = strat.generate_signal(df.copy(), check_last_n=check_n)
-                _record_scan_progress(df, symbol, strategy_name, timeframe)
+                    check_n = _compute_catchup_n(df, symbol, strategy_name, timeframe)
+                    result = strat.generate_signal(df.copy(), check_last_n=check_n)
+                    _record_scan_progress(df, symbol, strategy_name, timeframe)
 
-                if result.signal in ("BUY", "SELL"):
-                    self._execute_trade(
-                        symbol=symbol, strategy=strategy_name, timeframe=timeframe,
-                        side=result.signal,
-                        price=result.indicators.get("Pattern_Entry"),
-                        stop=result.indicators.get("Pattern_Stop"),
-                        target=result.indicators.get("Pattern_Target_Exact"),
-                        strength=result.strength, reason=result.reason,
-                        source_label="PATTERN-SCAN",
-                    )
-                elif result.indicators.get("Watch_Entry") is not None:
-                    db.upsert_pending_breakout(
-                        symbol=symbol, strategy=strategy_name, timeframe=timeframe,
-                        side=result.indicators["Watch_Side"],
-                        trigger_price=result.indicators["Watch_Entry"],
-                        stop_loss=result.indicators["Watch_Stop"],
-                        target=result.indicators["Watch_Target"],
-                        strength=result.indicators.get("Watch_Strength"),
-                    )
-                else:
-                    db.cancel_pending_breakout(symbol, strategy_name, timeframe)
-            except Exception as e:
-                log.warning(f"pattern-scan failed for {symbol}: {e}")
+                    if result.signal in ("BUY", "SELL"):
+                        if not self._apply_trend_grading(symbol, timeframe, df, result):
+                            continue  # suppressed -- opposing nifty+stock trend
+                        self._execute_trade(
+                            symbol=symbol, strategy=strategy_name, timeframe=timeframe,
+                            side=result.signal,
+                            price=result.indicators.get("Pattern_Entry"),
+                            stop=result.indicators.get("Pattern_Stop"),
+                            target=result.indicators.get("Pattern_Target_Exact"),
+                            strength=result.strength, reason=result.reason,
+                            source_label="PATTERN-SCAN",
+                            anatomy={
+                                "flagpole": result.indicators.get("Anatomy_Flagpole"),
+                                "consolidation": result.indicators.get("Anatomy_Consolidation"),
+                                "breakout": result.indicators.get("Anatomy_Breakout"),
+                            },
+                        )
+                    elif result.indicators.get("Watch_Entry") is not None:
+                        db.upsert_pending_breakout(
+                            symbol=symbol, strategy=strategy_name, timeframe=timeframe,
+                            side=result.indicators["Watch_Side"],
+                            trigger_price=result.indicators["Watch_Entry"],
+                            stop_loss=result.indicators["Watch_Stop"],
+                            target=result.indicators["Watch_Target"],
+                            strength=result.indicators.get("Watch_Strength"),
+                        )
+                    else:
+                        db.cancel_pending_breakout(symbol, strategy_name, timeframe)
+                except Exception as e:
+                    log.warning(f"pattern-scan failed for {symbol}/{timeframe}: {e}")
 
     def run_forever(self) -> None:
         universe = build_subscription_universe()
@@ -584,6 +676,7 @@ class WSListener:
 
         self._key_to_symbol = {u["instrument_key"]: u["symbol"] for u in universe}
         self._symbol_to_key = {u["symbol"]: u["instrument_key"] for u in universe}
+        self._symbol_to_category = {u["symbol"]: u.get("category", "STOCK") for u in universe}
         instrument_keys = list(self._key_to_symbol.keys())
 
         threading.Thread(target=self._flush_loop, daemon=True, name="ws-listener-flush").start()

@@ -164,6 +164,12 @@ class PaperTrader:
                                     # straight through to RMS.evaluate(); see
                                     # that function's docstring for how target
                                     # gets recomputed around it.
+        anatomy:     dict  = None,  # (Sep 9) flagpole/consolidation/breakout
+                                    # candle dict from ThreeBarFlagStrategy's
+                                    # indicators -- persisted to trade_anatomy
+                                    # on a successful open, for reports/charts.
+                                    # Best-effort: a write failure here never
+                                    # affects the trade itself.
         custom_target: float = None,  # strategy-native target level (Jwala,
                                     # Aug 26: 3 Bar Play's target is an exact
                                     # 70% of the flagpole candle's range, not
@@ -269,6 +275,12 @@ class PaperTrader:
         if not insert["opened"]:
             action = "reject" if insert.get("cause") == "cap" else "error"
             return {"action": action, "reason": insert["reason"]}
+
+        if anatomy:
+            try:
+                db.insert_trade_anatomy(insert["position_id"], anatomy)
+            except Exception as e:
+                log.warning(f"trade_anatomy write failed for {symbol} (non-fatal): {e}")
 
         return {
             "action":   "opened",

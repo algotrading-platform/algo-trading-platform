@@ -967,6 +967,35 @@ def build_tv_chart(
                     ts_str = sig.get("Timestamp", "")
                     if not ts_str:
                         continue
+                    t = _snap_to_candle(_to_chart_epoch(pd.to_datetime(ts_str, utc=True)))
+
+                    # 3 Bar Play trade-anatomy markers (Sep 9) -- flagpole/
+                    # stop/breakout candles, tagged separately so they
+                    # bypass the BUY/SELL-only signal filter below. Sourced
+                    # from show_chart_panel()'s get_trade_anatomy() lookup.
+                    if sig.get("Kind") == "anatomy":
+                        role = sig.get("Role")
+                        price = sig.get("Price", "")
+                        if role == "FLAGPOLE":
+                            markers.append({"time": t, "position": "inBar", "color": "#f2a93b",
+                                             "shape": "square", "text": "FLAGPOLE"})
+                        elif role == "STOP":
+                            side = sig.get("Side", "BUY")
+                            markers.append({
+                                "time": t, "color": "#f05555", "shape": "circle",
+                                "position": "belowBar" if side == "BUY" else "aboveBar",
+                                "text": f"STOP ₹{price}",
+                            })
+                        elif role == "BREAKOUT":
+                            side = sig.get("Side", "BUY")
+                            markers.append({
+                                "time": t, "color": "#9b6dff",
+                                "shape": "arrowUp" if side == "BUY" else "arrowDown",
+                                "position": "belowBar" if side == "BUY" else "aboveBar",
+                                "text": f"BREAKOUT ₹{price}",
+                            })
+                        continue
+
                     signal_type = sig.get("Signal", "")
                     # Skip HOLD / anything that isn't an actual BUY or SELL —
                     # log_signal() writes a row on every scan (including
@@ -974,7 +1003,6 @@ def build_tv_chart(
                     # with HOLD rows mislabeled as red SELL arrows.
                     if signal_type not in ("BUY", "SELL"):
                         continue
-                    t = _snap_to_candle(_to_chart_epoch(pd.to_datetime(ts_str, utc=True)))
                     label = sig.get("Label")
                     text  = f"{label} {signal_type} ₹{sig.get('Price','')}" if label else f"{signal_type} ₹{sig.get('Price','')}"
                     markers.append({
@@ -1068,6 +1096,9 @@ body {{ background:{bg}; font-family:'IBM Plex Sans',sans-serif; overflow:hidden
   <div class="legend-item"><div class="legend-dot" style="background:#1ec9a0;opacity:0.6"></div>S1/S2 Support</div>
   <div class="legend-item"><div class="legend-dot" style="background:#f05555;opacity:0.6"></div>R1/R2 Resistance</div>
   <div class="legend-item"><div class="legend-dot" style="background:#9b6dff;opacity:0.6"></div>RSI 25/75 levels</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#f2a93b"></div>Flagpole</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#f05555"></div>Stop level</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#9b6dff"></div>Breakout</div>
 </div>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <script>
@@ -1562,6 +1593,30 @@ def show_chart_panel():
                     "Price":     p["exit_price"],
                     "Label":     f"EXIT {str(p.get('exit_reason', '')).upper()}".strip(),
                 })
+    except Exception:
+        pass
+
+    # Trade-anatomy markers (Sep 9) -- flagpole/stop/breakout candles for
+    # every 3 Bar Play position on this symbol, so a trade's chart shows
+    # exactly what the strategy saw, not just where it entered/exited.
+    try:
+        from core.database.db import get_trade_anatomy
+        anatomy_positions = []
+        if open_pos is not None and not open_pos.empty:
+            anatomy_positions += [p for _, p in open_pos.iterrows() if p.get("strategy") == "3 Bar Play"]
+        if closed_pos is not None and not closed_pos.empty:
+            anatomy_positions += [p for _, p in closed_pos.iterrows() if p.get("strategy") == "3 Bar Play"]
+
+        for p in anatomy_positions:
+            rows = get_trade_anatomy(int(p["id"]))
+            for a in rows:
+                if a["role"] == "FLAGPOLE":
+                    sym_signals.append({"Kind": "anatomy", "Role": "FLAGPOLE", "Timestamp": a["candle_ts"]})
+                    sym_signals.append({"Kind": "anatomy", "Role": "STOP", "Timestamp": a["candle_ts"],
+                                         "Price": p["stop_loss"], "Side": p["side"]})
+                elif a["role"] == "BREAKOUT":
+                    sym_signals.append({"Kind": "anatomy", "Role": "BREAKOUT", "Timestamp": a["candle_ts"],
+                                         "Price": a["high"] if p["side"] == "BUY" else a["low"], "Side": p["side"]})
     except Exception:
         pass
 
