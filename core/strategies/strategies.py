@@ -1116,10 +1116,11 @@ class ThreeBarFlagStrategy(BaseStrategy):
     OVERSHOOT_LIMIT    = 0.1   # consolidation high can't clear bar1's high by >10% of bar1's range
     ATR_PERIOD         = 30    # widened from 14 (Jwala, Aug 31 walkthrough call: 14 wasn't
                                 # a long enough baseline on 5-min bars to judge "unusual")
-    # TEMP TEST (Sep 10, Om) -- dropped from 4.0 to 2.0 to verify the signal
-    # pipeline fires end-to-end on a quiet day. REVERT to 4.0 once confirmed.
-    ATR_MULTIPLE       = 2.0   # bar1's range must be >= this many ATRs (Jwala, Aug 31: raised
+    ATR_MULTIPLE       = 4.0   # bar1's range must be >= this many ATRs (Jwala, Aug 31: raised
                                 # from 3x to "four times" after reviewing missed/failed setups)
+                                # (temporarily dropped to 2.0 on Sep 10 to verify the signal
+                                # pipeline fires end-to-end; reverted to 4.0 after confirming
+                                # the real bug was a stale sandbox client, not a threshold issue)
     STOP_PCT_OF_RANGE   = 0.5  # stop = bar1's midpoint -- 50% of the flagpole's FULL
                                 # High-Low range back from entry (Jwala, Sep 3: "stop should
                                 # be at half of the flagpole candle" -- replaces the prior
@@ -1130,9 +1131,7 @@ class ThreeBarFlagStrategy(BaseStrategy):
                                 # after finding it was measured against the wrong reference --
                                 # "we will only look at the body part" for target specifically).
     STRONG_VOLUME_MULTIPLE = 2.0
-    # TEMP TEST (Sep 10, Om) -- dropped from 0.6 to 0.3 to verify the signal
-    # pipeline fires end-to-end on a quiet day. REVERT to 0.6 once confirmed.
-    BODY_RATIO_MIN     = 0.3   # (Close-Open)/(High-Low) floor for bar1 -- filters out
+    BODY_RATIO_MIN     = 0.6   # (Close-Open)/(High-Low) floor for bar1 -- filters out
                                 # wicky/doji flagpole candles in favor of a solid green body
                                 # (Jwala, Aug 31). No exact ratio was agreed on the call; 0.6
                                 # is a middle-of-the-road choice (a Marubozu-like solid-body

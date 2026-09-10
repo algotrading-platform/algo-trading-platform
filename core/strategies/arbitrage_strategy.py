@@ -37,10 +37,11 @@ IST = pytz.timezone("Asia/Kolkata")
 # now that arbitrage is actually being paper-traded, not just alerted,
 # 1.2% is needed to recover the real per-trade cost of a spot+futures
 # lot: "so that we are able to recover the cost part").
-# TEMP TEST (Sep 10, Om) -- dropped from 1.2 to 0.8 to verify the signal
-# pipeline fires end-to-end on a quiet day. REVERT to 1.2/1.2 once confirmed.
-NORMAL_BASIS_PCT  = 0.8
-EXPIRY_BASIS_PCT  = 0.8
+NORMAL_BASIS_PCT  = 1.2
+EXPIRY_BASIS_PCT  = 1.2
+# (temporarily dropped to 0.8 on Sep 10 to verify the signal pipeline
+# fires end-to-end; reverted to 1.2 after confirming the real bug was
+# a stale sandbox client, not a threshold issue)
 EXPIRY_WEEK_DAYS  = 7
 MAX_BASIS_PCT     = 10.0
 
