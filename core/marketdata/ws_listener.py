@@ -462,6 +462,22 @@ class WSListener:
         )
         log.info(f"{source_label}  {symbol}  [{strategy}]  {side} @ {price}  -> {outcome}")
 
+        if outcome.get("action") == "error":
+            # Confirmed live, Sep 10: a genuine BUY/SELL was detected and
+            # triggered correctly, but every single downstream attempt
+            # failed silently for over an hour (a stale sandbox client in
+            # this long-running singleton) -- nothing surfaced anywhere
+            # except a container log line nobody was watching. "error"
+            # (unlike "reject", which covers expected, high-frequency
+            # outcomes like a full position cap) means something is
+            # actually broken, not just a normal pass -- worth a direct,
+            # rate-limited ops alert rather than silence.
+            _send_ops_alert(
+                "signal_execution_error",
+                f"{source_label}: {symbol} {side} signal fired but failed to execute — "
+                f"{outcome.get('reason', 'unknown error')}",
+            )
+
         if outcome.get("action") != "opened":
             return  # rejected/skipped/error — nothing further to log/alert
 
