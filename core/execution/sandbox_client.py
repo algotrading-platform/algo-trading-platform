@@ -24,14 +24,21 @@ from dotenv import load_dotenv
 load_dotenv()
 log = logging.getLogger("sandbox_client")
 
-# Sep 11 -- confirmed live that a 401 from Upstox's sandbox can be a
-# few-minutes transient blip that clears on its own with no change on
-# our end (re-placing the SAME order with the SAME token moments later
-# succeeded). A single immediate retry can still land inside that same
-# window, so this retries a few times with a short delay rather than
-# giving up after one attempt.
-MAX_401_RETRIES = 3
-RETRY_401_DELAY_SEC = 3
+# Sep 11 -- confirmed live, twice, with real production failures
+# (RAMCOCEM.NS, then BAJAJFINSV.NS): a 401 from Upstox's sandbox can
+# persist for LONGER than a few seconds -- BAJAJFINSV failed 401 on 4
+# straight attempts spanning ~12s (the original MAX_401_RETRIES=3
+# window), then the exact same token, same process, same replica
+# succeeded (got past auth to a normal response) when re-tried
+# manually ~2 minutes later with zero changes on our end. This is a
+# genuine intermittent reliability issue on Upstox's sandbox side, not
+# a bad/expired token -- proven by the token working again shortly
+# after with nothing refreshed. Widened so the retry window can
+# realistically outlast a multi-ten-second blip: ~7 attempts over
+# ~48s, still comfortably under the 60s pattern-scan cadence so one
+# stuck symbol doesn't meaningfully delay the rest of that cycle.
+MAX_401_RETRIES = 7
+RETRY_401_DELAY_SEC = 7
 
 
 class SandboxClient:
