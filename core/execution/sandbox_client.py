@@ -17,11 +17,21 @@
 # ============================================================
 
 import os
+import time
 import logging
 from dotenv import load_dotenv
 
 load_dotenv()
 log = logging.getLogger("sandbox_client")
+
+# Sep 11 -- confirmed live that a 401 from Upstox's sandbox can be a
+# few-minutes transient blip that clears on its own with no change on
+# our end (re-placing the SAME order with the SAME token moments later
+# succeeded). A single immediate retry can still land inside that same
+# window, so this retries a few times with a short delay rather than
+# giving up after one attempt.
+MAX_401_RETRIES = 3
+RETRY_401_DELAY_SEC = 3
 
 
 class SandboxClient:
@@ -90,30 +100,40 @@ class SandboxClient:
 
         Returns: {"ok": bool, "order_id": str|None, "error": str|None}
 
-        Retries once, with a forced client rebuild, on an auth-looking
-        (401) failure (Sep 10) -- confirmed live: a long-running
-        singleton's cached client can start failing with 401 even
-        though the env var's token is genuinely fine (a brand-new
-        process reading the same variable at the same moment
-        succeeded), for over an hour, on every single trade, entirely
-        silently (the caller only alerts on a successful open). A
-        container restart always fixed it, meaning the failure was in
-        this object's own cached SDK client state, not upstream --
-        so rebuild-and-retry here removes the need for that restart.
+        Retries on an auth-looking (401) failure, with a forced client
+        rebuild before each retry (Sep 10, extended Sep 11). Two
+        distinct 401 failure modes confirmed live, both now covered:
+          1. (Sep 10) A long-running singleton's cached SDK client can
+             start failing with 401 even though the env var's token is
+             genuinely fine -- a brand-new process reading the same
+             variable at the same moment succeeded. A container restart
+             always fixed it. One rebuild-and-retry covers this.
+          2. (Sep 11) The token itself can be rejected with 401 for a
+             few minutes and then work again with NO change on our end
+             -- confirmed by directly re-placing an order with the same
+             token moments after a real 401, and it succeeded (got past
+             auth to a normal validation error). A single immediate
+             retry can still land inside that same brief window, so
+             this now retries up to MAX_401_RETRIES times with a short
+             delay between attempts, giving a transient blip (on
+             Upstox's sandbox side, not ours) time to clear.
         """
         self._rebuild_client()  # cheap no-op if the token hasn't changed and is already working
         if not self._ready:
             return {"ok": False, "order_id": None, "error": "sandbox client not ready"}
 
         result = self._place_order_once(order, instrument_key)
-        if result["ok"] or "401" not in (result.get("error") or ""):
-            return result
-
-        log.warning(f"place_order 401 for {order.symbol} -- forcing client rebuild and retrying once")
-        self._rebuild_client(force=True)
-        if not self._ready:
-            return result
-        return self._place_order_once(order, instrument_key)
+        attempt = 1
+        while not result["ok"] and "401" in (result.get("error") or "") and attempt <= MAX_401_RETRIES:
+            log.warning(f"place_order 401 for {order.symbol} -- attempt {attempt}/{MAX_401_RETRIES}, "
+                        f"forcing client rebuild and retrying in {RETRY_401_DELAY_SEC}s")
+            time.sleep(RETRY_401_DELAY_SEC)
+            self._rebuild_client(force=True)
+            if not self._ready:
+                return result
+            result = self._place_order_once(order, instrument_key)
+            attempt += 1
+        return result
 
     def _place_order_once(self, order, instrument_key: str) -> dict:
         try:
