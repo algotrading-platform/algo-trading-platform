@@ -1591,6 +1591,50 @@ def get_live_candles_since(symbol: str, since_ts) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def get_live_candles_before_today(symbol: str, days: int) -> pd.DataFrame:
+    """
+    1-minute candles for a symbol from the last `days` calendar days,
+    EXCLUDING today (oldest first) -- Sep 11: ws_listener.py's pattern
+    scan bootstrapped its rolling buffer with get_live_candles_today()
+    ALONE, which only ever holds a single trading day's worth of 1-min
+    data (~375 rows at most). Resampled to 15-min that's ~25 bars/day
+    and to 1-hour just ~6/day -- ThreeBarFlagStrategy needs at least
+    VOLUME_LOOKBACK+4=24 bars before it will even attempt a pattern
+    check, so the 1-Hour timeframe could NEVER fire (same-day data
+    never reaches 24 hourly bars) and 15-Minute only barely qualified
+    in the last few minutes of each session -- confirmed live: zero
+    3-Bar-Play signals since the WS-only migration, versus the old
+    REST scanner's 5d/15d lookback windows which had no such problem.
+    This is the fix: a one-time, per-symbol multi-day bootstrap the
+    pattern scan resamples immediately and caches (see
+    WSListener._get_historical_bars) -- the raw rows returned here are
+    NOT meant to be kept in memory long-term (500 symbols x many days
+    of 1-min data would be hundreds of MB); the caller resamples once
+    and discards this.
+    """
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        today_start_utc, _ = _ist_today_bounds_utc()
+        with _get_cursor() as cur:
+            cur.execute("""
+                SELECT ts AS [Datetime], [open] AS [Open], high AS [High],
+                       low AS [Low], [close] AS [Close], volume AS [Volume]
+                FROM live_candles_1min
+                WHERE symbol = ? AND ts >= ? AND ts < ?
+                ORDER BY ts ASC
+            """, (symbol, cutoff, today_start_utc))
+            rows = cur.fetchall()
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        for col in ("Open", "High", "Low", "Close"):
+            df[col] = df[col].astype(float)
+        return df
+    except Exception as e:
+        print(f"[DB] get_live_candles_before_today error for {symbol}: {e}")
+        return pd.DataFrame()
+
+
 def get_latest_live_price(symbol: str, max_age_minutes: int = 2) -> float | None:
     """
     Latest close for a symbol from the live feed. Returns None (not a

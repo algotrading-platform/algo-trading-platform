@@ -255,6 +255,24 @@ class RMS:
 
         self._roll_day_if_needed()
 
+        # Re-sync from the DB before every decision (Sep 11 review) --
+        # not just at construction. _realized_pnl_today/_trading_halted
+        # are otherwise purely in-memory, which silently breaks the kill
+        # switch now that 3 Bar Play's entries run exclusively through
+        # ws_listener.py's long-lived RMS instance (one process for the
+        # whole trading day) while CLOSES (which call record_realized_pnl)
+        # happen via the separate, short-lived algo-scanner job process.
+        # Those two processes never share memory, so without this
+        # re-sync, ws-listener's view of today's P&L would freeze at
+        # whatever it was when first constructed, and new 3 Bar Play
+        # trades could keep opening for the rest of the day even after
+        # the 1% daily loss limit was breached by positions the scanner
+        # job closed. get_today_pnl_summary() is a fresh, authoritative
+        # aggregate query every time -- cheap and safe to re-run here,
+        # since evaluate() is only called per candidate trade, not per
+        # symbol scanned.
+        self._sync_today_pnl_from_db()
+
         def reject(reason: str) -> RMSDecision:
             return RMSDecision(
                 approved=False, symbol=symbol, side=side,
