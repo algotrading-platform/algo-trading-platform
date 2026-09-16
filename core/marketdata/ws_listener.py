@@ -212,6 +212,10 @@ class WSListener:
         self._paper_trader_lock = threading.Lock()
         self._candle_buffers: dict = {}    # symbol -> 1-min OHLCV DataFrame (rolling, TODAY only)
         self._buffer_last_ts: dict = {}    # symbol -> timestamp of that buffer's newest row
+        self._candle_buffer_day = None     # calendar date the above buffers were built for --
+                                            # see _refresh_today_buffer()'s day-rollover reset
+        self._no_data_warned: set = set()  # symbols already logged as having zero candle data
+                                            # today (Sep 16) -- warn once, not every 60s cycle
         self._historical_bars: dict = {}   # symbol -> {rule: DataFrame} resampled bars from
                                             # before today -- see _get_historical_bars()
         self._historical_bootstrap_day = None  # calendar date the above cache was built for
@@ -394,28 +398,40 @@ class WSListener:
     def _flush_loop(self) -> None:
         while True:
             time.sleep(FLUSH_INTERVAL_SEC)
-            now_minute = datetime.now(IST).replace(second=0, microsecond=0)
-            with self._lock:
-                rows = list(self._pending.values())
-                # Evict candles whose minute has already closed -- they
-                # were flushed at least once already and won't receive
-                # any more ticks (a live tick for a new minute replaces
-                # the dict entry instead of mutating this one; see
-                # _extract_candle). Without this, an instrument whose
-                # feed silently dies keeps the SAME stale row here
-                # forever, and it gets re-flushed every cycle with a
-                # bumped updated_at but unchanged ts/close -- making a
-                # dead price look fresh to any staleness check keyed
-                # off updated_at instead of the candle's own ts.
-                for key, row in list(self._pending.items()):
-                    if row["ts"] < now_minute:
-                        del self._pending[key]
-            if not rows:
-                continue
-            if db.upsert_live_candles(rows):
-                log.debug(f"flushed {len(rows)} candle rows")
-            else:
-                log.warning(f"flush failed for {len(rows)} rows — will retry next cycle")
+            # Sep 16 -- this cycle body used to have NO exception
+            # handling at all, unlike _breakout_watch_loop/
+            # _pattern_scan_loop which both wrap theirs. db.upsert_
+            # live_candles() catches internally today, so this was
+            # low-risk in practice, but any future change touching row/
+            # dict handling here (e.g. a malformed row) would silently
+            # and permanently kill candle flushing for the rest of the
+            # process's life -- no crash, no log, no alert. Matching
+            # the other two loops' defensive pattern.
+            try:
+                now_minute = datetime.now(IST).replace(second=0, microsecond=0)
+                with self._lock:
+                    rows = list(self._pending.values())
+                    # Evict candles whose minute has already closed -- they
+                    # were flushed at least once already and won't receive
+                    # any more ticks (a live tick for a new minute replaces
+                    # the dict entry instead of mutating this one; see
+                    # _extract_candle). Without this, an instrument whose
+                    # feed silently dies keeps the SAME stale row here
+                    # forever, and it gets re-flushed every cycle with a
+                    # bumped updated_at but unchanged ts/close -- making a
+                    # dead price look fresh to any staleness check keyed
+                    # off updated_at instead of the candle's own ts.
+                    for key, row in list(self._pending.items()):
+                        if row["ts"] < now_minute:
+                            del self._pending[key]
+                if not rows:
+                    continue
+                if db.upsert_live_candles(rows):
+                    log.debug(f"flushed {len(rows)} candle rows")
+                else:
+                    log.warning(f"flush failed for {len(rows)} rows — will retry next cycle")
+            except Exception as e:
+                log.warning(f"flush cycle failed: {e}")
 
     # --------------------------------------------------------
     # fast breakout watch (main-process thread, Sep 2)
@@ -574,10 +590,7 @@ class WSListener:
             )
 
         if outcome.get("action") != "opened":
-            return outcome
-
-        if outcome.get("action") != "opened":
-            return  # rejected/skipped/error — nothing further to log/alert
+            return outcome  # rejected/skipped/error — nothing further to log/alert
 
         from core.logger.signal_logger import SignalLogger
         from core.alerts.alert_manager import AlertManager
@@ -631,6 +644,23 @@ class WSListener:
         buffer DataFrame, or None if there's no data at all yet today.
         """
         import pandas as pd
+        from datetime import date
+
+        # Day-rollover reset (Sep 16) -- this process is designed to run
+        # all day, every day, with no scheduled restart (see module
+        # docstring), but this buffer had no day-boundary check at all,
+        # unlike _historical_bars (which does, see _get_historical_bars).
+        # Without it, a process surviving past midnight would keep
+        # appending onto yesterday's tail via get_live_candles_since()
+        # and resample "today's" data from a mix of two calendar days --
+        # get_live_candles_before_today() would then ALSO include
+        # yesterday's rows, double-counting them into the pattern check.
+        today = date.today()
+        if self._candle_buffer_day != today:
+            self._candle_buffers = {}
+            self._buffer_last_ts = {}
+            self._candle_buffer_day = today
+            self._no_data_warned = set()
 
         buf = self._candle_buffers.get(symbol)
         if buf is None:
@@ -695,7 +725,16 @@ class WSListener:
                             r = r.iloc[-HISTORICAL_BARS_MAX_ROWS:].reset_index(drop=True)
                         bars[rule] = r
         except Exception as e:
-            log.warning(f"historical-bars bootstrap failed for {symbol}: {e}")
+            # Do NOT cache on failure (a transient DB hiccup) -- caching
+            # {} here would permanently mark this symbol "bootstrapped"
+            # for the rest of the day with no multi-day history at all,
+            # silently reintroducing the under-24-bar starvation bug
+            # HISTORICAL_BOOTSTRAP_DAYS exists to fix. Leaving it
+            # uncached means the next cycle retries it (consuming
+            # another budget slot), same as a symbol that hasn't had
+            # its turn yet.
+            log.warning(f"historical-bars bootstrap failed for {symbol} (will retry next cycle): {e}")
+            return {}
 
         self._historical_bars[symbol] = bars
         return bars
@@ -837,6 +876,15 @@ class WSListener:
                 log.warning(f"pattern-scan buffer refresh failed for {symbol}: {e}")
                 continue
             if today_buf is None:
+                # Sep 16 -- this used to be a fully silent, permanent
+                # per-cycle skip with zero trace anywhere if a symbol's
+                # WS feed never produced a tick (subscription/key
+                # mismatch, etc). Warn once per symbol per day, not
+                # every 60s, so it's visible without being log spam.
+                if symbol not in self._no_data_warned:
+                    self._no_data_warned.add(symbol)
+                    log.warning(f"pattern-scan: no candle data at all today for {symbol} -- "
+                                f"skipping until a tick arrives (won't repeat this warning today)")
                 continue
 
             for timeframe, rule in self.PATTERN_SCAN_TIMEFRAMES:
