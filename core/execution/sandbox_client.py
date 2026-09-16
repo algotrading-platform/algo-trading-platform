@@ -43,12 +43,30 @@ def _fingerprint(token: str) -> str:
 # manually ~2 minutes later with zero changes on our end. This is a
 # genuine intermittent reliability issue on Upstox's sandbox side, not
 # a bad/expired token -- proven by the token working again shortly
-# after with nothing refreshed. Widened so the retry window can
-# realistically outlast a multi-ten-second blip: ~7 attempts over
-# ~48s, still comfortably under the 60s pattern-scan cadence so one
-# stuck symbol doesn't meaningfully delay the rest of that cycle.
-MAX_401_RETRIES = 7
-RETRY_401_DELAY_SEC = 7
+# after with nothing refreshed.
+#
+# SHORTENED BACK DOWN Sep 16 (Om, after a full 401 depth-analysis):
+# place_order() is called SYNCHRONOUSLY, once per symbol, inside
+# ws_listener.py's _scan_universe_for_patterns() -- a plain for loop
+# over the WHOLE ~500-symbol universe, no threading (confirmed by
+# reading that loop directly). The Sep 11 widening to 7x7s=~48s meant
+# a single 401 on ONE symbol blocked evaluation of every OTHER symbol
+# in that same cycle for up to 48s out of the 60s cadence -- exactly
+# the kind of multi-ten-second blip this file itself was built to
+# survive, just inflicted on the WHOLE universe by trying to outlast
+# it in-place. That tradeoff made sense on Sep 11 because there was no
+# other recovery path: a failed pattern-scan signal was simply lost.
+# It no longer does, because Sep 16 also fixed exactly that gap --
+# _execute_trade() now registers a `RETRY` row in pending_breakouts on
+# any sandbox-error outcome, which the fast breakout-watch loop
+# (BREAKOUT-WATCH, 60s cadence, up to its 15-min TTL) retries against
+# the live price non-blockingly, in a SEPARATE cycle, without freezing
+# pattern-scan for anyone else. So this only needs to cover the FAST
+# failure mode (Sep 10's stale-singleton-client case, which a rebuild
+# resolves near-instantly) -- a multi-minute Upstox-side blip (Sep
+# 11's case) is now the RETRY path's job, not this blocking loop's.
+MAX_401_RETRIES = 2
+RETRY_401_DELAY_SEC = 2
 
 
 class SandboxClient:
