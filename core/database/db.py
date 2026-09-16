@@ -1696,6 +1696,7 @@ def upsert_pending_breakout(
     target:        float,
     strength:      str = None,
     ttl_seconds:   int = 900,
+    status:        str = "PENDING",
 ) -> bool:
     """
     Insert or refresh a pending-breakout watch row. Re-detecting the
@@ -1704,7 +1705,9 @@ def upsert_pending_breakout(
     row via the (symbol, strategy, timeframe) unique constraint rather
     than creating a duplicate -- also resets status back to PENDING in
     case a stale TRIGGERED/EXPIRED row for this exact symbol+strategy+
-    timeframe combo is still sitting here from an earlier setup.
+    timeframe combo is still sitting here from an earlier setup. ``RETRY``
+    retains a signal whose trigger crossed but whose broker submission was
+    rejected during a temporary sandbox outage.
     """
     try:
         with _get_cursor() as cur:
@@ -1716,22 +1719,21 @@ def upsert_pending_breakout(
                     AND target.timeframe = source.timeframe)
                 WHEN MATCHED THEN
                     UPDATE SET side = ?, trigger_price = ?, stop_loss = ?, target = ?,
-                               strength = ?, status = 'PENDING',
+                               strength = ?, status = ?,
                                detected_at = SYSDATETIMEOFFSET(),
                                expires_at = DATEADD(second, ?, SYSDATETIMEOFFSET()),
                                updated_at = SYSDATETIMEOFFSET()
                 WHEN NOT MATCHED THEN
                     INSERT (symbol, strategy, timeframe, side, trigger_price, stop_loss,
                             target, strength, status, detected_at, expires_at, updated_at)
-                    VALUES (source.symbol, source.strategy, source.timeframe, ?, ?, ?, ?, ?,
-                            'PENDING', SYSDATETIMEOFFSET(),
+                    VALUES (source.symbol, source.strategy, source.timeframe, ?, ?, ?, ?, ?, ?, SYSDATETIMEOFFSET(),
                             DATEADD(second, ?, SYSDATETIMEOFFSET()), SYSDATETIMEOFFSET());
             """, (
                 symbol, strategy, timeframe,
                 side, round(float(trigger_price), 2), round(float(stop_loss), 2),
-                round(float(target), 2), strength, ttl_seconds,
+                round(float(target), 2), strength, status, ttl_seconds,
                 side, round(float(trigger_price), 2), round(float(stop_loss), 2),
-                round(float(target), 2), strength, ttl_seconds,
+                round(float(target), 2), strength, status, ttl_seconds,
             ))
         return True
     except Exception as e:
@@ -1740,12 +1742,12 @@ def upsert_pending_breakout(
 
 
 def get_active_pending_breakouts() -> list[dict]:
-    """PENDING rows that haven't expired yet, for the per-minute watcher."""
+    """Unexpired watches and broker-retry rows for the per-minute watcher."""
     try:
         with _get_cursor() as cur:
             cur.execute("""
                 SELECT * FROM pending_breakouts
-                WHERE status = 'PENDING' AND expires_at > SYSDATETIMEOFFSET()
+                WHERE status IN ('PENDING', 'RETRY') AND expires_at > SYSDATETIMEOFFSET()
             """)
             return cur.fetchall() or []
     except Exception as e:
@@ -1753,13 +1755,27 @@ def get_active_pending_breakouts() -> list[dict]:
         return []
 
 
+def claim_pending_breakout(id_: int) -> bool:
+    """Atomically claim a watch/retry row before attempting its order."""
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                UPDATE pending_breakouts SET status = 'EXECUTING', updated_at = SYSDATETIMEOFFSET()
+                WHERE id = ? AND status IN ('PENDING', 'RETRY')
+            """, (id_,))
+            return cur.rowcount > 0
+    except Exception as e:
+        print(f"[DB] claim_pending_breakout error: {e}")
+        return False
+
+
 def mark_pending_breakout(id_: int, status: str) -> bool:
-    """status: 'TRIGGERED' (breakout acted on) or 'EXPIRED' (window passed)."""
+    """Finish a claimed row as TRIGGERED, RETRY, CANCELLED, or EXPIRED."""
     try:
         with _get_cursor() as cur:
             cur.execute("""
                 UPDATE pending_breakouts SET status = ?, updated_at = SYSDATETIMEOFFSET()
-                WHERE id = ? AND status = 'PENDING'
+                WHERE id = ? AND status = 'EXECUTING'
             """, (status, id_))
             return cur.rowcount > 0
     except Exception as e:
@@ -1773,7 +1789,8 @@ def expire_stale_pending_breakouts() -> int:
         with _get_cursor() as cur:
             cur.execute("""
                 UPDATE pending_breakouts SET status = 'EXPIRED', updated_at = SYSDATETIMEOFFSET()
-                WHERE status = 'PENDING' AND expires_at <= SYSDATETIMEOFFSET()
+                WHERE status IN ('PENDING', 'RETRY', 'EXECUTING')
+                  AND expires_at <= SYSDATETIMEOFFSET()
             """)
             return cur.rowcount
     except Exception as e:

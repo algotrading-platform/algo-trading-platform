@@ -157,3 +157,14 @@ class OrderManager:
     def clear_key(self, symbol: str, side: str, signal_identity: str) -> None:
         """Allow a signal to fire again (e.g. after its position closes)."""
         self._placed_keys.discard(f"{symbol}|{side}|{signal_identity}")
+
+    def release(self, order: OrderRequest) -> None:
+        """Release a reservation when the broker did not accept the order.
+
+        ``build_order`` reserves a key before broker submission to prevent
+        concurrent duplicate orders. A transport/authentication failure is
+        not an accepted order, though, and must remain eligible for the
+        bounded broker-retry path.
+        """
+        if order and order.idempotency_key:
+            self._placed_keys.discard(order.idempotency_key)

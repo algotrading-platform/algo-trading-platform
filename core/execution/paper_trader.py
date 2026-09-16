@@ -253,6 +253,10 @@ class PaperTrader:
         # 4. Place in sandbox
         result = self.sbx.place_order(order, inst_key)
         if not result["ok"]:
+            # A failed broker call did not create an order. Releasing this
+            # reservation lets a bounded retry re-attempt the same signal if
+            # Upstox Sandbox recovers from a transient 401/outage.
+            self.om.release(order)
             return {"action": "error", "reason": f"sandbox: {result['error']}"}
 
         # 5. Record the open position in the DB — atomic with a fresh

@@ -490,13 +490,26 @@ class WSListener:
             if not crossed:
                 continue
 
-            # Claim it first -- UPDATE ... WHERE status='PENDING' is the
-            # atomic gate against acting on the same row twice.
-            if db.mark_pending_breakout(row["id"], "TRIGGERED"):
-                self._act_on_breakout(row)
+            # Claim atomically, but only mark a watch triggered after the
+            # broker accepts its order. Upstox Sandbox can intermittently
+            # return 401 for a token that succeeds again later; consuming a
+            # watch before that call made the valid signal unrecoverable.
+            if not db.claim_pending_breakout(row["id"]):
+                continue
 
-    def _act_on_breakout(self, row: dict) -> None:
-        self._execute_trade(
+            outcome = self._act_on_breakout(row)
+            if outcome.get("action") == "opened":
+                db.mark_pending_breakout(row["id"], "TRIGGERED")
+            elif (outcome.get("action") == "error" and
+                  str(outcome.get("reason", "")).startswith("sandbox:")):
+                # Bounded by its existing expires_at and rechecked against
+                # live price before each retry.
+                db.mark_pending_breakout(row["id"], "RETRY")
+            else:
+                db.mark_pending_breakout(row["id"], "CANCELLED")
+
+    def _act_on_breakout(self, row: dict) -> dict:
+        return self._execute_trade(
             symbol=row["symbol"], strategy=row["strategy"], timeframe=row["timeframe"],
             side=row["side"], price=float(row["trigger_price"]),
             stop=float(row["stop_loss"]), target=float(row["target"]),
@@ -510,7 +523,7 @@ class WSListener:
         self, symbol: str, strategy: str, timeframe: str, side: str,
         price: float, stop: float, target: float, strength: str | None,
         reason: str, source_label: str, anatomy: dict | None = None,
-    ) -> None:
+    ) -> dict:
         """
         Shared trade-execution path for both the price-level watch
         (_act_on_breakout, driven by pending_breakouts rows the normal
@@ -534,7 +547,7 @@ class WSListener:
         pt = self._get_paper_trader()
         if pt is None:
             log.warning(f"{source_label}: {symbol} crossed but PaperTrader unavailable — skipped")
-            return
+            return {"action": "error", "reason": "paper trader unavailable"}
 
         outcome = pt.on_signal(
             symbol=symbol, side=side, price=price,
@@ -559,6 +572,9 @@ class WSListener:
                 f"{source_label}: {symbol} {side} signal fired but failed to execute — "
                 f"{outcome.get('reason', 'unknown error')}",
             )
+
+        if outcome.get("action") != "opened":
+            return outcome
 
         if outcome.get("action") != "opened":
             return  # rejected/skipped/error — nothing further to log/alert
@@ -586,6 +602,8 @@ class WSListener:
             rsi=0.0, price=price, strategy=strategy,
             signal_result=signal_result, data_source="upstox_ws",
         )
+
+        return outcome
 
     # --------------------------------------------------------
     # full-universe pattern scan (Sep 7) -- see PATTERN_SCAN_INTERVAL_SEC's
@@ -834,7 +852,7 @@ class WSListener:
                     if result.signal in ("BUY", "SELL"):
                         if not self._apply_trend_grading(symbol, timeframe, df, result):
                             continue  # suppressed -- opposing nifty+stock trend
-                        self._execute_trade(
+                        outcome = self._execute_trade(
                             symbol=symbol, strategy=strategy_name, timeframe=timeframe,
                             side=result.signal,
                             price=result.indicators.get("Pattern_Entry"),
@@ -848,6 +866,21 @@ class WSListener:
                                 "breakout": result.indicators.get("Anatomy_Breakout"),
                             },
                         )
+                        # Keep a direct pattern signal alive for the same
+                        # bounded 15-minute window when Sandbox temporarily
+                        # rejects a valid token. The live-tick watcher will
+                        # retry only while the trigger remains crossed.
+                        if (outcome.get("action") == "error" and
+                                str(outcome.get("reason", "")).startswith("sandbox:")):
+                            db.upsert_pending_breakout(
+                                symbol=symbol, strategy=strategy_name, timeframe=timeframe,
+                                side=result.signal,
+                                trigger_price=result.indicators.get("Pattern_Entry"),
+                                stop_loss=result.indicators.get("Pattern_Stop"),
+                                target=result.indicators.get("Pattern_Target_Exact"),
+                                strength=result.strength,
+                                status="RETRY",
+                            )
                     elif result.indicators.get("Watch_Entry") is not None:
                         db.upsert_pending_breakout(
                             symbol=symbol, strategy=strategy_name, timeframe=timeframe,
