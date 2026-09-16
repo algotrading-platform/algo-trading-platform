@@ -154,7 +154,27 @@ class SandboxClient:
              delay between attempts, giving a transient blip (on
              Upstox's sandbox side, not ours) time to clear.
         """
-        self._rebuild_client()  # cheap no-op if the token hasn't changed and is already working
+        # Sep 16 -- ALWAYS force a fresh client (and therefore a fresh
+        # urllib3 connection pool) here, not just a no-op when the token
+        # is unchanged. Confirmed by reading the Upstox SDK's own source
+        # (upstox_client/api_client.py, rest.py): ApiClient.__init__
+        # creates a brand-new urllib3.PoolManager every time it's
+        # constructed, but _rebuild_client() without force= reuses the
+        # SAME one indefinitely as long as the token hasn't changed --
+        # meaning ws_listener.py's long-lived process (all day, one
+        # process) can keep reusing the SAME HTTP connection pool for
+        # hours, versus the old 5-min scanner-job architecture, where a
+        # brand-new process (and therefore brand-new pool/connections)
+        # placed every single order. A long-lived, mostly-idle keep-
+        # alive connection silently going stale (e.g. a load balancer's
+        # idle timeout closing it without either side being told) is a
+        # well-known class of bug, and would explain exactly what's
+        # been observed: identical token, identical everything, works
+        # again right after a forced rebuild -- because a forced
+        # rebuild is precisely what creates a fresh connection. Order
+        # placement is rare (a handful of real signals a day at most),
+        # so there is no meaningful cost to never reusing the pool.
+        self._rebuild_client(force=True)
         if not self._ready:
             return {"ok": False, "order_id": None, "error": "sandbox client not ready"}
 
