@@ -168,3 +168,24 @@ class OrderManager:
         """
         if order and order.idempotency_key:
             self._placed_keys.discard(order.idempotency_key)
+
+
+# ============================================================
+# SHARED SINGLETON (Sep 16) — mirrors rms.py's shared_rms fix (Aug 19)
+# for the identical bug. PaperTrader is constructed independently in
+# three places (ws_listener.py's long-lived pattern-scan/breakout-watch,
+# strategy_engine.py's entry-side scan, signal_scheduler.py's
+# monitor_open close-side loop) -- each used to build its OWN
+# OrderManager with its own private _placed_keys set. A position opened
+# via one instance and closed via monitor_open() had its clear_key()
+# call land on signal_scheduler.py's instance, which never held that
+# key in the first place -- the instance that actually opened the
+# trade never saw its reservation released, permanently blocking any
+# later re-entry for that exact symbol+side+timeframe+strategy for the
+# rest of that process's lifetime (confirmed live, Sep 16: no way to
+# distinguish this from a genuine duplicate without cross-referencing
+# paper_positions). All PaperTrader instances now default to this one
+# shared instance instead, exactly like shared_rms.
+# ============================================================
+from core.database import db as _db
+shared_order_manager = OrderManager(is_open_position_fn=_db.is_paper_position_open)

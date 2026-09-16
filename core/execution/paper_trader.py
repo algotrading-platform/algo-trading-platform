@@ -73,7 +73,7 @@ from datetime import datetime, time as dtime
 import pytz
 
 from core.execution.rms import RMS, RMSConfig, shared_rms
-from core.execution.order_manager import OrderManager
+from core.execution.order_manager import OrderManager, shared_order_manager
 from core.execution.sandbox_client import SandboxClient
 from core.database import db
 
@@ -131,15 +131,21 @@ def _is_equity(symbol: str) -> bool:
 
 class PaperTrader:
 
-    def __init__(self, provider=None, rms: RMS = None):
+    def __init__(self, provider=None, rms: RMS = None, om: OrderManager = None):
         # Defaults to the module-level shared_rms singleton (see rms.py)
         # so the entry-side PaperTrader (strategy_engine.py) and the
         # monitor-side PaperTrader (signal_scheduler.py) see the SAME
         # daily P&L / halted state — pass an explicit rms= for tests
         # that need an isolated instance.
         self.rms  = rms if rms is not None else shared_rms
-        # Order Manager knows what's open (for idempotency + no re-entry)
-        self.om   = OrderManager(is_open_position_fn=db.is_paper_position_open)
+        # Order Manager: defaults to the module-level shared_order_manager
+        # singleton (see order_manager.py) for the identical reason —
+        # ws_listener.py/strategy_engine.py's entry-side PaperTrader and
+        # signal_scheduler.py's monitor-side PaperTrader must see the SAME
+        # _placed_keys reservations, or a close-side clear_key() call
+        # lands on an instance that never held the key. Pass an explicit
+        # om= for tests that need an isolated instance.
+        self.om   = om if om is not None else shared_order_manager
         self.sbx  = SandboxClient(sandbox=True)
         # provider is used to resolve symbol -> Upstox instrument key
         # and to fetch current prices for monitoring.
@@ -348,6 +354,7 @@ class PaperTrader:
                     if db.close_paper_position(pid, target, exit_reason="expiry"):
                         pnl = (target - entry) * qty
                         self.rms.record_realized_pnl(pnl)
+                        self.om.clear_key(symbol, pos["side"], f"{pos['timeframe']}|{pos['strategy']}")
                         closed.append({
                             "symbol": symbol, "reason": "expiry",
                             "exit": target, "pnl": round(pnl, 2),
