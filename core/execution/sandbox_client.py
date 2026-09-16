@@ -18,11 +18,21 @@
 
 import os
 import time
+import hashlib
 import logging
 from dotenv import load_dotenv
 
 load_dotenv()
 log = logging.getLogger("sandbox_client")
+
+
+def _fingerprint(token: str) -> str:
+    """Short, non-secret stand-in for a token so logs can show whether
+    the deployed secret actually changed between rebuilds/deploys,
+    without ever printing the token itself."""
+    if not token:
+        return "<empty>"
+    return f"len={len(token)} sha256[:8]={hashlib.sha256(token.encode()).hexdigest()[:8]}"
 
 # Sep 11 -- confirmed live, twice, with real production failures
 # (RAMCOCEM.NS, then BAJAJFINSV.NS): a 401 from Upstox's sandbox can
@@ -86,6 +96,7 @@ class SandboxClient:
             )
             self._token  = token
             self._ready  = True
+            log.info(f"SandboxClient token loaded: {_fingerprint(token)}")
         except ImportError:
             log.error("upstox-python-sdk not installed (pip install upstox-python-sdk)")
             self._ready = False
@@ -140,6 +151,11 @@ class SandboxClient:
                 return result
             result = self._place_order_once(order, instrument_key)
             attempt += 1
+        if not result["ok"] and "401" in (result.get("error") or ""):
+            log.error(f"place_order for {order.symbol} still 401 after {attempt - 1} rebuild-retries -- "
+                      f"token used throughout: {_fingerprint(self._token)}. If this fingerprint matches "
+                      f"what was last deployed to the Container App secret, the deployed token itself is "
+                      f"invalid/stale (not a transient blip) and needs to be re-pushed + the app restarted.")
         return result
 
     def _place_order_once(self, order, instrument_key: str) -> dict:
