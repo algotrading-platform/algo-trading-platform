@@ -256,14 +256,31 @@ class PaperTrader:
         if not inst_key:
             return {"action": "error", "reason": f"no instrument key for {symbol}"}
 
-        # 4. Place in sandbox
+        # 4. Place in sandbox -- BEST-EFFORT ONLY (Sep 16, Om: "make paper
+        # trading immune to Upstox's 401 issue"). Confirmed via Upstox's own
+        # community docs: the sandbox never simulates positions, fills, or
+        # P&L at all -- it is purely a mock acknowledgment that the request
+        # was formatted correctly. Every bit of this system's paper-trading
+        # realism (entry/exit price, P&L, stop/target) is already our own
+        # logic against our own DB, entirely independent of what the
+        # sandbox call returns. A 401 (or any other sandbox failure) is
+        # therefore NOT a legitimate reason to lose a signal -- it's an
+        # auth/infra hiccup on a call that was never load-bearing for
+        # paper trading. Still attempted and logged (keeps format-
+        # validation value for the eventual real-broker flip, sandbox=False),
+        # but its failure no longer blocks opening the position: falls back
+        # to a locally-generated placeholder order_id instead.
         result = self.sbx.place_order(order, inst_key)
-        if not result["ok"]:
-            # A failed broker call did not create an order. Releasing this
-            # reservation lets a bounded retry re-attempt the same signal if
-            # Upstox Sandbox recovers from a transient 401/outage.
-            self.om.release(order)
-            return {"action": "error", "reason": f"sandbox: {result['error']}"}
+        broker_confirmed = bool(result["ok"])
+        if broker_confirmed:
+            order_id = result["order_id"]
+        else:
+            import uuid
+            order_id = f"LOCAL-{uuid.uuid4().hex[:16]}"
+            log.warning(f"{symbol}: sandbox order call failed ({result['error']}) -- "
+                        f"opening the paper position anyway with placeholder order_id={order_id}. "
+                        f"Paper P&L/positions are our own bookkeeping, not the broker's, so this "
+                        f"trade is fully valid despite the broker leg failing.")
 
         # 5. Record the open position in the DB — atomic with a fresh
         # cap re-check (see open_paper_position_if_capacity docstring):
@@ -280,9 +297,14 @@ class PaperTrader:
             timeframe=timeframe,
             max_positions=MAX_OPEN_POSITIONS_PER_STRATEGY,
             risk_amount=decision.risk_amount,
-            order_id=result["order_id"],
+            order_id=order_id,
         )
         if not insert["opened"]:
+            # The position never actually opened (e.g. lost the cap race) --
+            # only NOW does the sandbox reservation need releasing, so a
+            # later legitimate re-fire of this same signal isn't blocked by
+            # a broker-side attempt that never became a real position.
+            self.om.release(order)
             action = "reject" if insert.get("cause") == "cap" else "error"
             return {"action": action, "reason": insert["reason"]}
 
@@ -300,7 +322,12 @@ class PaperTrader:
             "entry":    order.price,
             "stop":     order.stop_loss,
             "target":   order.target,
-            "order_id": result["order_id"],
+            "order_id": order_id,
+            "broker_confirmed": broker_confirmed,  # Sep 16 -- False when this
+                                                    # opened via the local
+                                                    # fallback (sandbox call
+                                                    # failed); paper P&L is
+                                                    # unaffected either way.
         }
 
     # --------------------------------------------------------
