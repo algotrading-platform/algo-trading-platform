@@ -1686,6 +1686,69 @@ def get_latest_live_price(symbol: str, max_age_minutes: int = 2) -> float | None
 # ThreeBarFlagStrategy's "Watch_*" indicators (strategies.py) for where
 # these values come from.
 
+def _anatomy_to_json(anatomy: dict | None) -> str | None:
+    """Serialize a flagpole/consolidation/breakout anatomy dict (candle
+    values keyed with a pandas/py Timestamp 'ts') to a JSON string safe
+    for NVARCHAR(MAX) storage -- timestamps become ISO strings. Returns
+    None (stored as SQL NULL) if there's nothing to serialize, so this
+    is a no-op for every call site that doesn't have anatomy on hand
+    (BREAKOUT-WATCH's own re-detections, most non-3-Bar-Play callers)."""
+    if not anatomy:
+        return None
+    import json
+
+    def _candle_safe(c):
+        if not c:
+            return c
+        c = dict(c)
+        ts = c.get("ts")
+        if ts is not None and hasattr(ts, "isoformat"):
+            c["ts"] = ts.isoformat()
+        return c
+
+    try:
+        safe = {
+            "flagpole": _candle_safe(anatomy.get("flagpole")),
+            "consolidation": [_candle_safe(c) for c in (anatomy.get("consolidation") or [])],
+            "breakout": _candle_safe(anatomy.get("breakout")),
+        }
+        return json.dumps(safe)
+    except Exception:
+        return None
+
+
+def anatomy_from_json(anatomy_json: str | None) -> dict | None:
+    """Inverse of _anatomy_to_json -- deserializes a stored anatomy_json
+    column back into the same shape _format_anatomy_block()/
+    _execute_trade() expect, restoring 'ts' to a real datetime (still
+    tz-aware if it was serialized that way) rather than a bare string."""
+    if not anatomy_json:
+        return None
+    import json
+    from datetime import datetime as _dt
+
+    def _restore(c):
+        if not c:
+            return c
+        c = dict(c)
+        if c.get("ts"):
+            try:
+                c["ts"] = _dt.fromisoformat(c["ts"])
+            except Exception:
+                pass
+        return c
+
+    try:
+        raw = json.loads(anatomy_json)
+        return {
+            "flagpole": _restore(raw.get("flagpole")),
+            "consolidation": [_restore(c) for c in (raw.get("consolidation") or [])],
+            "breakout": _restore(raw.get("breakout")),
+        }
+    except Exception:
+        return None
+
+
 def upsert_pending_breakout(
     symbol:        str,
     strategy:      str,
@@ -1697,6 +1760,7 @@ def upsert_pending_breakout(
     strength:      str = None,
     ttl_seconds:   int = 900,
     status:        str = "PENDING",
+    anatomy:       dict = None,
 ) -> bool:
     """
     Insert or refresh a pending-breakout watch row. Re-detecting the
@@ -1708,7 +1772,15 @@ def upsert_pending_breakout(
     timeframe combo is still sitting here from an earlier setup. ``RETRY``
     retains a signal whose trigger crossed but whose broker submission was
     rejected during a temporary sandbox outage.
+
+    `anatomy` (Sep 16): the flagpole/consolidation/breakout candles, so
+    a later BREAKOUT-WATCH trigger on this exact row can still render
+    the full detailed alert -- previously only the PATTERN-SCAN path
+    (which runs generate_signal() itself and has the raw candles in
+    hand right there) could show this; the watch-list path had nothing
+    to show because nothing carried it across the wait.
     """
+    anatomy_json = _anatomy_to_json(anatomy)
     try:
         with _get_cursor() as cur:
             cur.execute("""
@@ -1719,21 +1791,21 @@ def upsert_pending_breakout(
                     AND target.timeframe = source.timeframe)
                 WHEN MATCHED THEN
                     UPDATE SET side = ?, trigger_price = ?, stop_loss = ?, target = ?,
-                               strength = ?, status = ?,
+                               strength = ?, status = ?, anatomy_json = ?,
                                detected_at = SYSDATETIMEOFFSET(),
                                expires_at = DATEADD(second, ?, SYSDATETIMEOFFSET()),
                                updated_at = SYSDATETIMEOFFSET()
                 WHEN NOT MATCHED THEN
                     INSERT (symbol, strategy, timeframe, side, trigger_price, stop_loss,
-                            target, strength, status, detected_at, expires_at, updated_at)
-                    VALUES (source.symbol, source.strategy, source.timeframe, ?, ?, ?, ?, ?, ?, SYSDATETIMEOFFSET(),
+                            target, strength, status, anatomy_json, detected_at, expires_at, updated_at)
+                    VALUES (source.symbol, source.strategy, source.timeframe, ?, ?, ?, ?, ?, ?, ?, SYSDATETIMEOFFSET(),
                             DATEADD(second, ?, SYSDATETIMEOFFSET()), SYSDATETIMEOFFSET());
             """, (
                 symbol, strategy, timeframe,
                 side, round(float(trigger_price), 2), round(float(stop_loss), 2),
-                round(float(target), 2), strength, status, ttl_seconds,
+                round(float(target), 2), strength, status, anatomy_json, ttl_seconds,
                 side, round(float(trigger_price), 2), round(float(stop_loss), 2),
-                round(float(target), 2), strength, status, ttl_seconds,
+                round(float(target), 2), strength, status, anatomy_json, ttl_seconds,
             ))
         return True
     except Exception as e:

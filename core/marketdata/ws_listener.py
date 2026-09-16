@@ -515,16 +515,40 @@ class WSListener:
 
             outcome = self._act_on_breakout(row)
             if outcome.get("action") == "opened":
-                db.mark_pending_breakout(row["id"], "TRIGGERED")
+                final_status = "TRIGGERED"
             elif (outcome.get("action") == "error" and
                   str(outcome.get("reason", "")).startswith("sandbox:")):
                 # Bounded by its existing expires_at and rechecked against
                 # live price before each retry.
-                db.mark_pending_breakout(row["id"], "RETRY")
+                final_status = "RETRY"
             else:
-                db.mark_pending_breakout(row["id"], "CANCELLED")
+                final_status = "CANCELLED"
+            # Sep 16 -- mark_pending_breakout()'s return value used to be
+            # discarded entirely. Its UPDATE only matches a row still in
+            # 'EXECUTING' (see claim_pending_breakout); if anything else
+            # raced it back to a different status in between (e.g. a
+            # concurrent pattern-scan cycle re-upserting the same
+            # symbol/strategy/timeframe key), this call silently affects
+            # zero rows and the outcome above is lost with no trace --
+            # exactly the kind of stuck-row state that took a manual DB
+            # query to diagnose live (Sep 16, ABSLAMC.NS). Not a crash,
+            # not fatal (expire_stale_pending_breakouts() still reclaims
+            # it once its TTL passes), but worth surfacing immediately
+            # rather than only via its eventual expiry.
+            if not db.mark_pending_breakout(row["id"], final_status):
+                log.warning(f"mark_pending_breakout({row['id']}, {final_status}) affected 0 rows for "
+                            f"{row['symbol']} -- likely raced by a concurrent writer; row may sit stale "
+                            f"until its TTL expires it")
 
     def _act_on_breakout(self, row: dict) -> dict:
+        # Sep 16: restore the flagpole/consolidation/breakout candles
+        # upsert_pending_breakout() carried through in anatomy_json (if
+        # this row was registered after that fix), so a BREAKOUT-WATCH
+        # trigger can show the same full detail as a direct PATTERN-SCAN
+        # signal instead of nothing. None for any row registered before
+        # the fix shipped, or if it was never populated for some reason
+        # -- _execute_trade()/the alert already handle anatomy=None.
+        anatomy = db.anatomy_from_json(row.get("anatomy_json"))
         return self._execute_trade(
             symbol=row["symbol"], strategy=row["strategy"], timeframe=row["timeframe"],
             side=row["side"], price=float(row["trigger_price"]),
@@ -533,6 +557,7 @@ class WSListener:
             reason=f"3-Bar Play fast breakout watch: price crossed {float(row['trigger_price']):.2f} "
                    f"within ~1 min of the flagpole breakout level.",
             source_label="BREAKOUT-WATCH",
+            anatomy=anatomy,
         )
 
     def _execute_trade(
@@ -918,6 +943,11 @@ class WSListener:
                     if result.signal in ("BUY", "SELL"):
                         if not self._apply_trend_grading(symbol, timeframe, df, result):
                             continue  # suppressed -- opposing nifty+stock trend
+                        anatomy = {
+                            "flagpole": result.indicators.get("Anatomy_Flagpole"),
+                            "consolidation": result.indicators.get("Anatomy_Consolidation"),
+                            "breakout": result.indicators.get("Anatomy_Breakout"),
+                        }
                         outcome = self._execute_trade(
                             symbol=symbol, strategy=strategy_name, timeframe=timeframe,
                             side=result.signal,
@@ -926,16 +956,17 @@ class WSListener:
                             target=result.indicators.get("Pattern_Target_Exact"),
                             strength=result.strength, reason=result.reason,
                             source_label="PATTERN-SCAN",
-                            anatomy={
-                                "flagpole": result.indicators.get("Anatomy_Flagpole"),
-                                "consolidation": result.indicators.get("Anatomy_Consolidation"),
-                                "breakout": result.indicators.get("Anatomy_Breakout"),
-                            },
+                            anatomy=anatomy,
                         )
                         # Keep a direct pattern signal alive for the same
                         # bounded 15-minute window when Sandbox temporarily
                         # rejects a valid token. The live-tick watcher will
                         # retry only while the trigger remains crossed.
+                        # Sep 16: carries the same `anatomy` through too, so
+                        # if BREAKOUT-WATCH ends up being the one that
+                        # eventually lands this trade, its alert can still
+                        # show the full flagpole/consolidation/breakout
+                        # detail instead of nothing.
                         if (outcome.get("action") == "error" and
                                 str(outcome.get("reason", "")).startswith("sandbox:")):
                             db.upsert_pending_breakout(
@@ -946,6 +977,7 @@ class WSListener:
                                 target=result.indicators.get("Pattern_Target_Exact"),
                                 strength=result.strength,
                                 status="RETRY",
+                                anatomy=anatomy,
                             )
                     elif result.indicators.get("Watch_Entry") is not None:
                         db.upsert_pending_breakout(
@@ -955,6 +987,18 @@ class WSListener:
                             stop_loss=result.indicators["Watch_Stop"],
                             target=result.indicators["Watch_Target"],
                             strength=result.indicators.get("Watch_Strength"),
+                            # Sep 16: same anatomy data the confirmed-signal
+                            # branch above gets (ThreeBarFlagStrategy computes
+                            # both together) -- carried through pending_
+                            # breakouts.anatomy_json so a LATER BREAKOUT-WATCH
+                            # trigger on this exact row can still render the
+                            # full flagpole/consolidation/breakout detail,
+                            # not just the trigger/stop/target numbers.
+                            anatomy={
+                                "flagpole": result.indicators.get("Anatomy_Flagpole"),
+                                "consolidation": result.indicators.get("Anatomy_Consolidation"),
+                                "breakout": result.indicators.get("Anatomy_Breakout"),
+                            },
                         )
                     else:
                         db.cancel_pending_breakout(symbol, strategy_name, timeframe)
