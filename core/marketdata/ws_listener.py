@@ -583,10 +583,24 @@ class WSListener:
             # outcomes like a full position cap) means something is
             # actually broken, not just a normal pass -- worth a direct,
             # rate-limited ops alert rather than silence.
+            # Sep 16, Om: "have a full depth analysis of what's happening
+            # with this 401 error" -- include the exact flagpole/
+            # consolidation/breakout candles the strategy detected, so a
+            # failed-execution alert shows precisely what pattern was
+            # found (and when), not just "signal fired but failed."
+            anatomy_suffix = ""
+            if anatomy:
+                try:
+                    from core.alerts.alert_manager import _format_anatomy_block
+                    block = _format_anatomy_block(anatomy)
+                    if block:
+                        anatomy_suffix = f"\n{block}"
+                except Exception:
+                    pass
             _send_ops_alert(
                 "signal_execution_error",
                 f"{source_label}: {symbol} {side} signal fired but failed to execute — "
-                f"{outcome.get('reason', 'unknown error')}",
+                f"{outcome.get('reason', 'unknown error')} [{timeframe}]{anatomy_suffix}",
             )
 
         if outcome.get("action") != "opened":
@@ -608,12 +622,16 @@ class WSListener:
         # already acted on. Also sends the Telegram alert. No trend/RSI
         # enrichment here (that's a normal-scan-only step) -- the
         # message renders with neutral trend arrows, which is an
-        # accepted simplification for this fast path.
+        # accepted simplification for this fast path. `anatomy` (Sep 16)
+        # DOES get passed through when available (the PATTERN-SCAN path)
+        # so 3 Bar Play alerts show the full flagpole/consolidation/
+        # breakout candle detail instead of a bare summary line.
         signal_result = SignalResult(side, strength or "MODERATE", reason, {}, strategy)
         AlertManager().check_alert(
             timeframe=timeframe, stock=symbol, current_signal=side,
             rsi=0.0, price=price, strategy=strategy,
             signal_result=signal_result, data_source="upstox_ws",
+            anatomy=anatomy,
         )
 
         return outcome

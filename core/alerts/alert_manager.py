@@ -56,6 +56,54 @@ def _trend_arrow(trend: str) -> str:
     return "→"
 
 
+def _format_candle(label: str, c: dict) -> str:
+    """One anatomy candle (flagpole/consolidation/breakout) as a
+    readable line: label, IST time, full OHLCV. `c["ts"]` may be tz-aware
+    (assumed already correct) or naive (assumed UTC, matching how this
+    codebase stores candle timestamps elsewhere) -- converted to IST for
+    display either way, falling back to the raw value if conversion
+    fails rather than dropping the line."""
+    try:
+        ts = c.get("ts")
+        if ts is not None:
+            if getattr(ts, "tzinfo", None) is None:
+                ts = pytz.utc.localize(ts)
+            time_str = ts.astimezone(IST).strftime("%H:%M IST")
+        else:
+            time_str = "—"
+    except Exception:
+        time_str = str(c.get("ts", "—"))
+    return (f"{label} {time_str}  O {c.get('open')} H {c.get('high')} "
+            f"L {c.get('low')} C {c.get('close')}  Vol {c.get('volume'):,}"
+            if isinstance(c.get("volume"), int) else
+            f"{label} {time_str}  O {c.get('open')} H {c.get('high')} "
+            f"L {c.get('low')} C {c.get('close')}  Vol {c.get('volume')}")
+
+
+def _format_anatomy_block(anatomy: dict) -> str:
+    """3 Bar Play's flagpole/consolidation/breakout candles (Sep 16, Om:
+    "post the full details of the signal generated... Flag pole, stop
+    candle and breakout candle along with the timeframe and timings")
+    -- as a readable multi-line block, from the same raw OHLCV+timestamp
+    dicts ThreeBarFlagStrategy._anatomy_indicators() persists to
+    trade_anatomy. Defensive throughout: a malformed/missing candle
+    just gets skipped, never breaks the whole alert."""
+    lines = []
+    try:
+        flagpole = anatomy.get("flagpole")
+        if flagpole:
+            lines.append(_format_candle("🚩 Flagpole", flagpole))
+        consol = anatomy.get("consolidation") or []
+        for i, c in enumerate(consol, 1):
+            lines.append(_format_candle(f"⏸ Consolidation {i}", c))
+        breakout = anatomy.get("breakout")
+        if breakout:
+            lines.append(_format_candle("💥 Breakout", breakout))
+    except Exception as e:
+        log.warning(f"anatomy block formatting failed (non-fatal): {e}")
+    return "\n".join(lines)
+
+
 def _strength_emoji(strength: str) -> str:
     if strength == "VERY STRONG": return "💎"
     if strength == "STRONG":      return "💪"
@@ -112,6 +160,10 @@ class AlertManager:
         strategy:       str  = "RSI Reversal",
         signal_result          = None,
         data_source:    str  = "yfinance",
+        anatomy:        dict = None,  # Sep 16 -- 3 Bar Play's flagpole/
+                                       # consolidation/breakout candles,
+                                       # for a fully-detailed alert. None
+                                       # for every other strategy/caller.
     ) -> dict | None:
 
         previous_signal = db.get_alert_state(stock, timeframe, strategy)
@@ -138,6 +190,7 @@ class AlertManager:
             "strategy":      strategy,
             "signal_result": signal_result,
             "data_source":   data_source,
+            "anatomy":       anatomy,
         }
 
         # Deliver via primary channel with automatic fallback
@@ -212,6 +265,21 @@ class AlertManager:
                 f"Lot Size `{lot_str}`\n"
                 f"Gross `₹{gross:,.0f}`  Net `₹{net:,.0f}`\n"
                 f"_Buy spot + Sell futures simultaneously_"
+            )
+
+        # 3 Bar Play format (Sep 16, Om: full flagpole/stop/breakout
+        # candle detail, not just the summary line) -- only when the
+        # caller actually passed anatomy (currently only ws_listener.py's
+        # PATTERN-SCAN path has the raw candles on hand; the pending-
+        # breakouts watch path doesn't, same limitation _execute_trade's
+        # own anatomy param already documents).
+        if strategy == "3 Bar Play" and alert.get("anatomy"):
+            anatomy_block = _format_anatomy_block(alert["anatomy"])
+            str_emoji = _strength_emoji(strength)
+            return (
+                f"{sig_emoji} *{name}  {sig_letter}  {price_str}  {ist_now}*\n"
+                f"{str_emoji} {strength}  |  {strategy}  |  {tf}\n"
+                f"{anatomy_block}"
             )
 
         # RSI / other strategy format
