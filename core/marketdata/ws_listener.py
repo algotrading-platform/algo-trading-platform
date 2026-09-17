@@ -635,7 +635,17 @@ class WSListener:
         from core.alerts.alert_manager import AlertManager
         from core.strategies.base_strategy import SignalResult
 
-        SignalLogger().log_signal(
+        # Sep 17 -- log_trade_signal(), NOT log_signal(). Same bug class
+        # as the alert_states fix just below: log_signal()'s own dedup
+        # (skip if the last logged signal for this symbol+timeframe+
+        # strategy was already the same direction) silently ate M&M.NS's
+        # entry into the `signals` table today -- its last recorded
+        # signal was 'BUY' from 2026-07-27, so a genuinely new trade
+        # opened today was treated as "no change" and never logged at
+        # all. This call only ever happens after on_signal() has already
+        # confirmed a brand-new position, so there's nothing left to
+        # de-duplicate here either.
+        SignalLogger().log_trade_signal(
             stock=symbol, timeframe=timeframe, signal=side,
             rsi=0.0, price=price, strategy=strategy,
         )
