@@ -1325,6 +1325,20 @@ class ThreeBarFlagStrategy(BaseStrategy):
                                 "Watch_Target":   round(target, 2),
                                 "Watch_Strength": "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE",
                             }
+                            # Sep 17 -- watch_candidate is a SEPARATE, smaller
+                            # dict from `indicators`, not a view onto it, and
+                            # this elif is the sibling of the only branch that
+                            # calls _anatomy_indicators() above. Without this,
+                            # a Watch_* HOLD's result.indicators never carries
+                            # Anatomy_Flagpole/Consolidation/Breakout at all,
+                            # so ws_listener.py's pending_breakouts anatomy_json
+                            # gets stored with everything None -- confirmed
+                            # live, Sep 17: M&M.NS's Telegram alert rendered
+                            # the header line correctly but the whole
+                            # flagpole/consolidation/breakout block came back
+                            # empty, because there was never any anatomy data
+                            # to persist in the first place.
+                            watch_candidate.update(self._anatomy_indicators(bar1, consol, brk, bar1_volume))
 
                     if is_bearish_ignite and self._consolidation_ok(bar1_high, bar1_low, bar1_range, bar1_volume, consol, bullish=False):
                         stop   = bar1_low + self.STOP_PCT_OF_RANGE * bar1_range
@@ -1356,6 +1370,11 @@ class ThreeBarFlagStrategy(BaseStrategy):
                                 "Watch_Target":   round(target, 2),
                                 "Watch_Strength": "STRONG" if volume_ratio >= self.STRONG_VOLUME_MULTIPLE else "MODERATE",
                             }
+                            # Sep 17 -- see matching comment in the bullish
+                            # branch above: watch_candidate needs its own
+                            # anatomy data, it doesn't inherit it from
+                            # `indicators`.
+                            watch_candidate.update(self._anatomy_indicators(bar1, consol, brk, bar1_volume))
 
             if watch_candidate is not None:
                 return SignalResult(
