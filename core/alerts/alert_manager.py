@@ -180,11 +180,58 @@ class AlertManager:
 
         db.upsert_alert_state(stock, timeframe, current_signal, strategy)
 
+        return self._build_and_send(
+            stock, timeframe, current_signal, rsi, price, strategy,
+            signal_result, data_source, anatomy, previous=previous_signal,
+        )
+
+    def send_trade_alert(
+        self,
+        timeframe:      str,
+        stock:          str,
+        current_signal: str,
+        rsi:            float,
+        price:          float,
+        strategy:       str,
+        signal_result          = None,
+        data_source:    str  = "yfinance",
+        anatomy:        dict = None,
+    ) -> dict:
+        """
+        Unconditional alert send for an ALREADY-CONFIRMED trade event
+        (Sep 17) -- bypasses check_alert()'s previous-signal dedup
+        entirely. That dedup exists for continuously-polled strategies
+        (RSI Reversal, Volume Spike) that call check_alert() every scan
+        cycle regardless of outcome, where it correctly avoids re-
+        alerting every cycle while the same signal persists. It's wrong
+        for ws_listener.py's 3-Bar-Play path: that only ever calls into
+        AlertManager AFTER on_signal() has already confirmed a genuinely
+        NEW position was just opened (deduped upstream by OrderManager/
+        the open-position guard) -- there's nothing left to de-duplicate.
+
+        Confirmed live, Sep 17: M&M.NS BUY opened a real new trade, but
+        alert_states still held 'BUY' for that exact symbol+timeframe+
+        strategy from a signal on 2026-07-27 -- almost two months
+        earlier, an unrelated session -- so check_alert()'s "previous ==
+        current" check silently ate the alert for a trade that very much
+        should have been announced. Still records alert_state afterward
+        (for consistency/history), just never lets it gate the send.
+        """
+        db.upsert_alert_state(stock, timeframe, current_signal, strategy)
+        return self._build_and_send(
+            stock, timeframe, current_signal, rsi, price, strategy,
+            signal_result, data_source, anatomy, previous=None,
+        )
+
+    def _build_and_send(
+        self, stock, timeframe, current_signal, rsi, price, strategy,
+        signal_result, data_source, anatomy, previous,
+    ) -> dict:
         alert = {
             "stock":         stock,
             "timeframe":     timeframe,
             "signal":        current_signal,
-            "previous":      previous_signal,
+            "previous":      previous,
             "rsi":           round(float(rsi), 2),
             "price":         round(float(price), 2),
             "strategy":      strategy,

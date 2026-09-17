@@ -640,19 +640,29 @@ class WSListener:
             rsi=0.0, price=price, strategy=strategy,
         )
 
-        # Same alert_states table the normal 5-min scan's check_alert()
-        # reads/writes -- recording the transition here means the next
-        # scan sees "no change" for this exact signal and won't
-        # redundantly re-fire on_signal() for a breakout this thread
-        # already acted on. Also sends the Telegram alert. No trend/RSI
+        # Sep 17 -- use send_trade_alert(), NOT check_alert(). This call
+        # only ever happens after on_signal() already confirmed a
+        # genuinely NEW position was just opened (the existing-position
+        # guard inside on_signal() rejects any duplicate/racing attempt
+        # for the same symbol before it ever gets here as "opened") --
+        # there is nothing left to de-duplicate. check_alert()'s own
+        # previous-signal dedup exists for continuously-polled strategies
+        # (RSI Reversal etc.) that call it every scan cycle regardless of
+        # outcome; using it here was actively wrong. Confirmed live:
+        # M&M.NS opened a real new BUY today, but alert_states still had
+        # 'BUY' recorded from an unrelated signal on 2026-07-27 -- almost
+        # two months earlier -- so check_alert()'s "previous == current"
+        # check silently swallowed the alert for a trade that clearly
+        # should have been announced. send_trade_alert() still records
+        # alert_state afterward (consistency/history), just never lets
+        # it gate whether the message actually sends. No trend/RSI
         # enrichment here (that's a normal-scan-only step) -- the
-        # message renders with neutral trend arrows, which is an
-        # accepted simplification for this fast path. `anatomy` (Sep 16)
-        # DOES get passed through when available (the PATTERN-SCAN path)
-        # so 3 Bar Play alerts show the full flagpole/consolidation/
-        # breakout candle detail instead of a bare summary line.
+        # message renders with neutral trend arrows, an accepted
+        # simplification for this fast path. `anatomy` (Sep 16) still
+        # passes through when available so 3 Bar Play alerts show the
+        # full flagpole/consolidation/breakout candle detail.
         signal_result = SignalResult(side, strength or "MODERATE", reason, {}, strategy)
-        AlertManager().check_alert(
+        AlertManager().send_trade_alert(
             timeframe=timeframe, stock=symbol, current_signal=side,
             rsi=0.0, price=price, strategy=strategy,
             signal_result=signal_result, data_source="upstox_ws",
