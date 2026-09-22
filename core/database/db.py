@@ -1891,6 +1891,161 @@ def cancel_pending_breakout(symbol: str, strategy: str, timeframe: str) -> bool:
         return False
 
 
+# ============================================================
+# TRADE INTENTS (outbox pattern, enterprise Phase 1)
+#
+# Generalizes pending_breakouts' RETRY idea to EVERY trade trigger, not
+# just breakout-watch. Previously, ws_listener.py's full-universe
+# _scan_universe_for_patterns() called PaperTrader.on_signal() (which
+# calls SandboxClient.place_order(), a blocking network call)
+# SYNCHRONOUSLY, inline, once per symbol -- meaning a slow order (a
+# 401 retry costs up to ~4s) stalled evaluation of every other symbol
+# in that same 60s cycle. Detection now only ever writes a row here
+# and moves on immediately; a separate worker pool
+# (ws_listener.py's _order_worker_loop) drains this table concurrently,
+# fully decoupled from the scan cadence.
+#
+# Requires the trade_intents table (infra/schema_azure_sql.sql) to
+# exist in the target database -- see that file's header for the
+# CREATE TABLE statement.
+# ============================================================
+
+def enqueue_trade_intent(
+    symbol:        str,
+    side:          str,
+    price:         float,
+    strategy:      str,
+    timeframe:     str,
+    strength:      str   = None,
+    reason:        str   = None,
+    anatomy:       dict  = None,
+    custom_stop:   float = None,
+    custom_target: float = None,
+) -> bool:
+    """Record a detected signal for the order-worker pool to act on.
+    Fire-and-forget from the caller's perspective -- returns quickly,
+    never calls the broker itself."""
+    anatomy_json = _anatomy_to_json(anatomy)
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                INSERT INTO trade_intents
+                    (symbol, side, price, strategy, timeframe, strength, reason, anatomy_json,
+                     custom_stop, custom_target, status, attempts, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, SYSDATETIMEOFFSET(), SYSDATETIMEOFFSET())
+            """, (
+                symbol, side, round(float(price), 2), strategy, timeframe, strength, reason, anatomy_json,
+                round(float(custom_stop), 2) if custom_stop is not None else None,
+                round(float(custom_target), 2) if custom_target is not None else None,
+            ))
+        return True
+    except Exception as e:
+        print(f"[DB] enqueue_trade_intent error: {e}")
+        return False
+
+
+def claim_next_trade_intents(limit: int = 10) -> list[dict]:
+    """
+    Atomically claims up to `limit` PENDING/RETRY rows (oldest first)
+    for the order-worker pool, flipping them to EXECUTING in the same
+    statement so two workers (or a worker racing a retry sweep) can
+    never both claim the same row -- same single-UPDATE atomicity
+    pending_breakouts' claim_pending_breakout() relies on, generalized
+    to a multi-row claim via an updatable CTE.
+
+    A RETRY row backs off exponentially (15s/30s/60s/120s, capped at
+    180s) before it's eligible again, keyed off `attempts` -- added
+    Sep 22 (code review) after a RETRY row with no backoff at all was
+    found to exhaust mark_trade_intent_failed's default max_attempts=8
+    (raised from 5 in the same fix) in under 25s at the 3s worker-poll
+    cadence, instead of tolerating a transient Upstox Sandbox 401 (the
+    kind sandbox_client.py's own docs say "succeeds again later") the
+    way the older pending_breakouts table's ~15-minute TTL did.
+    """
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                WITH cte AS (
+                    SELECT TOP (?) *
+                    FROM trade_intents
+                    WHERE status = 'PENDING'
+                       OR (status = 'RETRY' AND updated_at <= DATEADD(SECOND,
+                            -CASE WHEN attempts >= 4 THEN 180
+                                  ELSE CAST(15 * POWER(2.0, attempts) AS INT) END,
+                            SYSDATETIMEOFFSET()))
+                    ORDER BY created_at
+                )
+                UPDATE cte SET status = 'EXECUTING', updated_at = SYSDATETIMEOFFSET()
+                OUTPUT inserted.*;
+            """, (limit,))
+            return cur.fetchall() or []
+    except Exception as e:
+        print(f"[DB] claim_next_trade_intents error: {e}")
+        return []
+
+
+def mark_trade_intent_done(id_: int) -> bool:
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                UPDATE trade_intents SET status = 'DONE', updated_at = SYSDATETIMEOFFSET()
+                WHERE id = ? AND status = 'EXECUTING'
+            """, (id_,))
+            return cur.rowcount > 0
+    except Exception as e:
+        print(f"[DB] mark_trade_intent_done error: {e}")
+        return False
+
+
+def mark_trade_intent_failed(id_: int, error: str, max_attempts: int = 8) -> bool:
+    """
+    A failed placement goes back to RETRY (for the same worker loop to
+    pick up again next poll, subject to claim_next_trade_intents'
+    exponential backoff) unless it's already exhausted max_attempts,
+    in which case it's parked as FAILED so a stuck symbol can't retry
+    forever and starve the queue. max_attempts raised from 5 to 8 (Sep
+    22, code review) alongside adding that backoff -- together they
+    give a RETRY row roughly the same ~15-minute total retry window
+    the older pending_breakouts table's TTL gave, instead of exhausting
+    in under 25s with no backoff at all.
+    """
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                UPDATE trade_intents
+                SET status = CASE WHEN attempts + 1 >= ? THEN 'FAILED' ELSE 'RETRY' END,
+                    attempts = attempts + 1,
+                    error = ?,
+                    updated_at = SYSDATETIMEOFFSET()
+                WHERE id = ? AND status = 'EXECUTING'
+            """, (max_attempts, error[:2000] if error else None, id_))
+            return cur.rowcount > 0
+    except Exception as e:
+        print(f"[DB] mark_trade_intent_failed error: {e}")
+        return False
+
+
+def expire_stale_trade_intents(stale_after_seconds: int = 300) -> int:
+    """
+    Sweep rows stuck in EXECUTING (e.g. a worker crashed mid-placement)
+    back to RETRY once they've been claimed longer than
+    stale_after_seconds -- mirrors expire_stale_pending_breakouts()'s
+    role for the older watch-list table. Called once per worker-loop
+    tick before claiming new rows.
+    """
+    try:
+        with _get_cursor() as cur:
+            cur.execute("""
+                UPDATE trade_intents SET status = 'RETRY', updated_at = SYSDATETIMEOFFSET()
+                WHERE status = 'EXECUTING'
+                  AND updated_at <= DATEADD(second, -?, SYSDATETIMEOFFSET())
+            """, (stale_after_seconds,))
+            return cur.rowcount
+    except Exception as e:
+        print(f"[DB] expire_stale_trade_intents error: {e}")
+        return 0
+
+
 def insert_trade_anatomy(position_id: int, anatomy: dict) -> bool:
     """
     Persist the flagpole/consolidation/breakout candles a pattern

@@ -33,6 +33,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import pytz
@@ -40,6 +41,7 @@ import requests
 
 from configs.universe import get_all_instruments_extended
 from core.database import db
+from core.telemetry import record_signal_to_order_latency
 from data.providers.upstox_provider import _load_instruments, get_instrument_key, get_token
 
 log = logging.getLogger("ws_listener")
@@ -56,14 +58,58 @@ IST = pytz.timezone("Asia/Kolkata")
 # alerts). Rate-limited so a stuck retry loop can't spam the chat.
 _OPS_ALERT_COOLDOWN_SEC = 1800  # at most one alert per 30 min per reason
 _last_ops_alert: dict[str, float] = {}
+_ops_alert_lock = threading.Lock()
+
+
+def _candle_ts_is_stale(candle: dict | None) -> bool:
+    ts = (candle or {}).get("ts")
+    if ts is None:
+        return False
+    try:
+        if getattr(ts, "tzinfo", None) is None:
+            ts = pytz.utc.localize(ts)
+        return ts.astimezone(IST).date() != datetime.now(IST).date()
+    except Exception:
+        return False
+
+
+def _is_stale_breakout(anatomy: dict | None) -> bool:
+    """
+    True if the pattern's breakout OR flagpole candle isn't from today
+    (IST) -- see the Sep 21 MARICO.NS incident this guards against:
+    between market open and this timeframe's first candle actually
+    closing, the most recent COMPLETE candle can still be the PREVIOUS
+    session's last bar, and a trend-grading re-check that happens to
+    flip from "suppressed" to "not suppressed" overnight can fire a
+    signal on a breakout that already fully played out last session.
+    Originally only checked the breakout candle; extended (Sep 22,
+    second MARICO.NS report) after the same stale-session-boundary
+    issue surfaced on the FLAGPOLE candle instead -- bar1_idx in
+    ThreeBarFlagStrategy.generate_signal() can walk back into the
+    prior session near market open just as easily as brk_idx can, so
+    a flagpole from yesterday needs the same guard as a breakout from
+    yesterday.
+    Best-effort: missing/malformed anatomy is treated as NOT stale
+    (fail open) so a genuine data-shape issue elsewhere never blocks
+    a real signal -- this is a staleness check, not a validity check.
+    """
+    if not anatomy:
+        return False
+    return (_candle_ts_is_stale(anatomy.get("breakout")) or
+            _candle_ts_is_stale(anatomy.get("flagpole")))
 
 
 def _send_ops_alert(reason: str, message: str) -> None:
-    now = time.time()
-    last = _last_ops_alert.get(reason, 0.0)
-    if now - last < _OPS_ALERT_COOLDOWN_SEC:
-        return
-    _last_ops_alert[reason] = now
+    # Locked read-then-write: two connect threads can hit the same
+    # failure reason at nearly the same time, and without a lock both
+    # can read the stale `last` before either writes the update,
+    # letting both past the cooldown and firing a duplicate alert.
+    with _ops_alert_lock:
+        now = time.time()
+        last = _last_ops_alert.get(reason, 0.0)
+        if now - last < _OPS_ALERT_COOLDOWN_SEC:
+            return
+        _last_ops_alert[reason] = now
 
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     chat_id   = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -81,6 +127,20 @@ def _send_ops_alert(reason: str, message: str) -> None:
 
 FLUSH_INTERVAL_SEC = 5
 SUPERVISOR_TICK_SEC = 30
+
+# ── Order-execution worker pool (enterprise Phase 1, 2026-09-20) ──
+# _scan_universe_for_patterns() used to call PaperTrader.on_signal()
+# (which blocks on a broker network call) SYNCHRONOUSLY, once per
+# symbol, inline in its ~500-symbol loop -- a slow order (a 401 retry
+# costs up to ~4s, sandbox_client.py) stalled evaluation of every
+# other symbol for the rest of that 60s cycle. Detection now only
+# writes a trade_intents row (db.enqueue_trade_intent) and moves on;
+# this worker pool drains that table on its own short cadence, with
+# its own concurrency, fully decoupled from the scan loop's cadence.
+ORDER_WORKER_POLL_SEC = 3
+ORDER_WORKER_CLAIM_BATCH = 10
+ORDER_WORKER_MAX_WORKERS = 8
+ORDER_INTENT_STALE_AFTER_SEC = 120  # re-queue a claim stuck in EXECUTING this long
 RECONNECT_RETRY_COUNT = 100
 RECONNECT_INTERVAL_SEC = 5
 BREAKOUT_WATCH_INTERVAL_SEC = 60  # fast breakout watch cadence (Sep 2) --
@@ -114,6 +174,17 @@ BREAKOUT_WATCH_INTERVAL_SEC = 60  # fast breakout watch cadence (Sep 2) --
 # just to avoid timeouts. This design keeps the per-cycle DB read down
 # to whatever's genuinely new (usually 0-1 rows per symbol per pass).
 PATTERN_SCAN_INTERVAL_SEC = 60
+
+# Enterprise Phase 3 (2026-09-21) -- the universe is split into this many
+# roughly-equal, disjoint symbol shards, each scanned by its own thread on
+# the same PATTERN_SCAN_INTERVAL_SEC cadence (see run_forever()). Total
+# per-cycle wall time then scales with (universe size / PATTERN_SCAN_SHARDS)
+# instead of the full universe size, which is what actually lets the
+# instrument count grow without the single-threaded loop's cycle time
+# eventually exceeding its own 60s cadence. 4 is a starting point, not
+# derived from a measured ceiling -- raise it if a future universe
+# expansion (e.g. crypto, or a wider Nifty universe) needs it.
+PATTERN_SCAN_SHARDS = 4
 CANDLE_BUFFER_MAX_1MIN_ROWS = 400  # ~6.5h of 1-min data -- comfortably covers
                                     # ATR(30) + VOLUME_LOOKBACK(20) + the
                                     # pattern's own lookback + catch-up
@@ -208,6 +279,7 @@ class WSListener:
         self._streamer = None
         self._need_restart = False
         self._connect_generation = 0  # see _connect_once()'s pileup guard
+        self._connect_lock = threading.Lock()  # guards generation bump + streamer assignment
         self._paper_trader = None  # lazy, see _get_paper_trader()
         self._paper_trader_lock = threading.Lock()
         self._candle_buffers: dict = {}    # symbol -> 1-min OHLCV DataFrame (rolling, TODAY only)
@@ -219,7 +291,13 @@ class WSListener:
         self._historical_bars: dict = {}   # symbol -> {rule: DataFrame} resampled bars from
                                             # before today -- see _get_historical_bars()
         self._historical_bootstrap_day = None  # calendar date the above cache was built for
-        self._historical_bootstrap_budget = 0  # new-symbol bootstraps left this cycle
+        # Per-SHARD budget (enterprise Phase 3, 2026-09-21) -- was a single
+        # shared scalar, fine when one loop covered the whole universe.
+        # Once the pattern scan is sharded into N parallel loops (see
+        # run_forever()), each shard resets its own budget independently at
+        # the top of its own cycle; a shared scalar would have let one
+        # shard's reset clobber another shard's still-in-progress budget.
+        self._historical_bootstrap_budget: dict[int, int] = {}
         self._last_tick_ts: float = time.time()  # last time ANY WS message arrived
         self._symbol_to_category: dict[str, str] = {}
         self._trend_engine = None  # lazy StrategyEngine("3 Bar Play"), see _get_trend_engine()
@@ -282,22 +360,32 @@ class WSListener:
         # (right before committing to the blocking .connect() loop)
         # whether a newer attempt has since started -- if so it abandons
         # itself instead of clobbering self._streamer out of order.
-        self._connect_generation += 1
-        my_generation = self._connect_generation
+        with self._connect_lock:
+            self._connect_generation += 1
+            my_generation = self._connect_generation
 
         def _run():
             try:
                 log.info(f"connecting WS — {len(instrument_keys)} instruments, mode=full")
                 streamer = self._build_streamer(instrument_keys)
-                if my_generation != self._connect_generation:
-                    log.warning(f"connect attempt (gen {my_generation}) superseded before "
-                                f"connecting -- abandoning in favor of the newer attempt")
-                    try:
-                        streamer.disconnect()
-                    except Exception:
-                        pass
-                    return
-                self._streamer = streamer
+                # Check-and-assign must be one atomic step under the same
+                # lock the generation bump above uses -- otherwise a
+                # stale thread's check here can pass just before a newer
+                # attempt bumps the generation, and its assignment below
+                # can still land AFTER the newer attempt's, overwriting
+                # the real live streamer with this superseded one (leaked
+                # socket/thread, and duplicate _on_message delivery from
+                # two simultaneously-live streams).
+                with self._connect_lock:
+                    if my_generation != self._connect_generation:
+                        log.warning(f"connect attempt (gen {my_generation}) superseded before "
+                                    f"connecting -- abandoning in favor of the newer attempt")
+                        try:
+                            streamer.disconnect()
+                        except Exception:
+                            pass
+                        return
+                    self._streamer = streamer
                 self._streamer.connect()  # may block this thread indefinitely — that's fine
             except Exception as e:
                 log.error(f"WS connect thread crashed: {e}")
@@ -380,13 +468,21 @@ class WSListener:
         # No OHLC field on this particular tick — still track LTP so
         # the latest-price read path stays fresh even before the
         # first I1 candle arrives for this instrument this minute.
+        # Read-and-mutate must happen under ONE lock acquisition: this
+        # dict is the same object sitting in self._pending, which
+        # _flush_loop can read and hand to db.upsert_live_candles()
+        # concurrently from another thread. Splitting the read and the
+        # mutation across two separately-locked (or unlocked) steps let
+        # a flush serialize a half-updated row (e.g. close bumped but
+        # high/low not yet), producing an invalid close>high/low<close
+        # candle in live_candles_1min with no error.
         with self._lock:
             prev = self._pending.get(instrument_key)
-        if prev and prev["ts"] == ts:
-            prev["close"] = ltp
-            prev["high"] = max(prev["high"], ltp)
-            prev["low"] = min(prev["low"], ltp)
-            return prev
+            if prev and prev["ts"] == ts:
+                prev["close"] = ltp
+                prev["high"] = max(prev["high"], ltp)
+                prev["low"] = min(prev["low"], ltp)
+                return prev
         return {
             "instrument_key": instrument_key, "symbol": symbol, "ts": ts,
             "open": ltp, "high": ltp, "low": ltp, "close": ltp, "volume": 0,
@@ -410,7 +506,13 @@ class WSListener:
             try:
                 now_minute = datetime.now(IST).replace(second=0, microsecond=0)
                 with self._lock:
-                    rows = list(self._pending.values())
+                    # Shallow-copy each row while still holding the lock --
+                    # these dicts are mutated in place by _extract_candle
+                    # on later ticks, and handing out the live references
+                    # (instead of a snapshot) let a tick mutate a row while
+                    # db.upsert_live_candles() below was still serializing
+                    # it, unlocked, on this thread.
+                    rows = [dict(row) for row in self._pending.values()]
                     # Evict candles whose minute has already closed -- they
                     # were flushed at least once already and won't receive
                     # any more ticks (a live tick for a new minute replaces
@@ -494,8 +596,15 @@ class WSListener:
             if not instrument_key:
                 continue  # not in this listener's subscription universe
 
+            # Copy the row (not just the reference) while still under the
+            # lock -- _extract_candle mutates this same dict in place on
+            # later ticks, and reading high/low after releasing the lock
+            # could read a torn pair (e.g. high already bumped by a new
+            # tick, low not yet), mis-detecting the breakout cross.
             with self._lock:
                 live = self._pending.get(instrument_key)
+                if live is not None:
+                    live = dict(live)
             if not live:
                 continue  # no live tick for this symbol yet this session
 
@@ -504,6 +613,21 @@ class WSListener:
             crossed = (side == "BUY"  and float(live["high"]) >= trigger) or \
                       (side == "SELL" and float(live["low"])  <= trigger)
             if not crossed:
+                continue
+
+            # Defense in depth alongside the same check in
+            # _scan_universe_for_patterns -- this row's own TTL (default
+            # 15 min, see upsert_pending_breakout) already makes a
+            # multi-day-stale watch unlikely here, but it's cheap
+            # insurance against the same "stale breakout candle" class
+            # of bug regardless of which path a signal comes through.
+            if _is_stale_breakout(db.anatomy_from_json(row.get("anatomy_json"))):
+                # Row is still PENDING/RETRY here (not yet claimed) --
+                # leave it for expire_stale_pending_breakouts()'s normal
+                # TTL sweep rather than force-updating a status this
+                # function has no claim on yet.
+                log.warning(f"breakout-watch: {row['symbol']}/{row['timeframe']} crossed but its "
+                            f"anatomy is from a prior session -- not triggering, letting it expire")
                 continue
 
             # Claim atomically, but only mark a watch triggered after the
@@ -743,7 +867,7 @@ class WSListener:
         self._buffer_last_ts[symbol] = buf["Datetime"].iloc[-1]
         return buf
 
-    def _get_historical_bars(self, symbol: str) -> dict:
+    def _get_historical_bars(self, symbol: str, shard_id: int) -> dict:
         """
         Lazily bootstraps and caches this symbol's pre-today candles,
         resampled into all three PATTERN_SCAN_TIMEFRAMES -- see
@@ -751,10 +875,11 @@ class WSListener:
         this fixes (1-Hour/15-Minute could never accumulate enough
         same-day bars to pass ThreeBarFlagStrategy's minimum-data check).
 
-        Paced via _historical_bootstrap_budget (reset once per cycle by
-        _scan_universe_for_patterns(), NOT here) so a cold start doesn't
-        fire ~500 heavier multi-day queries at once -- a symbol that
-        hasn't had its turn yet just returns {} (falls back to
+        Paced via _historical_bootstrap_budget[shard_id] (reset once per
+        cycle, per shard, by _scan_universe_for_patterns(), NOT here) so a
+        cold start doesn't fire ~500 heavier multi-day queries at once -- a
+        symbol that hasn't had its shard's turn yet just returns {} (falls
+        back to today-only data, today's original behavior) until its budget
         today-only data, today's original behavior) until its budget
         comes up in a later cycle, typically within ~20 minutes of a
         restart. The cache itself (which symbols are already
@@ -771,10 +896,10 @@ class WSListener:
         if symbol in self._historical_bars:
             return self._historical_bars[symbol]
 
-        if self._historical_bootstrap_budget <= 0:
-            return {}  # not this symbol's turn yet this cycle
+        if self._historical_bootstrap_budget.get(shard_id, 0) <= 0:
+            return {}  # not this symbol's shard's turn yet this cycle
 
-        self._historical_bootstrap_budget -= 1
+        self._historical_bootstrap_budget[shard_id] -= 1
         from data.providers.upstox_provider import resample_ohlc
 
         bars: dict = {}
@@ -802,7 +927,7 @@ class WSListener:
         self._historical_bars[symbol] = bars
         return bars
 
-    def _get_candles(self, symbol: str, rule: str, today_buf=None):
+    def _get_candles(self, symbol: str, rule: str, shard_id: int, today_buf=None):
         """
         Resamples `rule` (e.g. "5min"/"15min"/"1h") from the combination
         of this symbol's cached pre-today bars and its live today-buffer
@@ -820,7 +945,7 @@ class WSListener:
             return None
 
         today_resampled = resample_ohlc(today_buf.copy(), rule)
-        historical = self._get_historical_bars(symbol).get(rule)
+        historical = self._get_historical_bars(symbol, shard_id).get(rule)
 
         if historical is not None and not historical.empty:
             if today_resampled is not None and not today_resampled.empty:
@@ -895,15 +1020,21 @@ class WSListener:
         )
         return True
 
-    def _pattern_scan_loop(self) -> None:
+    def _pattern_scan_loop(self, shard_id: int, symbols: list[str]) -> None:
+        # Enterprise Phase 3 (2026-09-21): each shard runs this loop on its
+        # own thread, covering only `symbols` (a disjoint slice of the full
+        # universe -- see run_forever()'s sharding). Total scan-cycle wall
+        # time then scales with shard size, not total universe size, which
+        # is what actually lets the instrument count grow past where a
+        # single 60s-cadence loop over everything would start lagging.
         while True:
             time.sleep(PATTERN_SCAN_INTERVAL_SEC)
             try:
-                self._scan_universe_for_patterns()
+                self._scan_symbols_for_patterns(shard_id, symbols)
             except Exception as e:
-                log.warning(f"pattern-scan cycle failed: {e}")
+                log.warning(f"pattern-scan cycle failed (shard {shard_id}): {e}")
 
-    def _scan_universe_for_patterns(self) -> None:
+    def _scan_symbols_for_patterns(self, shard_id: int, symbols: list[str]) -> None:
         from core.strategies.strategies import ThreeBarFlagStrategy
         from core.engine.strategy_engine import _compute_catchup_n, _record_scan_progress
         from core.scheduler.signal_scheduler import is_market_hours
@@ -921,18 +1052,28 @@ class WSListener:
         if not is_market_hours():
             return
 
-        # Fresh historical-bootstrap budget every cycle (Sep 11) -- the
-        # cache of WHICH symbols are already bootstrapped persists across
-        # cycles (see _get_historical_bars), but the budget itself must
-        # reset each cycle, not just once per calendar day, or only the
-        # first HISTORICAL_BOOTSTRAP_BUDGET_PER_CYCLE symbols in iteration
-        # order would ever get bootstrapped for the entire rest of the day.
-        self._historical_bootstrap_budget = HISTORICAL_BOOTSTRAP_BUDGET_PER_CYCLE
+        # Fresh historical-bootstrap budget every cycle (Sep 11), now keyed
+        # per shard (Phase 3) -- the cache of WHICH symbols are already
+        # bootstrapped persists across cycles (see _get_historical_bars),
+        # but the budget itself must reset each cycle, not just once per
+        # calendar day, or only the first HISTORICAL_BOOTSTRAP_BUDGET_PER_CYCLE
+        # symbols in iteration order would ever get bootstrapped for the
+        # entire rest of the day. Per-shard so one shard's reset can never
+        # stomp another shard's still-in-progress budget for this cycle --
+        # but the per-shard allotment is HISTORICAL_BOOTSTRAP_BUDGET_PER_CYCLE
+        # divided across PATTERN_SCAN_SHARDS (Sep 22 fix, code review), not
+        # the full constant each: giving every one of the 4 shards its own
+        # full 25 let a cold restart during market hours fire up to 100
+        # simultaneous historical-bootstrap queries in one cycle -- 4x the
+        # burst this budget exists to cap.
+        self._historical_bootstrap_budget[shard_id] = max(
+            1, HISTORICAL_BOOTSTRAP_BUDGET_PER_CYCLE // PATTERN_SCAN_SHARDS
+        )
 
         strat = ThreeBarFlagStrategy()
         strategy_name = strat.name
 
-        for symbol in list(self._symbol_to_key.keys()):
+        for symbol in symbols:
             try:
                 today_buf = self._refresh_today_buffer(symbol)
             except Exception as e:
@@ -952,7 +1093,7 @@ class WSListener:
 
             for timeframe, rule in self.PATTERN_SCAN_TIMEFRAMES:
                 try:
-                    df = self._get_candles(symbol, rule, today_buf=today_buf)
+                    df = self._get_candles(symbol, rule, shard_id, today_buf=today_buf)
                     if df is None:
                         continue
 
@@ -968,37 +1109,46 @@ class WSListener:
                             "consolidation": result.indicators.get("Anatomy_Consolidation"),
                             "breakout": result.indicators.get("Anatomy_Breakout"),
                         }
-                        outcome = self._execute_trade(
-                            symbol=symbol, strategy=strategy_name, timeframe=timeframe,
-                            side=result.signal,
+                        if _is_stale_breakout(anatomy):
+                            # Confirmed live, Sep 21 (MARICO.NS): between market
+                            # open and this timeframe's first candle actually
+                            # closing (e.g. 09:15-09:30 for a 15-min bar), the
+                            # most recent COMPLETE candle in the resampled
+                            # series is still the PREVIOUS session's last bar.
+                            # check_last_n is correctly capped at 1 by
+                            # _compute_catchup_n's day-boundary guard, but that
+                            # only bounds which candle is checked AS a
+                            # breakout point -- it doesn't stop that single
+                            # candle itself from being a prior-session one. The
+                            # pattern had already been evaluated (and correctly
+                            # suppressed by trend grading) Friday afternoon;
+                            # today's freshly-recomputed trend just happened to
+                            # stop suppressing it, "firing" on Monday morning a
+                            # breakout that actually happened, and finished,
+                            # last Friday. Guard here instead of loosening the
+                            # catch-up window, since the underlying candles are
+                            # genuinely stale, not merely uncounted.
+                            log.warning(f"pattern-scan: {symbol}/{timeframe} matched but its "
+                                        f"breakout candle is from a prior session -- skipping "
+                                        f"as stale rather than firing on a completed old move")
+                            continue
+                        # Enterprise Phase 1 (2026-09-20): enqueue only --
+                        # no network call, no blocking on this loop's
+                        # thread. _order_worker_loop drains trade_intents
+                        # with its own concurrency and retry/backoff
+                        # (attempts/RETRY/FAILED), which supersedes the old
+                        # "write a pending_breakouts RETRY row on a sandbox
+                        # error" fallback this branch used to need -- that
+                        # retry now lives in trade_intents itself.
+                        db.enqueue_trade_intent(
+                            symbol=symbol, side=result.signal, strategy=strategy_name,
+                            timeframe=timeframe,
                             price=result.indicators.get("Pattern_Entry"),
-                            stop=result.indicators.get("Pattern_Stop"),
-                            target=result.indicators.get("Pattern_Target_Exact"),
+                            custom_stop=result.indicators.get("Pattern_Stop"),
+                            custom_target=result.indicators.get("Pattern_Target_Exact"),
                             strength=result.strength, reason=result.reason,
-                            source_label="PATTERN-SCAN",
                             anatomy=anatomy,
                         )
-                        # Keep a direct pattern signal alive for the same
-                        # bounded 15-minute window when Sandbox temporarily
-                        # rejects a valid token. The live-tick watcher will
-                        # retry only while the trigger remains crossed.
-                        # Sep 16: carries the same `anatomy` through too, so
-                        # if BREAKOUT-WATCH ends up being the one that
-                        # eventually lands this trade, its alert can still
-                        # show the full flagpole/consolidation/breakout
-                        # detail instead of nothing.
-                        if (outcome.get("action") == "error" and
-                                str(outcome.get("reason", "")).startswith("sandbox:")):
-                            db.upsert_pending_breakout(
-                                symbol=symbol, strategy=strategy_name, timeframe=timeframe,
-                                side=result.signal,
-                                trigger_price=result.indicators.get("Pattern_Entry"),
-                                stop_loss=result.indicators.get("Pattern_Stop"),
-                                target=result.indicators.get("Pattern_Target_Exact"),
-                                strength=result.strength,
-                                status="RETRY",
-                                anatomy=anatomy,
-                            )
                     elif result.indicators.get("Watch_Entry") is not None:
                         db.upsert_pending_breakout(
                             symbol=symbol, strategy=strategy_name, timeframe=timeframe,
@@ -1025,6 +1175,67 @@ class WSListener:
                 except Exception as e:
                     log.warning(f"pattern-scan failed for {symbol}/{timeframe}: {e}")
 
+    # --------------------------------------------------------
+    # order-execution worker pool (enterprise Phase 1) -- drains
+    # trade_intents rows written by _scan_universe_for_patterns above,
+    # fully decoupled from that loop's cadence. See ORDER_WORKER_*
+    # constants' comment for why this exists.
+    # --------------------------------------------------------
+    def _order_worker_loop(self) -> None:
+        while True:
+            time.sleep(ORDER_WORKER_POLL_SEC)
+            try:
+                self._drain_trade_intents()
+            except Exception as e:
+                log.warning(f"order-worker cycle failed: {e}")
+
+    def _drain_trade_intents(self) -> None:
+        db.expire_stale_trade_intents(ORDER_INTENT_STALE_AFTER_SEC)
+        intents = db.claim_next_trade_intents(ORDER_WORKER_CLAIM_BATCH)
+        if not intents:
+            return
+
+        with ThreadPoolExecutor(max_workers=ORDER_WORKER_MAX_WORKERS) as pool:
+            futures = {pool.submit(self._run_trade_intent, row): row for row in intents}
+            for fut in as_completed(futures):
+                row = futures[fut]
+                try:
+                    fut.result()
+                except Exception as e:
+                    log.error(f"trade_intent {row['id']} ({row['symbol']}) worker crashed: {e}")
+                    db.mark_trade_intent_failed(row["id"], str(e))
+
+    def _run_trade_intent(self, row: dict) -> None:
+        anatomy = db.anatomy_from_json(row.get("anatomy_json"))
+        outcome = self._execute_trade(
+            symbol=row["symbol"], strategy=row["strategy"], timeframe=row["timeframe"],
+            side=row["side"], price=float(row["price"]),
+            stop=float(row["custom_stop"]) if row.get("custom_stop") is not None else float(row["price"]),
+            target=float(row["custom_target"]) if row.get("custom_target") is not None else float(row["price"]),
+            strength=row.get("strength"), reason=row.get("reason") or "",
+            source_label="PATTERN-SCAN", anatomy=anatomy,
+        )
+
+        created_at = row.get("created_at")
+        if created_at is not None:
+            try:
+                if created_at.tzinfo is None:
+                    created_at = pytz.utc.localize(created_at)
+                latency = (datetime.now(created_at.tzinfo) - created_at).total_seconds()
+                record_signal_to_order_latency(latency, row["strategy"], "PATTERN-SCAN")
+            except Exception as e:
+                log.debug(f"latency metric failed (non-fatal): {e}")
+
+        if outcome.get("action") == "error":
+            db.mark_trade_intent_failed(row["id"], str(outcome.get("reason", "unknown error")))
+        else:
+            # "opened"/"rejected"/"skip" are all terminal from the
+            # outbox's point of view -- a reject (e.g. cap full,
+            # duplicate signal) isn't a transient failure worth
+            # retrying, same posture _execute_trade already takes with
+            # its own alerting (only "error" gets an ops alert).
+            db.mark_trade_intent_done(row["id"])
+
     def run_forever(self) -> None:
         universe = build_subscription_universe()
         if not universe:
@@ -1038,7 +1249,27 @@ class WSListener:
 
         threading.Thread(target=self._flush_loop, daemon=True, name="ws-listener-flush").start()
         threading.Thread(target=self._breakout_watch_loop, daemon=True, name="ws-listener-breakout-watch").start()
-        threading.Thread(target=self._pattern_scan_loop, daemon=True, name="ws-listener-pattern-scan").start()
+
+        # Enterprise Phase 3 -- split the universe into PATTERN_SCAN_SHARDS
+        # disjoint symbol lists, one dedicated thread per shard, instead of
+        # one thread looping the entire universe. A symbol's shard
+        # assignment (index into the sorted symbol list, mod shard count)
+        # is stable across restarts since it only depends on the symbol
+        # list itself, not on iteration/dict order.
+        all_symbols = sorted(self._symbol_to_key.keys())
+        shards: list[list[str]] = [[] for _ in range(PATTERN_SCAN_SHARDS)]
+        for i, sym in enumerate(all_symbols):
+            shards[i % PATTERN_SCAN_SHARDS].append(sym)
+        for shard_id, shard_symbols in enumerate(shards):
+            if not shard_symbols:
+                continue
+            threading.Thread(
+                target=self._pattern_scan_loop, args=(shard_id, shard_symbols),
+                daemon=True, name=f"ws-listener-pattern-scan-{shard_id}",
+            ).start()
+            log.info(f"pattern-scan shard {shard_id}: {len(shard_symbols)} symbols")
+
+        threading.Thread(target=self._order_worker_loop, daemon=True, name="ws-listener-order-worker").start()
         self._connect_once(instrument_keys)
 
         from core.scheduler.signal_scheduler import is_market_hours

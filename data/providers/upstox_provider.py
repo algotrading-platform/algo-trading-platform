@@ -190,14 +190,32 @@ def get_instrument_key(yf_symbol: str) -> str | None:
     return _symbol_key_cache.get(yf_symbol)
 
 
+def _arbitrage_contract_index() -> int:
+    """
+    Which contract in an underlying's expiry-sorted FUT list arbitrage
+    should quote, per Jwala's month-half rule (2026-09-22 call): days
+    1-15 use the current (front) month's futures; day 16 through
+    month-end roll to the NEXT month's futures, since holding the
+    front-month contract deep into its expiry run-up degrades the
+    basis arbitrage isn't meant to be exposed to. 0 = front/current
+    month, 1 = next month.
+    """
+    return 0 if datetime.now(pytz.timezone("Asia/Kolkata")).day <= 15 else 1
+
+
 def get_nearest_futures_contract(underlying_symbol: str) -> dict | None:
     """
-    Front-month (nearest-expiry) NSE_FO FUT contract for an equity
-    underlying, looked up locally from the instruments file this module
-    already downloads — NOT via Upstox's /instruments/search, which
-    doesn't actually filter by asset_type (see the FUT-collection
-    comment in _load_instruments() for why that broke arbitrage
-    coverage on names like M&M/LT/BSE/BEL/OIL).
+    NSE_FO FUT contract for an equity underlying, looked up locally
+    from the instruments file this module already downloads — NOT via
+    Upstox's /instruments/search, which doesn't actually filter by
+    asset_type (see the FUT-collection comment in _load_instruments()
+    for why that broke arbitrage coverage on names like
+    M&M/LT/BSE/BEL/OIL).
+
+    Which contract (front month vs. next month) is picked follows
+    _arbitrage_contract_index()'s day-of-month rule; if the preferred
+    month isn't available (e.g. next month's contract not listed yet),
+    falls back to the nearest one that is, rather than returning None.
 
     `underlying_symbol` should be the bare NSE symbol, no ".NS" suffix
     (e.g. "M&M", "RELIANCE"). Returns None if there's no active FUT
@@ -208,7 +226,21 @@ def get_nearest_futures_contract(underlying_symbol: str) -> dict | None:
     if not contracts:
         return None
 
-    nearest = contracts[0]
+    want_idx = _arbitrage_contract_index()
+    idx = min(want_idx, len(contracts) - 1)
+    if idx != want_idx:
+        # Bug found in code review (Sep 22): silently falling back to
+        # front-month here with no trace defeats the whole point of the
+        # day-16+ roll rule -- this is exactly the contract it's meant
+        # to avoid holding deep into expiry. Common right after a
+        # monthly rollover, before Upstox lists next month's contract.
+        log.warning(
+            f"[Upstox] Arbitrage wanted contract index {want_idx} for "
+            f"{underlying_symbol} (day-of-month roll rule) but only "
+            f"{len(contracts)} contract(s) listed -- falling back to "
+            f"index {idx} (front month)"
+        )
+    nearest = contracts[idx]
     expiry_str = ""
     expiry_ms = nearest.get("expiry_ms")
     if expiry_ms:
