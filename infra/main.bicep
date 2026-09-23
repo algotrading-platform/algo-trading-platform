@@ -2,8 +2,11 @@
 // Algo Trading Platform — Infrastructure (AGT PlayGround subscription)
 // ============================================================================
 // Deploys: ACR, Log Analytics, Container Apps Environment, one always-on
-// Container App (dashboard), one Container App Job (scheduled scan, replaces
-// run_scheduler.py), one always-on Container App (websocket listener),
+// Container App (dashboard), four Container App Jobs -- one per timeframe
+// group, algo-scanner-5min/15min/1hour/eod (enterprise Phase 2, 2026-09-21;
+// was a single algo-scanner Job driving all 6 timeframes sequentially
+// behind one global run-lock, see run_single_scan.py's GROUPS/--group for
+// why that was split), one always-on Container App (websocket listener),
 // Azure SQL Server + Database, and Key Vault.
 //
 // Deploy with (resource group scope):
@@ -39,8 +42,9 @@ param sqlAdminPassword string
 @description('Container image for all three compute resources. Points at the real built-and-pushed image.')
 param containerImage string = 'algoacrrjw4desia2hqk.azurecr.io/algo-trading:latest'
 
-@description('Cron expression (UTC) for the scheduled scan job. Default covers ~9:15-15:30 IST, Mon-Fri, every 5 min. Adjust as needed.')
-param scanCronExpression string = '*/5 3-10 * * 1-5'
+@description('Application Insights connection string (enterprise Phase 1, 2026-09-20) — shared by all three compute resources for scan-duration/signal-latency/sandbox-result telemetry. Empty string is a safe no-op: core/telemetry.py disables itself cleanly when this env var is unset.')
+@secure()
+param appInsightsConnectionString string = ''
 
 @description('Azure SQL SKU tier')
 param sqlSkuName string = 'Basic'
@@ -230,7 +234,7 @@ resource dashboardApp 'Microsoft.App/containerApps@2023-05-01' = {
           passwordSecretRef: 'acr-password'
         }
       ]
-      secrets: [
+      secrets: concat([
         {
           name: 'acr-password'
           value: acr.listCredentials().passwords[0].value
@@ -243,7 +247,10 @@ resource dashboardApp 'Microsoft.App/containerApps@2023-05-01' = {
           name: 'entra-client-secret'
           value: entraClientSecret
         }
-      ]
+      ], appInsightsConnectionString != '' ? [{
+        name: 'appinsights-connection-string'
+        value: appInsightsConnectionString
+      }] : [])
     }
     template: {
       containers: [
@@ -257,7 +264,7 @@ resource dashboardApp 'Microsoft.App/containerApps@2023-05-01' = {
             '--server.port=8501'
             '--server.address=0.0.0.0'
           ]
-          env: [
+          env: concat([
             {
               name: 'AZURE_DB_HOST'
               value: sqlServer.properties.fullyQualifiedDomainName
@@ -298,7 +305,10 @@ resource dashboardApp 'Microsoft.App/containerApps@2023-05-01' = {
               name: 'ENTRA_ALLOWED_UPNS'
               value: entraAllowedUpns
             }
-          ]
+          ], appInsightsConnectionString != '' ? [{
+            name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
+            secretRef: 'appinsights-connection-string'
+          }] : [])
           resources: {
             cpu: json('0.5')
             memory: '1.0Gi'
@@ -333,7 +343,7 @@ resource wsListenerApp 'Microsoft.App/containerApps@2023-05-01' = {
           passwordSecretRef: 'acr-password'
         }
       ]
-      secrets: [
+      secrets: concat([
         {
           name: 'acr-password'
           value: acr.listCredentials().passwords[0].value
@@ -354,7 +364,10 @@ resource wsListenerApp 'Microsoft.App/containerApps@2023-05-01' = {
           name: 'upstox-sandbox-token'
           value: upstoxSandboxAccessToken
         }
-      ]
+      ], appInsightsConnectionString != '' ? [{
+        name: 'appinsights-connection-string'
+        value: appInsightsConnectionString
+      }] : [])
     }
     template: {
       containers: [
@@ -365,7 +378,7 @@ resource wsListenerApp 'Microsoft.App/containerApps@2023-05-01' = {
             'python'
             'run_ws_listener.py'
           ]
-          env: [
+          env: concat([
             {
               name: 'AZURE_DB_HOST'
               value: sqlServer.properties.fullyQualifiedDomainName
@@ -412,7 +425,10 @@ resource wsListenerApp 'Microsoft.App/containerApps@2023-05-01' = {
               name: 'UPSTOX_SANDBOX_ACCESS_TOKEN'
               secretRef: 'upstox-sandbox-token'
             }
-          ]
+          ], appInsightsConnectionString != '' ? [{
+            name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
+            secretRef: 'appinsights-connection-string'
+          }] : [])
           resources: {
             cpu: json('0.25')
             memory: '0.5Gi'
@@ -428,14 +444,55 @@ resource wsListenerApp 'Microsoft.App/containerApps@2023-05-01' = {
 }
 
 // ----------------------------------------------------------------------------
-// Container App Job: Scheduled Scan (replaces run_scheduler.py entirely)
+// Container App Jobs: Scheduled Scan — one per timeframe group (enterprise
+// Phase 2, 2026-09-21).
+//
+// Was a single Job whose cron fired every 5 min and, inside one process,
+// looped through ALL 6 timeframes sequentially behind one global run-lock —
+// a slow 5-Minute scan (the one most likely to be slow, since it's the most
+// frequent) delayed or starved every other timeframe in the same execution,
+// with no way for e.g. 1-Hour to run independently. Split into 4 Jobs, each
+// with its own cron matching its actual cadence (see run_single_scan.py's
+// GROUPS/_is_scan_due for where these minute values come from — IST
+// minutes converted to the UTC cron field, IST = UTC+5:30) and its own
+// run-lock key (single_scan_<group>, see run_single_scan.py) — a slow
+// 1-Hour cycle can no longer touch 5-Minute's schedule at all.
+//
 // NOTE: parallelism/replicaCompletionCount=1 limits replicas WITHIN one
 // execution - it does NOT stop a new cron trigger from firing while a
-// previous execution is still running. The overlap fix still needs an
-// app-level lock in run_single_scan.py (Phase 4 code change, not infra).
+// previous execution is still running. The overlap fix is the per-group
+// app-level lock in run_single_scan.py, not infra.
 // ----------------------------------------------------------------------------
-resource scanJob 'Microsoft.App/jobs@2023-05-01' = {
-  name: scanJobName
+var scanJobGroups = [
+  {
+    suffix: '5min'
+    group: '5min'
+    cron: '*/5 3-10 * * 1-5'      // every 5 min, unchanged from the original single job
+  }
+  {
+    suffix: '15min'
+    group: '15min'
+    cron: '0,15,30,45 3-10 * * 1-5'  // IST minute in {0,15,30,45} -- see _is_scan_due
+  }
+  {
+    suffix: '1hour'
+    group: '1hour'
+    cron: '35 3-10 * * 1-5'       // IST minute==5 -> UTC minute 35
+  }
+  {
+    suffix: 'eod'
+    group: 'eod'
+    // Fires at all three EOD trigger times (1 Day@UTC10:00, 1 Week@10:05
+    // Fri-only, 1 Month@10:10 last-trading-day-only) every weekday; the
+    // existing _is_scan_due() logic inside this same process gates each
+    // one down to its real day/date condition -- cron alone can't express
+    // "last trading day of the month", so that check stays in Python.
+    cron: '0,5,10 10 * * 1-5'
+  }
+]
+
+resource scanJobs 'Microsoft.App/jobs@2023-05-01' = [for g in scanJobGroups: {
+  name: '${scanJobName}-${g.suffix}'
   location: location
   identity: {
     type: 'SystemAssigned'
@@ -445,16 +502,17 @@ resource scanJob 'Microsoft.App/jobs@2023-05-01' = {
     configuration: {
       triggerType: 'Schedule'
       scheduleTriggerConfig: {
-        cronExpression: scanCronExpression
+        cronExpression: g.cron
         parallelism: 1
         replicaCompletionCount: 1
       }
       // 1800s (30 min), not the original 300s (5 min): the real scan cycle
-      // (507 instruments, RSI+MA and Volume Spike together) legitimately
-      // exceeds 300s once monitor_open() runs on top of the scan itself -
-      // this caused every execution to fail Aug 10-12 until someone fixed
-      // it directly on the live resource. Matching that fix here so a
-      // future redeploy of this file doesn't silently revert it.
+      // (507 instruments) legitimately exceeds 300s once monitor_open()
+      // runs on top of the scan itself (5min group only) - this caused
+      // every execution to fail Aug 10-12 until someone fixed it directly
+      // on the live resource. Matching that fix here so a future redeploy
+      // of this file doesn't silently revert it. Kept uniform across all
+      // 4 groups for simplicity, even though 15min/1hour/eod need far less.
       replicaTimeout: 1800
       replicaRetryLimit: 1
       registries: [
@@ -464,7 +522,7 @@ resource scanJob 'Microsoft.App/jobs@2023-05-01' = {
           passwordSecretRef: 'acr-password'
         }
       ]
-      secrets: [
+      secrets: concat([
         {
           name: 'acr-password'
           value: acr.listCredentials().passwords[0].value
@@ -485,7 +543,10 @@ resource scanJob 'Microsoft.App/jobs@2023-05-01' = {
           name: 'upstox-sandbox-token'
           value: upstoxSandboxAccessToken
         }
-      ]
+      ], appInsightsConnectionString != '' ? [{
+        name: 'appinsights-connection-string'
+        value: appInsightsConnectionString
+      }] : [])
     }
     template: {
       containers: [
@@ -495,8 +556,10 @@ resource scanJob 'Microsoft.App/jobs@2023-05-01' = {
           command: [
             'python'
             'run_single_scan.py'
+            '--group'
+            g.group
           ]
-          env: [
+          env: concat([
             {
               name: 'AZURE_DB_HOST'
               value: sqlServer.properties.fullyQualifiedDomainName
@@ -529,7 +592,10 @@ resource scanJob 'Microsoft.App/jobs@2023-05-01' = {
               name: 'UPSTOX_SANDBOX_ACCESS_TOKEN'
               secretRef: 'upstox-sandbox-token'
             }
-          ]
+          ], appInsightsConnectionString != '' ? [{
+            name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
+            secretRef: 'appinsights-connection-string'
+          }] : [])
           resources: {
             cpu: json('0.5')
             memory: '1.0Gi'
@@ -538,7 +604,7 @@ resource scanJob 'Microsoft.App/jobs@2023-05-01' = {
       ]
     }
   }
-}
+}]
 
 // ----------------------------------------------------------------------------
 // Key Vault access — access policies instead of RBAC role assignments.
@@ -547,6 +613,14 @@ resource scanJob 'Microsoft.App/jobs@2023-05-01' = {
 // entirely - that action requires Owner/User Access Administrator, which
 // this account does not have at this scope.
 // ----------------------------------------------------------------------------
+// Bicep won't allow looping a resource-collection reference (scanJobs)
+// through a variable or a for-expression indirection when the loop body
+// needs a runtime-only property like .identity.principalId (BCP178/
+// BCP182/BCP144, all tried and rejected) -- so this is spelled out
+// explicitly per index instead of genuinely DRY. scanJobGroups has
+// exactly 4 entries (enterprise Phase 2: one identity per timeframe
+// group, was a single scanJob identity) -- keep this in sync with that
+// array's length if it's ever changed.
 resource kvAccessPolicies 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' = {
   parent: kv
   name: 'add'
@@ -574,7 +648,37 @@ resource kvAccessPolicies 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' 
       }
       {
         tenantId: subscription().tenantId
-        objectId: scanJob.identity.principalId
+        objectId: scanJobs[0].identity.principalId  // scanJobGroups[0] = 5min
+        permissions: {
+          secrets: [
+            'get'
+            'list'
+          ]
+        }
+      }
+      {
+        tenantId: subscription().tenantId
+        objectId: scanJobs[1].identity.principalId  // scanJobGroups[1] = 15min
+        permissions: {
+          secrets: [
+            'get'
+            'list'
+          ]
+        }
+      }
+      {
+        tenantId: subscription().tenantId
+        objectId: scanJobs[2].identity.principalId  // scanJobGroups[2] = 1hour
+        permissions: {
+          secrets: [
+            'get'
+            'list'
+          ]
+        }
+      }
+      {
+        tenantId: subscription().tenantId
+        objectId: scanJobs[3].identity.principalId  // scanJobGroups[3] = eod
         permissions: {
           secrets: [
             'get'

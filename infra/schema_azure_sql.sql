@@ -175,6 +175,50 @@ GO
 CREATE INDEX idx_pending_breakouts_status_expires ON pending_breakouts (status, expires_at);
 GO
 
+-- pending_breakouts.anatomy_json (Sep 16, applied via ALTER, not captured
+-- above at the time -- included here now so a fresh deploy doesn't drift
+-- from what's actually running): flagpole/consolidation/breakout candles,
+-- so a later BREAKOUT-WATCH trigger can still render the full detailed
+-- alert. NULL-able -- most rows don't carry it.
+-- ALTER TABLE pending_breakouts ADD anatomy_json NVARCHAR(MAX) NULL;
+
+-- ----------------------------------------------------------------------------
+-- trade_intents (enterprise Phase 1, 2026-09-20) -- order-placement outbox.
+-- Generalizes pending_breakouts' RETRY idea to EVERY trade trigger, not
+-- just breakout-watch. core/marketdata/ws_listener.py's full-universe
+-- pattern scan used to call PaperTrader.on_signal() (which blocks on a
+-- broker network call) SYNCHRONOUSLY, inline, once per symbol -- a slow
+-- order (e.g. a 401 retry) stalled evaluation of every other symbol in
+-- that same 60s cycle. Detection now only INSERTs a row here and moves
+-- on; a separate order-worker pool (ws_listener.py's _order_worker_loop)
+-- drains this table with its own concurrency, fully decoupled from scan
+-- cadence. See core/database/db.py's enqueue_trade_intent/
+-- claim_next_trade_intents/mark_trade_intent_done/failed.
+-- ----------------------------------------------------------------------------
+CREATE TABLE trade_intents (
+    id BIGINT IDENTITY(1,1) NOT NULL,
+    symbol NVARCHAR(50) NOT NULL,
+    side NVARCHAR(10) NOT NULL,
+    price DECIMAL(12,2) NOT NULL,
+    strategy NVARCHAR(50) NOT NULL,
+    timeframe NVARCHAR(20) NOT NULL,
+    strength NVARCHAR(20) NULL,
+    reason NVARCHAR(1000) NULL,
+    anatomy_json NVARCHAR(MAX) NULL,
+    custom_stop DECIMAL(12,2) NULL,
+    custom_target DECIMAL(12,2) NULL,
+    status NVARCHAR(20) NOT NULL DEFAULT N'PENDING',  -- PENDING|EXECUTING|RETRY|DONE|FAILED
+    attempts INT NOT NULL DEFAULT 0,
+    error NVARCHAR(2000) NULL,
+    created_at DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET(),
+    updated_at DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET(),
+    CONSTRAINT trade_intents_pkey PRIMARY KEY (id)
+);
+GO
+
+CREATE INDEX idx_trade_intents_status_created ON trade_intents (status, created_at);
+GO
+
 -- ----------------------------------------------------------------------------
 -- trade_anatomy (Sep 9) -- the flagpole/consolidation/breakout candles a
 -- pattern strategy (currently only "3 Bar Play") actually used to compute a
