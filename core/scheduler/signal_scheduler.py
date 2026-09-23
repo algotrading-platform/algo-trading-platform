@@ -35,8 +35,6 @@ import calendar
 from datetime import datetime, date
 
 import pytz
-from apscheduler.schedulers.blocking import BlockingScheduler
-from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -158,6 +156,21 @@ def is_market_hours() -> bool:
     from datetime import time as dtime
     t = datetime.now(IST).time()
     return dtime(9, 45) <= t <= dtime(15, 15)
+
+
+def is_exchange_hours() -> bool:
+    """
+    The real NSE exchange session, 9:15 AM - 3:30 PM IST -- NOT the
+    narrower algo window above. For infrastructure health checks that
+    must cover the whole session regardless of when the algo is
+    allowed to trade, e.g. ws_listener.py's tick-staleness watchdog
+    (a feed that's dead at 09:15 must be caught at 09:18, not 09:45).
+    """
+    if not is_market_day():
+        return False
+    from datetime import time as dtime
+    t = datetime.now(IST).time()
+    return dtime(9, 15) <= t <= dtime(15, 30)
 
 
 def is_equity_hours() -> bool:
@@ -503,7 +516,7 @@ def run_scan(tf_name: str, mode: str = "all", now: datetime = None) -> None:
         log.warning(f"primary scan failed for {tf_name} (non-fatal): {e}")
 
     try:
-        run_arbitrage_scan(tf_name, now=now)  # Only runs on 15 Minutes — no-op for other timeframes
+        run_arbitrage_scan(tf_name, now=now)  # Only runs on 5 Minutes (Aug 26 cadence flip) — no-op for other timeframes
     except Exception as e:
         log.warning(f"arbitrage scan failed for {tf_name} (non-fatal): {e}")
 
@@ -601,106 +614,14 @@ def run_post_scan_housekeeping() -> None:
 
 # ============================================================
 # SCHEDULER
+#
+# The apscheduler-based build_scheduler()/start() pair (one BlockingScheduler
+# process with 6 per-timeframe CronTriggers) that used to live here was
+# retired 2026-09-21 -- run_scheduler.py (its only caller) was already dead,
+# unreferenced by any deployed infra since the move to Container Apps Jobs
+# (see infra/main.bicep's own comment: "replaces run_scheduler.py entirely").
+# Enterprise Phase 2 reintroduces genuine per-timeframe scheduling, but as
+# separate Container Apps Jobs (each with its own cron trigger -- see
+# infra/main.bicep's scanJob loop and run_single_scan.py's --group), not
+# as CronTriggers inside one long-running process.
 # ============================================================
-
-def build_scheduler() -> BlockingScheduler:
-    scheduler = BlockingScheduler(timezone=IST)
-
-    scheduler.add_job(
-        lambda: run_scan("5 Minutes", "all"),
-        CronTrigger(
-            minute="1,6,11,16,21,26,31,36,41,46,51,56",
-            hour="9,10,11,12,13,14,15",
-            day_of_week="mon-fri", timezone=IST,
-        ),
-        id="scan_5min", name="5 Minute Scan",
-        max_instances=1, coalesce=True,
-    )
-
-    # OFFSET from the 5-min job's minutes (Aug 6: 1,16,31,46 collided with
-    # EVERY 15-min fire, and with the 1-hour job too at :16 — three
-    # full-507-instrument scans launching in the same instant, each
-    # spinning up its own 10-thread pool against the same rate-limited
-    # Upstox API. Cycles that should take ~1-2 min were taking 12-19 min,
-    # cascading into skipped 5-min runs for the rest of the hour. Offsets
-    # below (3/18/33/48 and :09) share no minute with the 5-min set
-    # {1,6,11,16,21,26,31,36,41,46,51,56} or with each other.
-    scheduler.add_job(
-        lambda: run_scan("15 Minutes", "all"),
-        CronTrigger(
-            minute="3,18,33,48",
-            hour="9,10,11,12,13,14,15",
-            day_of_week="mon-fri", timezone=IST,
-        ),
-        id="scan_15min", name="15 Minute Scan",
-        max_instances=1, coalesce=True,
-    )
-
-    scheduler.add_job(
-        lambda: run_scan("1 Hour", "all"),
-        CronTrigger(
-            minute="9", hour="10,11,12,13,14,15",
-            day_of_week="mon-fri", timezone=IST,
-        ),
-        id="scan_1hour", name="1 Hour Scan",
-        max_instances=1, coalesce=True,
-    )
-
-    scheduler.add_job(
-        lambda: run_scan("1 Day", "all"),
-        CronTrigger(
-            hour="15", minute="31",
-            day_of_week="mon-fri", timezone=IST,
-        ),
-        id="scan_1day", name="1 Day Scan",
-        max_instances=1, coalesce=True,
-    )
-
-    scheduler.add_job(
-        lambda: run_scan("1 Week", "all"),
-        CronTrigger(
-            hour="15", minute="32",
-            day_of_week="fri", timezone=IST,
-        ),
-        id="scan_1week", name="1 Week Scan",
-        max_instances=1, coalesce=True,
-    )
-
-    scheduler.add_job(
-        lambda: run_scan("1 Month", "all"),
-        CronTrigger(
-            hour="15", minute="33",
-            day_of_week="mon-fri", timezone=IST,
-        ),
-        id="scan_1month", name="1 Month Scan",
-        max_instances=1, coalesce=True,
-    )
-
-    return scheduler
-
-
-def start() -> None:
-    try:
-        from core.database.db import get_config
-        active_strat = get_config("SIGNAL_STRATEGY") or os.getenv("SIGNAL_STRATEGY", "RSI + MA")
-    except Exception:
-        active_strat = os.getenv("SIGNAL_STRATEGY", "RSI + MA")
-
-    log.info("=" * 60)
-    log.info("Algo Trading Signal Scheduler")
-    log.info(f"Instruments : {len(instruments)} total | {len(fno_instruments)} F&O")
-    log.info(f"Timeframes  : {list(TIMEFRAMES.keys())}")
-    log.info(f"Strategies  : {PARALLEL_STRATEGIES} ({', '.join(THREE_BAR_PLAY_TIMEFRAMES)}) "
-             f"+ Cash-Futures Arbitrage (every 5 Minutes) — all others muted")
-    log.info(f"Arbitrage   : Every 5 mins (F&O stocks only)")
-    log.info(f"Dashboard   : strategy dropdown filters the VIEW only")
-    log.info("Data source : Upstox API (primary) + yfinance (fallback)")
-    log.info("Algo window   : 9:45 AM — 3:15 PM IST (scanning/entries) | "
-             "exchange session 9:15 AM - 3:30 PM IST")
-    log.info("=" * 60)
-    scheduler = build_scheduler()
-    try:
-        log.info("Scheduler started. Press Ctrl+C to stop.")
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
-        log.info("Scheduler stopped.")

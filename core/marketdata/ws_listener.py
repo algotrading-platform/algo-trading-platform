@@ -34,7 +34,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, time as dtime
 
 import pytz
 import requests
@@ -243,6 +243,19 @@ HISTORICAL_BARS_MAX_ROWS = 300  # defensive per-timeframe cap after
 # callback: if the market is open and no tick has arrived for
 # WS_STALE_THRESHOLD_SEC, force a reconnect ourselves.
 WS_STALE_THRESHOLD_SEC = 180
+
+# Confirmed live, Sep 23: the watchdog above was gated on
+# is_market_hours() -- the ALGO window (09:45-15:15), not the exchange
+# session -- so a feed that died overnight (last tick ~23:30 the night
+# before) sat undetected through the whole 09:15-09:45 opening half
+# hour, and every symbol started the day with no candles until the
+# 09:45 forced reconnect. The watchdog now runs over the real exchange
+# session, and one proactive reconnect is made just before the open
+# (after the ~09:00 daily login has saved the day's fresh token), so
+# the socket is normally already live with a valid token at 09:15
+# instead of being discovered dead 3 minutes later.
+PRE_OPEN_RECONNECT_START = dtime(9, 8)
+PRE_OPEN_RECONNECT_END   = dtime(9, 15)
 
 
 def build_subscription_universe() -> list[dict]:
@@ -1272,8 +1285,9 @@ class WSListener:
         threading.Thread(target=self._order_worker_loop, daemon=True, name="ws-listener-order-worker").start()
         self._connect_once(instrument_keys)
 
-        from core.scheduler.signal_scheduler import is_market_hours
+        from core.scheduler.signal_scheduler import is_exchange_hours, is_market_day
 
+        pre_open_reconnect_day = None
         while True:
             time.sleep(SUPERVISOR_TICK_SEC)
             if self._need_restart:
@@ -1282,8 +1296,16 @@ class WSListener:
                 self._connect_once(instrument_keys)
                 continue
 
+            now_ist = datetime.now(IST)
+            if (is_market_day() and pre_open_reconnect_day != now_ist.date()
+                    and PRE_OPEN_RECONNECT_START <= now_ist.time() < PRE_OPEN_RECONNECT_END):
+                pre_open_reconnect_day = now_ist.date()
+                log.info("pre-open reconnect — rebuilding WS connection with today's token")
+                self._connect_once(instrument_keys)
+                continue
+
             stale_for = time.time() - self._last_tick_ts
-            if is_market_hours() and stale_for > WS_STALE_THRESHOLD_SEC:
+            if is_exchange_hours() and stale_for > WS_STALE_THRESHOLD_SEC:
                 log.error(f"no WS ticks for {stale_for:.0f}s during market hours — "
                           f"forcing reconnect (SDK gave no callback)")
                 _send_ops_alert(
