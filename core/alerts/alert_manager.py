@@ -16,6 +16,7 @@
 #     variable) once Telegram delivery is confirmed. No code change.
 # ============================================================
 
+import numbers
 import os
 import pytz
 import requests
@@ -68,16 +69,33 @@ def _format_candle(label: str, c: dict) -> str:
         if ts is not None:
             if getattr(ts, "tzinfo", None) is None:
                 ts = pytz.utc.localize(ts)
-            time_str = ts.astimezone(IST).strftime("%H:%M IST")
+            ts_ist = ts.astimezone(IST)
+            # Confirmed live, Sep 21 (MARICO.NS): a pattern spanning a
+            # session boundary (its breakout candle from a prior day,
+            # carried into today's evaluation -- see _is_stale_breakout
+            # in ws_listener.py) rendered as e.g. "Breakout 15:15 IST"
+            # with no date, looking impossible next to a message
+            # timestamped hours earlier the same morning. Only add the
+            # date when it isn't today, so the normal same-day case
+            # stays exactly as terse as before.
+            if ts_ist.date() != datetime.now(IST).date():
+                time_str = ts_ist.strftime("%d-%b %H:%M IST")
+            else:
+                time_str = ts_ist.strftime("%H:%M IST")
         else:
             time_str = "—"
     except Exception:
         time_str = str(c.get("ts", "—"))
+    # numbers.Integral (not `int`) -- anatomy candle dicts are built
+    # from pandas-derived OHLCV rows, where volume typically survives as
+    # numpy.int64, and `isinstance(numpy.int64(x), int)` is False, which
+    # silently skipped the comma formatting below for every real candle.
+    volume = c.get("volume")
     return (f"{label} {time_str}  O {c.get('open')} H {c.get('high')} "
-            f"L {c.get('low')} C {c.get('close')}  Vol {c.get('volume'):,}"
-            if isinstance(c.get("volume"), int) else
+            f"L {c.get('low')} C {c.get('close')}  Vol {volume:,}"
+            if isinstance(volume, numbers.Integral) else
             f"{label} {time_str}  O {c.get('open')} H {c.get('high')} "
-            f"L {c.get('low')} C {c.get('close')}  Vol {c.get('volume')}")
+            f"L {c.get('low')} C {c.get('close')}  Vol {volume}")
 
 
 def _format_anatomy_block(anatomy: dict) -> str:

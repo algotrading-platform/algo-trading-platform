@@ -19,11 +19,13 @@
 # ============================================================
 
 import pandas as pd
+import pytz
 from core.strategies.base_strategy import BaseStrategy, SignalResult
 from core.indicators.indicators import (
     add_rsi, add_pivot_points, add_bollinger_bands,
     add_ema, add_macd, add_volume_analysis, add_atr,
     get_nearest_level, get_ema_trend, is_volume_confirmed,
+    volume_baseline_avg,
 )
 
 
@@ -772,11 +774,9 @@ class VolumeSpikeStrategy(BaseStrategy):
             # the deeper into it you are — the opposite of what a
             # "buying spree" detector should do. Caught by testing a
             # real 3-candle spike pattern, not assumed.
-            baseline_window = df.iloc[-(self.LOOKBACK_CANDLES + self.CONFIRM_CANDLES):-self.CONFIRM_CANDLES]
-            if len(baseline_window) < self.LOOKBACK_CANDLES:
+            avg_volume = volume_baseline_avg(df, len(df) - self.CONFIRM_CANDLES, self.LOOKBACK_CANDLES)
+            if avg_volume is None:
                 return SignalResult("HOLD", "WEAK", "Insufficient baseline window", strategy=self.name)
-
-            avg_volume = float(baseline_window["Volume"].mean())
             if avg_volume <= 0:
                 return SignalResult("HOLD", "WEAK", "Zero average volume", strategy=self.name)
 
@@ -946,11 +946,10 @@ class ThreeBarPlayStrategy(BaseStrategy):
             # Volume filter (Jwala's spec, not his reference code) —
             # bar1's volume vs the 20-period average from the candles
             # strictly BEFORE bar1 (excludes bar1 itself).
-            baseline_window = df["Volume"].iloc[-(self.VOLUME_LOOKBACK + 3):-3]
-            if len(baseline_window) < self.VOLUME_LOOKBACK:
+            avg_volume = volume_baseline_avg(df, len(df) - 3, self.VOLUME_LOOKBACK)
+            if avg_volume is None:
                 return SignalResult("HOLD", "WEAK", "Insufficient volume baseline", strategy=self.name)
 
-            avg_volume   = float(baseline_window.mean())
             bar1_volume  = float(bar1["Volume"])
             volume_ratio = bar1_volume / avg_volume if avg_volume > 0 else 0.0
 
@@ -1167,8 +1166,22 @@ class ThreeBarFlagStrategy(BaseStrategy):
         objects already used for stop/target math above -- no re-derivation.
         """
         def _candle(row, volume=None) -> dict:
+            # Confirmed live, Sep 21 (BLS.NS/CCL.NS Telegram alerts showing
+            # anatomy times ~5.5h in the future): row["Datetime"] comes out
+            # of resample_ohlc() (upstox_provider.py), which deliberately
+            # returns NAIVE IST wall-clock timestamps for .between_time()'s
+            # sake. alert_manager.py's _format_candle() treats any naive
+            # timestamp as UTC (correct for raw DB timestamps elsewhere in
+            # this codebase, but NOT for this resampled data) and localizes
+            # it as such before converting to IST for display -- silently
+            # adding a bogus +5:30 on top of an already-correct IST value.
+            # Tag it correctly here, at the one place this ambiguity
+            # actually originates, instead of guessing in the display layer.
+            ts = row["Datetime"]
+            if getattr(ts, "tzinfo", None) is None:
+                ts = pytz.timezone("Asia/Kolkata").localize(ts)
             return {
-                "ts": row["Datetime"], "open": float(row["Open"]), "high": float(row["High"]),
+                "ts": ts, "open": float(row["Open"]), "high": float(row["High"]),
                 "low": float(row["Low"]), "close": float(row["Close"]),
                 "volume": int(volume if volume is not None else row.get("Volume", 0)),
             }
@@ -1265,10 +1278,9 @@ class ThreeBarFlagStrategy(BaseStrategy):
                     if bar1_body < self.BODY_RATIO_MIN * bar1_range:
                         continue
 
-                    baseline_window = df["Volume"].iloc[bar1_idx - self.VOLUME_LOOKBACK: bar1_idx]
-                    if len(baseline_window) < self.VOLUME_LOOKBACK:
+                    avg_volume = volume_baseline_avg(df, bar1_idx, self.VOLUME_LOOKBACK)
+                    if avg_volume is None:
                         continue
-                    avg_volume  = float(baseline_window.mean())
                     bar1_volume = float(bar1["Volume"])
                     volume_ratio = bar1_volume / avg_volume if avg_volume > 0 else 0.0
                     if volume_ratio <= 1.0:

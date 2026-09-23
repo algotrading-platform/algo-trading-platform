@@ -9,6 +9,8 @@
 #   - Volume lookback: 14 candles exactly
 # ============================================================
 
+from typing import Optional
+
 import pandas as pd
 import numpy as np
 from ta.momentum import RSIIndicator as TA_RSI
@@ -209,6 +211,28 @@ def add_volume_analysis(
     df["VOL_RATIO"] = df["Volume"] / df["VOL_MA"].replace(0, np.nan)
     df["VOL_SURGE"] = df["VOL_RATIO"] > 1.5
     return df
+
+
+def volume_baseline_avg(df: pd.DataFrame, end_idx: int, window: int) -> Optional[float]:
+    """
+    Average Volume of the `window` candles immediately BEFORE end_idx
+    (exclusive) -- e.g. the baseline before a breakout/flagpole/
+    confirmation-window candle. Returns None if there isn't a full
+    window of history available.
+
+    Shared by VolumeSpikeStrategy / ThreeBarPlayStrategy /
+    ThreeBarFlagStrategy (core/strategies/strategies.py), which each
+    used to hand-roll this exact "candles before this one, excluding
+    it" slice independently -- the kind of duplication that already
+    caused one baseline-window drift bug (see add_volume_analysis()'s
+    2026-08-25 fix note above) and could recur silently in any one of
+    the three copies.
+    """
+    start = max(end_idx - window, 0)
+    window_slice = df["Volume"].iloc[start:end_idx]
+    if len(window_slice) < window:
+        return None
+    return float(window_slice.mean())
 
 
 def is_volume_confirmed(df: pd.DataFrame) -> bool:
