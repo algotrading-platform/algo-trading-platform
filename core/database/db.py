@@ -926,11 +926,11 @@ def close_paper_position(
     P&L. Also computes charges and net_pnl = pnl - charges.
     """
     try:
-        from core.execution.charges import estimate_charges_for_trade
+        from core.execution.charges import estimate_charges_for_trade, estimate_arbitrage_charges
 
         with _get_cursor() as cur:
             cur.execute("""
-                SELECT TOP 1 side, quantity, entry_price
+                SELECT TOP 1 side, quantity, entry_price, strategy
                 FROM paper_positions
                 WHERE id = ? AND status = 'OPEN'
             """, (position_id,))
@@ -938,17 +938,21 @@ def close_paper_position(
             if not row:
                 return False
 
-            qty   = int(row["quantity"])
-            entry = float(row["entry_price"])
-            side  = row["side"]
-            exitp = round(float(exit_price), 2)
+            qty      = int(row["quantity"])
+            entry    = float(row["entry_price"])
+            side     = row["side"]
+            strategy = row["strategy"]
+            exitp    = round(float(exit_price), 2)
 
             if side == "BUY":
                 pnl = (exitp - entry) * qty
             else:  # SELL (short)
                 pnl = (entry - exitp) * qty
 
-            charges = estimate_charges_for_trade(side, entry, exitp, qty)
+            if strategy == "Cash-Futures Arbitrage":
+                charges = estimate_arbitrage_charges(entry, qty)
+            else:
+                charges = estimate_charges_for_trade(side, entry, exitp, qty)
             net_pnl = round(pnl - charges, 2)
 
             cur.execute("""
@@ -1069,7 +1073,20 @@ def get_open_paper_positions(symbol: str = None) -> pd.DataFrame:
             rows = cur.fetchall()
         if not rows:
             return pd.DataFrame()
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+        # Same Decimal-dtype coercion as get_paper_trades_for_report() --
+        # pyodbc returns SQL Server DECIMAL columns as object-dtype
+        # decimal.Decimal, never auto-cast. Every current caller wraps
+        # these in float()/int() before use, so this wasn't crashing
+        # today, but any future raw pandas op (sum/groupby/chart) on
+        # this DataFrame would hit the same class of bug already fixed
+        # for the reporting queries.
+        for col in ("entry_price", "exit_price", "stop_loss", "target",
+                    "quantity", "pnl", "net_pnl", "charges", "risk_amount",
+                    "peak_price", "initial_stop_distance"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
     except Exception as e:
         log.error(f"get_open_paper_positions error: {e}")
         return pd.DataFrame()
@@ -2076,12 +2093,23 @@ def insert_trade_anatomy(position_id: int, anatomy: dict) -> bool:
 
         with _get_cursor() as cur:
             for role, seq, c in rows:
+                # Same normalize-to-UTC-before-bind fix as
+                # upsert_live_candles() (2026-08-17) -- pyodbc has no
+                # native support for SQL Server's DATETIMEOFFSET type
+                # and silently drops a tz-aware datetime's offset,
+                # storing the wall-clock digits as if they were already
+                # UTC. Confirmed live, Sep 21: this exact table (via
+                # get_trade_anatomy) read back candle_ts values tagged
+                # UTC but holding correct IST wall-clock digits.
+                ts = c["ts"]
+                if getattr(ts, "tzinfo", None) is not None:
+                    ts = ts.astimezone(timezone.utc)
                 cur.execute("""
                     INSERT INTO trade_anatomy
                         (position_id, role, seq, candle_ts, [open], high, low, [close], volume)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    position_id, role, seq, c["ts"],
+                    position_id, role, seq, ts,
                     round(float(c["open"]), 2), round(float(c["high"]), 2),
                     round(float(c["low"]), 2), round(float(c["close"]), 2),
                     int(c.get("volume", 0)),
@@ -2106,6 +2134,36 @@ def get_trade_anatomy(position_id: int) -> list[dict]:
     except Exception as e:
         print(f"[DB] get_trade_anatomy error for position {position_id}: {e}")
         return []
+
+
+def get_trade_anatomy_bulk(position_ids: list[int]) -> dict[int, list[dict]]:
+    """
+    Same rows as get_trade_anatomy(), for many positions in one round
+    trip -- used by build_trade_anatomy_table() to avoid one DB call
+    per "3 Bar Play" trade in a report (N+1 query pattern; a report
+    period with hundreds of trades was issuing hundreds of sequential
+    calls, each grabbing its own pooled connection).
+    """
+    if not position_ids:
+        return {}
+    try:
+        placeholders = ",".join("?" * len(position_ids))
+        with _get_cursor() as cur:
+            cur.execute(f"""
+                SELECT position_id, role, seq, candle_ts, [open], high, low, [close], volume
+                FROM trade_anatomy
+                WHERE position_id IN ({placeholders})
+                ORDER BY position_id,
+                         CASE role WHEN 'FLAGPOLE' THEN 0 WHEN 'CONSOLIDATION' THEN 1 ELSE 2 END, seq
+            """, tuple(position_ids))
+            by_position: dict[int, list[dict]] = {}
+            for r in cur.fetchall():
+                row = dict(r)
+                by_position.setdefault(row.pop("position_id"), []).append(row)
+            return by_position
+    except Exception as e:
+        print(f"[DB] get_trade_anatomy_bulk error: {e}")
+        return {}
 
 
 # ============================================================

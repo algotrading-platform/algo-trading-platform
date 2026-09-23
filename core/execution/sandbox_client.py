@@ -22,6 +22,8 @@ import hashlib
 import logging
 from dotenv import load_dotenv
 
+from core.telemetry import record_sandbox_result
+
 load_dotenv()
 log = logging.getLogger("sandbox_client")
 
@@ -194,6 +196,7 @@ class SandboxClient:
                       f"token used throughout: {_fingerprint(self._token)}. If this fingerprint matches "
                       f"what was last deployed to the Container App secret, the deployed token itself is "
                       f"invalid/stale (not a transient blip) and needs to be re-pushed + the app restarted.")
+        record_sandbox_result(bool(result["ok"]))
         return result
 
     def _place_order_once(self, order, instrument_key: str) -> dict:

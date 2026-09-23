@@ -10,6 +10,7 @@
 # DataFrame already in memory.
 # ============================================================
 
+import numpy as np
 import pandas as pd
 import pytz
 
@@ -18,7 +19,7 @@ from core.database.db import (
     get_paper_summary_by_strategy,
     get_signals_for_report,
     get_signal_summary_by_strategy,
-    get_trade_anatomy,
+    get_trade_anatomy_bulk,
 )
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -110,9 +111,14 @@ def build_strategy_performance_table(trades: pd.DataFrame, by_strategy: pd.DataF
     hold = t.groupby("strategy")["hold_minutes"].mean().round(1).rename("avg_hold_minutes")
 
     perf = by_strategy.copy()
+    # np.nan (not pd.NA) keeps these float64 -- `.replace(0, pd.NA)` on an
+    # int64 column upcasts it to object dtype, and object-dtype NaN-like
+    # values (pd.NA) don't support `.round()` (TypeError: NAType doesn't
+    # define __round__), which crashed this table for any strategy with
+    # zero losses or zero wins in the period.
     perf["win_rate"] = (perf["wins"] / perf["trades"] * 100).round(1)
-    perf["avg_win"]  = (perf["gross_win"]  / perf["wins"].replace(0, pd.NA)).round(2)
-    perf["avg_loss"] = (perf["gross_loss"] / perf["losses"].replace(0, pd.NA)).round(2)
+    perf["avg_win"]  = (perf["gross_win"]  / perf["wins"].replace(0, np.nan)).round(2)
+    perf["avg_loss"] = (perf["gross_loss"] / perf["losses"].replace(0, np.nan)).round(2)
 
     def _profit_factor(row):
         if row["gross_loss"] != 0:
@@ -146,9 +152,11 @@ def build_trade_anatomy_table(trades: pd.DataFrame) -> pd.DataFrame:
     if three_bar.empty:
         return pd.DataFrame()
 
+    anatomy_by_position = get_trade_anatomy_bulk([int(i) for i in three_bar["id"]])
+
     rows = []
     for _, trade in three_bar.iterrows():
-        anatomy_rows = get_trade_anatomy(int(trade["id"]))
+        anatomy_rows = anatomy_by_position.get(int(trade["id"]), [])
         for a in anatomy_rows:
             rows.append({
                 "Symbol": trade["symbol"], "Position ID": int(trade["id"]),
@@ -208,15 +216,30 @@ def compute_signal_conversion(signals_df: pd.DataFrame, trades_df: pd.DataFrame,
         conv["traded"] = False
     else:
         tr = trades_df[["symbol", "strategy", "timeframe", "opened_at"]].copy()
-        tr["sig_time"] = pd.to_datetime(tr["opened_at"], utc=True)
+        tr["trade_time"] = pd.to_datetime(tr["opened_at"], utc=True)
+        tr["sig_time"] = tr["trade_time"]
         tr["traded"] = True
-        tr = tr[["sig_time", "symbol", "strategy", "timeframe", "traded"]].sort_values("sig_time")
+        tr = tr[["sig_time", "trade_time", "symbol", "strategy", "timeframe", "traded"]].sort_values("sig_time")
 
         conv = pd.merge_asof(
             sig, tr, on="sig_time", by=["symbol", "strategy", "timeframe"],
             direction="forward", tolerance=pd.Timedelta(minutes=tolerance_minutes),
         )
         conv["traded"] = conv["traded"].where(conv["traded"].notna(), False).astype(bool)
+
+        # merge_asof matches each SIGNAL row independently, so the same
+        # trade can be matched to more than one signal (e.g. a scalped
+        # trade whose BUY and a quick reversal SELL both land within
+        # `tolerance_minutes` of the same trade's opened_at), double-
+        # counting trades_taken. Keep only the closest signal per
+        # distinct matched trade and un-mark the rest.
+        matched = conv[conv["traded"]].copy()
+        if not matched.empty:
+            matched["_gap"] = (matched["sig_time"] - matched["trade_time"]).abs()
+            keep_idx = matched.groupby(["symbol", "strategy", "timeframe", "trade_time"])["_gap"].idxmin()
+            drop_idx = matched.index.difference(keep_idx)
+            conv.loc[drop_idx, "traded"] = False
+        conv = conv.drop(columns=["trade_time"])
 
     summary = conv.groupby(["strategy", "timeframe"]).agg(
         signals_generated=("traded", "count"),

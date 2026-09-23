@@ -16,10 +16,13 @@
 # executes. Kept broker-agnostic so sandbox→live is a client swap only.
 # ============================================================
 
+import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
 from configs.universe import get_lot_size
+
+log = logging.getLogger("order_manager")
 
 
 @dataclass
@@ -113,8 +116,14 @@ class OrderManager:
             try:
                 if self._is_open(symbol):
                     return reject(f"position already open for {symbol}")
-            except Exception:
-                pass  # if the check fails, don't block — tracker will dedupe
+            except Exception as e:
+                # Don't block on a failed check — the atomic applock check
+                # inside db.open_paper_position_if_capacity still catches a
+                # genuine duplicate. But unlike every other exception path
+                # in this file, this one used to be silent: a transient DB
+                # blip here was invisible, not just non-blocking.
+                log.warning(f"is_open_position_fn check failed for {symbol}, "
+                            f"proceeding without it: {e}")
 
         # 4. Lot-size validation
         qty, lot_note = self._round_to_lot(decision.quantity, symbol, instrument)

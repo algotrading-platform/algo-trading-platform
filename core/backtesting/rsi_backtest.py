@@ -1,7 +1,7 @@
 # ============================================================
 # core/backtesting/rsi_backtest.py
 #
-# RSI levels match reversal_rsi_signal.py: 25/75
+# RSI levels match reversal_rsi_signal.py: 35/75
 # ============================================================
 
 RSI_OVERSOLD   = 35   # matches reversal_rsi_signal.py

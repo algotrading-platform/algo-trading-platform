@@ -119,7 +119,15 @@ class UpstoxWSProvider(UpstoxProvider):
         try:
             last_ts = pd.to_datetime(live_today["Datetime"].iloc[-1])
             if last_ts.tzinfo is None:
-                last_ts = IST.localize(last_ts)
+                # The column is written in UTC (SYSDATETIMEOFFSET() /
+                # DATETIMEOFFSET) -- a naive read-back means the pyodbc
+                # output converter for DATETIMEOFFSET didn't run, and the
+                # value is still UTC, NOT IST. Same convention db.py's
+                # get_upstox_token() already established for this exact
+                # failure mode; localizing it as IST here shifted a
+                # genuinely fresh row's age by ~5.5h, making it look
+                # stale and silently disabling this fast path.
+                last_ts = pytz.utc.localize(last_ts)
             age_minutes = (datetime.now(IST) - last_ts).total_seconds() / 60
             return age_minutes <= MAX_LIVE_AGE_MINUTES
         except Exception:

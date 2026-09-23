@@ -37,6 +37,7 @@ from core.logger.signal_logger import SignalLogger
 from core.alerts.alert_manager import AlertManager
 from core.backtesting.rsi_backtest import RSIBacktest
 from core.backtesting.backtest_store import write_result
+from core.telemetry import record_scan_duration
 
 log = logging.getLogger("strategy_engine")
 IST = pytz.timezone("Asia/Kolkata")
@@ -1028,6 +1029,7 @@ class StrategyEngine:
             f"{len(results)}/{len(instruments)} processed  "
             f"{signals} signals  {elapsed}s"
         )
+        record_scan_duration(self.strategy_name, tf_name, elapsed, len(results), len(instruments))
 
         return results
 
@@ -1155,6 +1157,7 @@ class StrategyEngine:
             f"MULTI SCAN DONE   {list(strategies.keys())}  {tf_name}  "
             f"{len(instruments)} instruments  {signals} signals  {elapsed}s"
         )
+        record_scan_duration("+".join(strategies.keys()), tf_name, elapsed, len(results), len(instruments))
 
         # ── Paper trading ─────────────────────────────────────────
         # Feed newly-alerted BUY/SELL signals to the paper trader (equity

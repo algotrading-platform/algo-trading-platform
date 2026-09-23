@@ -79,3 +79,34 @@ def estimate_charges_for_trade(side: str, entry_price: float, exit_price: float,
         buy_value, sell_value = exit_value, entry_value
 
     return estimate_charges(buy_value, sell_value)
+
+
+# ============================================================
+# CASH-FUTURES ARBITRAGE — separate charge model
+#
+# The arbitrage trade is NOT a round-trip intraday equity trade like
+# the model above: it combines a spot BUY (delivery, held to expiry)
+# with a futures SELL, and the persisted paper_positions row only
+# records the spot leg's entry/target (see strategy_engine.py's
+# _open_arbitrage_position and paper_trader.py's arbitrage-expiry
+# branch in monitor_open()) -- there's no futures price stored on the
+# row to build a real two-leg equity-delivery + futures brokerage
+# breakdown from. Running this trade through estimate_charges_for_trade
+# (sell-only intraday STT, no futures leg at all) silently mis-states
+# its true cost either way.
+#
+# Instead this reuses the SAME turnover-based 0.3% round-trip estimate
+# the strategy itself already shows as Net_Profit_Est at signal time
+# (arbitrage_strategy.py's COST_PCT), so the entry-time estimate and
+# the closed-trade's persisted net_pnl agree with each other.
+# ============================================================
+
+ARBITRAGE_COST_PCT = 0.003  # 0.3% of spot turnover, round-trip
+
+
+def estimate_arbitrage_charges(entry_price: float, quantity: int) -> float:
+    """Charges for one Cash-Futures Arbitrage position, keyed off its
+    spot entry price/quantity — see module note above for why this
+    doesn't go through estimate_charges_for_trade()."""
+    turnover = entry_price * quantity
+    return round(turnover * ARBITRAGE_COST_PCT, 2)

@@ -66,20 +66,39 @@ def _rate_limit():
 # EXPIRY WEEK DETECTION
 # ============================================================
 
-def is_expiry_week() -> bool:
-    today    = datetime.now(IST).date()
-    last_day = calendar.monthrange(today.year, today.month)[1]
-    return (last_day - today.day) <= EXPIRY_WEEK_DAYS
-
-
-def get_basis_threshold() -> float:
-    return EXPIRY_BASIS_PCT if is_expiry_week() else NORMAL_BASIS_PCT
-
-
-def days_to_expiry() -> int:
+def _calendar_days_to_month_end() -> int:
+    """Fallback only — the real contract expiry (NSE monthly F&O: the
+    LAST THURSDAY of the month, not the last calendar day) should
+    always be preferred when known. See days_to_expiry()."""
     today    = datetime.now(IST).date()
     last_day = calendar.monthrange(today.year, today.month)[1]
     return last_day - today.day
+
+
+def days_to_expiry(expiry_date: Optional[date] = None) -> int:
+    """
+    Days from today (IST) to the contract's real expiry date, when
+    known. `expiry_date` should be the actual NSE_FO expiry (Upstox's
+    own instrument data — see get_nearest_futures_contract's
+    `expiry_ms`), which is the last THURSDAY of the month, not the
+    last calendar day. Approximating with the calendar month-end (the
+    old behavior, kept as a fallback for when no contract is available
+    yet) can overstate days remaining by up to 3 days whenever the
+    calendar month-end falls on a Fri/Sat/Sun, which understates the
+    annualised-return estimate shown in the trader-facing BUY reason
+    by roughly the same factor.
+    """
+    if expiry_date is not None:
+        return max((expiry_date - datetime.now(IST).date()).days, 0)
+    return _calendar_days_to_month_end()
+
+
+def is_expiry_week(expiry_date: Optional[date] = None) -> bool:
+    return days_to_expiry(expiry_date) <= EXPIRY_WEEK_DAYS
+
+
+def get_basis_threshold(expiry_date: Optional[date] = None) -> float:
+    return EXPIRY_BASIS_PCT if is_expiry_week(expiry_date) else NORMAL_BASIS_PCT
 
 
 # ============================================================
@@ -341,12 +360,20 @@ class ArbitrageStrategy(BaseStrategy):
         spread_abs = futures_price - spot_price
         spread_pct = round((spread_abs / spot_price) * 100, 2)
 
-        threshold     = get_basis_threshold()
-        in_exp_week   = is_expiry_week()
-        days_to_exp   = days_to_expiry()
         expiry        = contract.get("expiry", "")
+        expiry_date   = None
+        if expiry:
+            try:
+                expiry_date = date.fromisoformat(expiry)
+            except ValueError:
+                log.warning(f"Unparseable expiry '{expiry}' for {symbol}, "
+                            f"falling back to calendar month-end estimate")
+
+        threshold     = get_basis_threshold(expiry_date)
+        in_exp_week   = is_expiry_week(expiry_date)
+        days_to_exp   = days_to_expiry(expiry_date)
         tradingsymbol = contract.get("tradingsymbol", "")
-        lot_size      = contract.get("lot_size", get_lot_size(symbol))
+        lot_size      = contract.get("lot_size") or get_lot_size(symbol)
 
         gross_profit   = round(spread_abs * lot_size, 2)
 

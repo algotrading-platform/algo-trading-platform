@@ -19,8 +19,29 @@
 # ============================================================
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
+
+import pytz
+
+IST = pytz.timezone("Asia/Kolkata")
+
+
+def _ist_today() -> date:
+    """
+    IST calendar date — the SAME clock basis _sync_today_pnl_from_db()
+    uses (its DB query is bounded by IST midnight, not UTC midnight).
+    RMS._roll_day_if_needed() used to compare against date.today()
+    (server/UTC-based), a different clock than the DB sync for the same
+    "today" concept. Masked in practice because evaluate() always
+    re-syncs from the DB right after, and NSE trading hours (03:45-
+    10:00 UTC) never straddle a UTC-date rollover -- but
+    record_realized_pnl() is also called directly from monitor_open()/
+    close_manual()/close_by_symbol() with no re-sync, so a close
+    processed just after IST midnight but before UTC midnight (e.g. a
+    delayed EOD sweep) could add to a stale, wrong-day base.
+    """
+    return datetime.now(IST).date()
 
 
 # ============================================================
@@ -140,7 +161,7 @@ class RMS:
 
     def __init__(self, config: RMSConfig = RMSConfig):
         self.cfg = config
-        self._day = date.today()
+        self._day = _ist_today()
         self._realized_pnl_today = 0.0
         self._trading_halted = False
         self._sync_today_pnl_from_db()
@@ -190,8 +211,9 @@ class RMS:
             self._trading_halted = True
 
     def _roll_day_if_needed(self) -> None:
-        if date.today() != self._day:
-            self._day = date.today()
+        today = _ist_today()
+        if today != self._day:
+            self._day = today
             self._realized_pnl_today = 0.0
             self._trading_halted = False
 

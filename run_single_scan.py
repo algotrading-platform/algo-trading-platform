@@ -2,12 +2,25 @@
 # ============================================================
 # run_single_scan.py
 #
-# Entry point for the scheduled Container Apps Job.
-# Runs one scan cycle - all instruments 9:15-3:30 IST only.
+# Entry point for the scheduled Container Apps Job(s).
+#
+# Enterprise Phase 2 (2026-09-21): split from one job driving all 6
+# timeframes sequentially (each cron tick paying for the 5-Minute
+# scan's full cost before 15-Minute/1-Hour/EOD even got a chance to
+# run, behind a single GLOBAL run-lock) into 4 independent jobs --
+# algo-scanner-5min, algo-scanner-15min, algo-scanner-1hour,
+# algo-scanner-eod -- each with its own cron trigger matching its
+# real cadence and its own run-lock, so a slow 5-Minute cycle can
+# never again delay or skip another timeframe. See infra/main.bicep's
+# scanJob loop for the per-group cron expressions.
+#
+# --group selects which TIMEFRAMES this execution covers; "all" (the
+# original behavior) is kept only for local/manual runs, not used by
+# any deployed Job.
 #
 # Usage:
-#   python run_single_scan.py        # auto-detect
-#   python run_single_scan.py --mode all
+#   python run_single_scan.py --group 5min
+#   python run_single_scan.py --group all     # local dev / manual only
 # ============================================================
 import sys
 import os
@@ -25,6 +38,7 @@ from core.scheduler.signal_scheduler import (
     TIMEFRAMES,
 )
 from core.database import db
+from core.telemetry import init_telemetry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,16 +48,32 @@ logging.basicConfig(
 log = logging.getLogger("single_scan")
 IST = pytz.timezone("Asia/Kolkata")
 
+# Which TIMEFRAMES keys each --group covers. "5min" also owns the
+# once-per-execution housekeeping step (position monitoring, EOD
+# square-off check) -- it's the tightest cadence, so open positions
+# are never checked less often than they were under the single-job
+# design, regardless of which other groups exist.
+GROUPS = {
+    "5min":  ["5 Minutes"],
+    "15min": ["15 Minutes"],
+    "1hour": ["1 Hour"],
+    "eod":   ["1 Day", "1 Week", "1 Month"],
+    "all":   list(TIMEFRAMES.keys()),  # local/manual only -- no deployed Job uses this
+}
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--mode",
-        choices=["all"],
+        "--group",
+        choices=list(GROUPS.keys()),
         default="all",
-        help="Scan mode. Always 'all' - all instruments together."
+        help="Which timeframe group this execution covers (see GROUPS above).",
     )
     args = parser.parse_args()
+    group_timeframes = GROUPS[args.group]
+
+    init_telemetry("scanner")
 
     if not is_market_day():
         log.info("Market closed today (weekend or holiday). Skipping scan.")
@@ -64,36 +94,42 @@ def main():
     # still-running previous one. Fails closed -- if the lock can't be
     # acquired (already running, or the check itself errored), skip
     # this cycle; the next scheduled trigger retries in a few minutes.
-    if not db.try_acquire_scan_lock("single_scan", stale_after_seconds=900):
-        log.warning("Previous scan still running (or lock check failed) - skipping this cycle.")
+    # Keyed by group (not one global "single_scan" name any more) --
+    # each group's Job runs fully independently now, so a slow 1-Hour
+    # cycle holding its own lock must never block 5-Minute's.
+    lock_name = f"single_scan_{args.group}"
+    if not db.try_acquire_scan_lock(lock_name, stale_after_seconds=900):
+        log.warning(f"Previous '{args.group}' scan still running (or lock check failed) - skipping this cycle.")
         sys.exit(0)
 
     try:
-        # Snapshotted ONCE and passed to every timeframe below. Each
-        # timeframe's due-check (_is_scan_due) looks for an exact IST
-        # minute (e.g. "1 Hour" only at minute==6) — re-reading the
-        # clock per timeframe meant that by the time the loop reached
-        # "15 Minutes"/"1 Hour", the 5-Minute scan ahead of it (which
-        # alone regularly takes several minutes) had already pushed
-        # the clock past their window, so they were silently skipped
-        # almost every cycle. One shared snapshot makes every
+        # Snapshotted ONCE and passed to every timeframe in this group.
+        # Each timeframe's due-check (_is_scan_due) looks for an exact
+        # IST minute -- re-reading the clock per timeframe meant that by
+        # the time the loop reached a later timeframe, an earlier one's
+        # scan (which can itself take a while) had already pushed the
+        # clock past its window. One shared snapshot makes every
         # timeframe's due-check reflect the minute this Job actually
-        # fired at, not the minute it happened to be reached.
+        # fired at, not the minute it happened to be reached. Now mostly
+        # moot for cross-timeframe drift (each group is its own Job),
+        # but "eod" still covers 3 timeframes in one execution.
         run_started_at = datetime.now(IST)
         now_str = run_started_at.strftime("%H:%M IST")
-        log.info(f"Single scan - mode=all - time={now_str}")
+        log.info(f"Single scan - group={args.group} - time={now_str}")
 
-        for tf in TIMEFRAMES.keys():
+        for tf in group_timeframes:
             run_scan(tf, "all", now=run_started_at)
 
-        # Once per execution, not once per timeframe — see
-        # run_post_scan_housekeeping()'s docstring for why this used to
-        # live inside the loop above and what that repetition caused.
-        run_post_scan_housekeeping()
+        # Only the 5min group's execution runs housekeeping -- see
+        # GROUPS' comment above and run_post_scan_housekeeping()'s own
+        # docstring for why this must run exactly once per cycle, not
+        # once per timeframe.
+        if "5 Minutes" in group_timeframes:
+            run_post_scan_housekeeping()
 
         log.info("Single scan complete.")
     finally:
-        db.release_scan_lock("single_scan")
+        db.release_scan_lock(lock_name)
 
 
 if __name__ == "__main__":

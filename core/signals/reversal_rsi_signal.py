@@ -4,7 +4,7 @@
 # Reversal confirmation logic (Jwala-approved):
 #
 #   BUY  : RSI was below 35 (trigger), then bounced up for
-#          2 consecutive candles AND crossed back above 25.
+#          2 consecutive candles AND crossed back above 35.
 #          Deeper oversold threshold = fewer, higher quality signals.
 #
 #   SELL : RSI was above 65 (trigger), then turned down for
@@ -48,7 +48,7 @@ class ReversalRSISignal:
         prev2    = rsi_series.iloc[-3]
 
         # --------------------------------------------------
-        # BUY: RSI dipped below 25, now recovering
+        # BUY: RSI dipped below RSI_OVERSOLD (35), now recovering
         #   prev2 < 35  → was in oversold zone
         #   prev  > prev2  → first bounce candle
         #   current > prev → second bounce candle (confirmation)

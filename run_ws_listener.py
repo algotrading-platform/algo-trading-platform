@@ -20,6 +20,7 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from core.marketdata.ws_listener import WSListener
+from core.telemetry import init_telemetry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,6 +31,7 @@ log = logging.getLogger("run_ws_listener")
 
 
 def main():
+    init_telemetry("ws-listener")
     log.info("Starting Upstox WebSocket market-data listener...")
     WSListener().run_forever()
 

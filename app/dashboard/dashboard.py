@@ -31,7 +31,10 @@ import pytz
 import msal
 from streamlit_autorefresh import st_autorefresh
 
-from data.providers.upstox_provider import UpstoxProvider
+from data.providers.upstox_ws_provider import UpstoxWSProvider
+from core.telemetry import init_telemetry
+
+init_telemetry("dashboard")
 from core.indicators.indicators import add_rsi, add_bollinger_bands, add_ema, add_pivot_points
 from core.logger.signal_logger import SignalLogger
 from core.backtesting.backtest_store import get_results
@@ -386,7 +389,14 @@ if "chart_strategy"   not in st.session_state: st.session_state.chart_strategy  
 if "chart_timeframe"  not in st.session_state: st.session_state.chart_timeframe   = None
 
 if "provider" not in st.session_state:
-    st.session_state.provider      = UpstoxProvider()
+    # WS-fed provider (core/marketdata/ws_listener.py's live_candles_1min
+    # table), same one signal_scheduler.py uses for the fast live-price
+    # path -- was plain UpstoxProvider, which meant every price fetch on
+    # this page took the full REST historical+intraday call chain per
+    # symbol per render even when the WS listener already had a fresh,
+    # cheap DB-backed price. Falls through to REST/yfinance automatically
+    # (see UpstoxWSProvider docstring) if the listener is down or stale.
+    st.session_state.provider      = UpstoxWSProvider()
     st.session_state.logger        = SignalLogger()
 
 provider = st.session_state.provider
@@ -1737,6 +1747,25 @@ def render_section(rows, title, dot_color="var(--blue)", scroll_height=None):
         _render_action_rows(action)
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def _fetch_price_cached(symbol: str, interval: str, period: str):
+    """
+    Cached current-price lookup, shared by the signals table
+    (_render_action_rows) and the paper-trading unrealized-P&L block --
+    Streamlit reruns this ENTIRE script on any widget interaction, not
+    just the 5-min st_autorefresh, so an unmemoized per-row fetch was
+    reissuing a fetch for every open signal/position on every click.
+    30s TTL keeps prices reasonably live while collapsing reruns that
+    land faster than that. `provider` (module-level) is now
+    UpstoxWSProvider, so a cache miss is a cheap DB read, not a REST
+    round trip, for the intervals it covers.
+    """
+    df = provider.fetch_data(symbol=symbol, interval=interval, period=period)
+    if df is not None and not df.empty:
+        return round(float(df["Close"].iloc[-1]), 2)
+    return None
+
+
 def _render_action_rows(action):
     # Column headers
     h = st.columns([2.2, 0.7, 0.9, 0.8, 1.2, 1.0, 0.9, 1.2, 0.7])
@@ -1747,17 +1776,15 @@ def _render_action_rows(action):
     for row in action:
         c = st.columns([2.2, 0.7, 0.9, 0.8, 1.2, 1.0, 0.9, 1.2, 0.7])
 
-        # Live price fetch
+        # Live price fetch (cached — see _fetch_price_cached)
         cur_price = row["sig_price"]
         cur_live  = False
         try:
-            _df = provider.fetch_data(
-                symbol=row["sym"],
-                interval=TIMEFRAMES[selected_tf],
-                period=PERIOD_MAP[selected_tf],
+            _price = _fetch_price_cached(
+                row["sym"], TIMEFRAMES[selected_tf], PERIOD_MAP[selected_tf],
             )
-            if _df is not None and not _df.empty:
-                cur_price = round(float(_df["Close"].iloc[-1]), 2)
+            if _price is not None:
+                cur_price = _price
                 cur_live  = True
         except Exception:
             pass
@@ -2170,13 +2197,9 @@ def render_paper_trading():
     if open_df is not None and not open_df.empty:
         for sym in open_df["symbol"].unique():
             try:
-                _df = provider.fetch_data(
-                    symbol=sym,
-                    interval=TIMEFRAMES[selected_tf],
-                    period=PERIOD_MAP[selected_tf],
+                cmp_map[sym] = _fetch_price_cached(
+                    sym, TIMEFRAMES[selected_tf], PERIOD_MAP[selected_tf],
                 )
-                if _df is not None and not _df.empty:
-                    cmp_map[sym] = round(float(_df["Close"].iloc[-1]), 2)
             except Exception:
                 cmp_map[sym] = None
 

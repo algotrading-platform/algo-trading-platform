@@ -129,6 +129,18 @@ def _is_equity(symbol: str) -> bool:
     return symbol.endswith(".NS")     # NSE equity
 
 
+def _gross_pnl(side: str, entry: float, exit_price: float, qty: int) -> float:
+    """
+    The one gross-P&L formula, shared by every close path below
+    (stop/target, square-off, stale-carryover, kill-switch, manual,
+    close_by_symbol) so the BUY/SELL mirroring only has to be correct
+    in one place. NOT for Cash-Futures Arbitrage, whose profit is the
+    basis locked in at entry, not (exit-entry) against a live price —
+    see the dedicated arbitrage-expiry branch in monitor_open().
+    """
+    return (exit_price - entry) * qty if side == "BUY" else (entry - exit_price) * qty
+
+
 class PaperTrader:
 
     def __init__(self, provider=None, rms: RMS = None, om: OrderManager = None):
@@ -194,6 +206,30 @@ class PaperTrader:
 
         if not _is_equity(symbol):
             return {"action": "skip", "reason": f"{symbol} not equity — not paper-traded"}
+
+        # ── Sanity check: does this signal's price even resemble reality? ──
+        # Confirmed live, 2026-09-10 (ABREL.NS): a corrupted/stale candle
+        # (most likely a leftover historical-bootstrap bar merged into the
+        # pattern series at the wrong price level) produced a BUY signal at
+        # ₹100 for a stock genuinely trading at ~₹1,328 at that exact
+        # moment. The strategy's own math (stop/target as a % of that
+        # candle's range) was entirely self-consistent, so nothing inside
+        # pattern detection ever had a reason to doubt it -- the position
+        # opened at ₹100, and the very next monitor_open() cycle saw the
+        # REAL live price (~₹1,330) blow through the fabricated target
+        # (₹110), closing it for a fake ~₹9.88M "gain". Comparing the
+        # signal's own price against the current live price -- something
+        # pattern detection never does, since it only ever looks at its
+        # own candle series -- catches this class of bug regardless of
+        # which upstream step actually produced the bad price.
+        live_check = self._current_price(symbol)
+        if live_check is not None and live_check > 0:
+            drift = abs(price - live_check) / live_check
+            if drift > 0.25:
+                log.error(f"{symbol}: signal price ₹{price:,.2f} is {drift*100:.0f}% away from "
+                          f"live price ₹{live_check:,.2f} — rejecting as corrupted data, not trading it")
+                return {"action": "reject", "reason": f"signal price ₹{price:,.2f} vs live ₹{live_check:,.2f} "
+                                                        f"({drift*100:.0f}% drift) — looks like bad data"}
 
         # ── What (if anything) is currently open for this symbol? ──
         existing = db.get_open_position(symbol)
@@ -405,7 +441,7 @@ class PaperTrader:
                 if db.close_paper_position(pid, price, exit_reason="stale_carryover"):
                     qty   = int(pos["quantity"])
                     entry = float(pos["entry_price"])
-                    pnl   = (entry - price) * qty  # SELL/short only, mirrored math
+                    pnl   = _gross_pnl(side, entry, price, qty)  # SELL/short only here
                     self.rms.record_realized_pnl(pnl)
                     self.om.clear_key(symbol, side, f"{pos['timeframe']}|{pos['strategy']}")
                     closed.append({
@@ -431,7 +467,7 @@ class PaperTrader:
                 if db.close_paper_position(pid, price, exit_reason="square_off"):
                     qty   = int(pos["quantity"])
                     entry = float(pos["entry_price"])
-                    pnl   = (entry - price) * qty  # SELL/short only, mirrored math
+                    pnl   = _gross_pnl(side, entry, price, qty)  # SELL/short only here
                     self.rms.record_realized_pnl(pnl)
                     self.om.clear_key(symbol, side, f"{pos['timeframe']}|{pos['strategy']}")
                     closed.append({
@@ -479,7 +515,7 @@ class PaperTrader:
                     # update RMS daily P&L for the kill switch
                     qty   = int(pos["quantity"])
                     entry = float(pos["entry_price"])
-                    pnl   = (price - entry) * qty if side == "BUY" else (entry - price) * qty
+                    pnl   = _gross_pnl(side, entry, price, qty)
                     self.rms.record_realized_pnl(pnl)
                     self.om.clear_key(symbol, side, f"{pos['timeframe']}|{pos['strategy']}")
                     closed.append({
@@ -502,13 +538,26 @@ class PaperTrader:
         """Force-close every remaining open paper position at current
         market price. Called once the RMS daily-loss kill switch has
         tripped — positions are closed regardless of their own
-        stop/target, since the portfolio-level limit overrides them."""
+        stop/target, since the portfolio-level limit overrides them.
+
+        EXCEPT Cash-Futures Arbitrage: same carve-out as monitor_open()
+        above — that position's profit is the basis locked in at entry,
+        realized only at expiry, and is never subject to live price
+        swings by design (Jwala, Sep 3: "this would run for the whole
+        month"). Force-closing it here at spot would both destroy its
+        real economics and end it early for a daily-loss limit that has
+        nothing to do with its (already-locked-in) outcome. It stays
+        open and gets picked up by monitor_open()'s own expiry check on
+        a later cycle regardless of halted state."""
         closed = []
         open_df = db.get_open_paper_positions()
         if open_df is None or open_df.empty:
             return closed
 
         for _, pos in open_df.iterrows():
+            if pos["strategy"] == "Cash-Futures Arbitrage":
+                continue
+
             symbol = pos["symbol"]
             side   = pos["side"]
             pid    = int(pos["id"])
@@ -521,7 +570,7 @@ class PaperTrader:
             if db.close_paper_position(pid, price, exit_reason="kill_switch"):
                 qty   = int(pos["quantity"])
                 entry = float(pos["entry_price"])
-                pnl   = (price - entry) * qty if side == "BUY" else (entry - price) * qty
+                pnl   = _gross_pnl(side, entry, price, qty)
                 self.rms.record_realized_pnl(pnl)
                 self.om.clear_key(symbol, side, f"{pos['timeframe']}|{pos['strategy']}")
                 closed.append({
@@ -619,7 +668,7 @@ class PaperTrader:
         qty   = int(pos["quantity"])
         entry = float(pos["entry_price"])
         side  = pos["side"]
-        pnl   = (price - entry) * qty if side == "BUY" else (entry - price) * qty
+        pnl   = _gross_pnl(side, entry, price, qty)
         self.rms.record_realized_pnl(pnl)
         self.om.clear_key(pos["symbol"], side, f"{pos['timeframe']}|{pos['strategy']}")
 
@@ -649,7 +698,7 @@ class PaperTrader:
         if ok:
             pos   = open_df.iloc[0]
             qty   = int(pos["quantity"]); entry = float(pos["entry_price"])
-            pnl = (price - entry) * qty if pos["side"] == "BUY" else (entry - price) * qty
+            pnl = _gross_pnl(pos["side"], entry, price, qty)
             self.rms.record_realized_pnl(pnl)
             self.om.clear_key(symbol, pos["side"], f"{pos['timeframe']}|{pos['strategy']}")
         return ok
